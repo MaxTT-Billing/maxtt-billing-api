@@ -20,7 +20,6 @@ if (!DATABASE_URL) {
 }
 const pool = new Pool({
   connectionString: DATABASE_URL,
-  // Render internal DB usually needs SSL off internally; if external, may need ssl: { rejectUnauthorized: false }
 });
 
 // ----- ONE-TIME TABLE CREATE (safe if already exists) -----
@@ -56,11 +55,32 @@ const ensureTable = async () => {
 // ----- HEALTH CHECK -----
 app.get("/healthz", (_req, res) => res.status(200).send("OK"));
 
-// ----- LIST LAST 20 INVOICES -----
+// ----- FRIENDLY ROOT -----
+app.get("/", (_req, res) => res.send("MaxTT Billing API is running ✔"));
+
+// ----- LIST LAST 20 INVOICES (cast numerics to numbers) -----
 app.get("/api/invoices", async (_req, res) => {
   try {
     const r = await pool.query(
-      "SELECT * FROM invoices ORDER BY created_at DESC LIMIT 20"
+      `SELECT
+        id, created_at, customer_name, mobile_number, vehicle_number, odometer,
+        CAST(tread_depth_mm AS float8) AS tread_depth_mm,
+        installer_name, vehicle_type,
+        CAST(tyre_width_mm AS float8) AS tyre_width_mm,
+        CAST(aspect_ratio AS float8) AS aspect_ratio,
+        CAST(rim_diameter_in AS float8) AS rim_diameter_in,
+        CAST(dosage_ml AS float8) AS dosage_ml,
+        CAST(price_per_ml AS float8) AS price_per_ml,
+        CAST(gst_rate AS float8) AS gst_rate,
+        CAST(total_before_gst AS float8) AS total_before_gst,
+        CAST(gst_amount AS float8) AS gst_amount,
+        CAST(total_with_gst AS float8) AS total_with_gst,
+        CAST(gps_lat AS float8) AS gps_lat,
+        CAST(gps_lng AS float8) AS gps_lng,
+        customer_code
+       FROM invoices
+       ORDER BY created_at DESC
+       LIMIT 20`
     );
     res.json(r.rows);
   } catch (e) {
@@ -84,8 +104,6 @@ app.get("/api/invoices/:id", async (req, res) => {
 });
 
 // ----- CREATE INVOICE -----
-// For now, the frontend sends dosage_ml it calculated.
-// We compute totals here using MRP and GST env vars.
 const MRP_PER_ML = Number(process.env.MRP_PER_ML || "4.5"); // ₹/ml
 const GST_RATE = Number(process.env.GST_RATE || "0.18");    // 18%
 
@@ -142,3 +160,4 @@ app.listen(PORT, async () => {
   await ensureTable();
   console.log(`API listening on ${PORT}`);
 });
+
