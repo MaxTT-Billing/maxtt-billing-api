@@ -14,13 +14,10 @@ const app = express();
 app.use(express.json());
 app.use(cors({ origin: FRONTEND_URL, credentials: false }));
 
-// ----- DB POOL -----
-if (!DATABASE_URL) {
-  console.error("Missing DATABASE_URL env var");
-}
+if (!DATABASE_URL) console.error("Missing DATABASE_URL env var");
 const pool = new Pool({ connectionString: DATABASE_URL });
 
-// ----- ONE-TIME TABLE CREATE (safe if already exists) -----
+// ----- ONE-TIME TABLE CREATE / MIGRATE -----
 const ensureTable = async () => {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS invoices (
@@ -47,32 +44,33 @@ const ensureTable = async () => {
       customer_code TEXT
     );
   `);
-  console.log("Table ready ✔");
+  // add new column for tyre count (safe if already exists)
+  await pool.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS tyre_count INTEGER;`);
+  console.log("Table ready ✔ (with tyre_count)");
 };
 
-// ----- HEALTH & ROOT -----
+// small helpers
+const toNum = (v) => (v === null || v === undefined || v === "" ? null : Number(v));
+
+// health & root
 app.get("/healthz", (_req, res) => res.status(200).send("OK"));
 app.get("/", (_req, res) => res.send("MaxTT Billing API is running ✔"));
 
-// helper: force numbers (PG returns NUMERIC as strings)
-const toNum = (v) => (v === null || v === undefined || v === "" ? null : Number(v));
-
-// ----- LIST LAST 20 INVOICES (force numbers in JS) -----
+// LIST last 20 (force numeric types)
 app.get("/api/invoices", async (_req, res) => {
   try {
     const r = await pool.query(
       `SELECT
-        id, created_at, customer_name, mobile_number, vehicle_number, odometer,
-        tread_depth_mm, installer_name, vehicle_type,
-        tyre_width_mm, aspect_ratio, rim_diameter_in,
-        dosage_ml, price_per_ml, gst_rate,
-        total_before_gst, gst_amount, total_with_gst,
-        gps_lat, gps_lng, customer_code
+         id, created_at, customer_name, mobile_number, vehicle_number, odometer,
+         tread_depth_mm, installer_name, vehicle_type,
+         tyre_width_mm, aspect_ratio, rim_diameter_in,
+         dosage_ml, price_per_ml, gst_rate,
+         total_before_gst, gst_amount, total_with_gst,
+         gps_lat, gps_lng, customer_code, tyre_count
        FROM invoices
        ORDER BY created_at DESC
        LIMIT 20`
     );
-
     const rows = r.rows.map(row => ({
       ...row,
       tread_depth_mm: toNum(row.tread_depth_mm),
@@ -87,8 +85,8 @@ app.get("/api/invoices", async (_req, res) => {
       total_with_gst: toNum(row.total_with_gst),
       gps_lat: toNum(row.gps_lat),
       gps_lng: toNum(row.gps_lng),
+      tyre_count: row.tyre_count == null ? null : Number(row.tyre_count)
     }));
-
     res.json(rows);
   } catch (e) {
     console.error(e);
@@ -96,12 +94,21 @@ app.get("/api/invoices", async (_req, res) => {
   }
 });
 
-// ----- GET ONE INVOICE BY ID -----
+// GET one by ID
 app.get("/api/invoices/:id", async (req, res) => {
   try {
-    const r = await pool.query("SELECT * FROM invoices WHERE id=$1", [req.params.id]);
+    const r = await pool.query(
+      `SELECT
+         id, created_at, customer_name, mobile_number, vehicle_number, odometer,
+         tread_depth_mm, installer_name, vehicle_type,
+         tyre_width_mm, aspect_ratio, rim_diameter_in,
+         dosage_ml, price_per_ml, gst_rate,
+         total_before_gst, gst_amount, total_with_gst,
+         gps_lat, gps_lng, customer_code, tyre_count
+       FROM invoices WHERE id=$1`,
+      [req.params.id]
+    );
     if (!r.rows.length) return res.status(404).json({ error: "not_found" });
-
     const row = r.rows[0];
     const cleaned = {
       ...row,
@@ -117,6 +124,7 @@ app.get("/api/invoices/:id", async (req, res) => {
       total_with_gst: toNum(row.total_with_gst),
       gps_lat: toNum(row.gps_lat),
       gps_lng: toNum(row.gps_lng),
+      tyre_count: row.tyre_count == null ? null : Number(row.tyre_count)
     };
     res.json(cleaned);
   } catch (e) {
@@ -125,7 +133,7 @@ app.get("/api/invoices/:id", async (req, res) => {
   }
 });
 
-// ----- CREATE INVOICE -----
+// CREATE invoice
 app.post("/api/invoices", async (req, res) => {
   try {
     const {
@@ -139,10 +147,11 @@ app.post("/api/invoices", async (req, res) => {
       tyre_width_mm,
       aspect_ratio,
       rim_diameter_in,
-      dosage_ml,
+      dosage_ml,   // TOTAL dosage
       gps_lat,
       gps_lng,
-      customer_code
+      customer_code,
+      tyre_count    // NEW
     } = req.body || {};
 
     if (!customer_name || !vehicle_number || !dosage_ml) {
@@ -160,15 +169,15 @@ app.post("/api/invoices", async (req, res) => {
       INSERT INTO invoices
         (customer_name, mobile_number, vehicle_number, odometer, tread_depth_mm, installer_name, vehicle_type,
          tyre_width_mm, aspect_ratio, rim_diameter_in, dosage_ml, price_per_ml, gst_rate,
-         total_before_gst, gst_amount, total_with_gst, gps_lat, gps_lng, customer_code)
+         total_before_gst, gst_amount, total_with_gst, gps_lat, gps_lng, customer_code, tyre_count)
       VALUES
-        ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
+        ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
       RETURNING id
     `;
     const vals = [
       customer_name, mobile_number, vehicle_number, odometer, tread_depth_mm, installer_name, vehicle_type,
       tyre_width_mm, aspect_ratio, rim_diameter_in, dosage_ml, price_per_ml, gst_rate,
-      total_before_gst, gst_amount, total_with_gst, gps_lat, gps_lng, customer_code
+      total_before_gst, gst_amount, total_with_gst, gps_lat, gps_lng, customer_code, tyre_count
     ];
     const r = await pool.query(q, vals);
 
