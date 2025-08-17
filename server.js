@@ -6,13 +6,17 @@ const { Pool } = pkg;
 
 const PORT = process.env.PORT || 10000;
 const DATABASE_URL = process.env.DATABASE_URL;
-const FRONTEND_URL = process.env.FRONTEND_URL || "*";
+const FRONTEND_URL = process.env.FRONTEND_URL || "https://maxtt-billing-frontend.onrender.com";
+const API_KEY = process.env.API_KEY || ""; // set this in Render
 const MRP_PER_ML = Number(process.env.MRP_PER_ML || "4.5"); // ₹/ml
 const GST_RATE = Number(process.env.GST_RATE || "0.18");    // 18%
 
 const app = express();
 app.use(express.json());
+
+// CORS locked to your site
 app.use(cors({ origin: FRONTEND_URL, credentials: false }));
+app.options("*", cors({ origin: FRONTEND_URL, credentials: false }));
 
 if (!DATABASE_URL) console.error("Missing DATABASE_URL env var");
 const pool = new Pool({ connectionString: DATABASE_URL });
@@ -41,11 +45,15 @@ const ensureTable = async () => {
       total_with_gst NUMERIC,
       gps_lat NUMERIC,
       gps_lng NUMERIC,
-      customer_code TEXT
+      customer_code TEXT,
+      tyre_count INTEGER
     );
   `);
-  await pool.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS tyre_count INTEGER;`);
-  console.log("Table ready ✔ (with tyre_count)");
+  // New fields
+  await pool.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS fitment_locations TEXT;`); // e.g. "Front Left, Front Right, Rear Left, Rear Right"
+  await pool.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS customer_gstin TEXT;`);
+  await pool.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS customer_address TEXT;`);
+  console.log("Table ready ✔ (with tyre_count, fitment_locations, customer_gstin, customer_address)");
 };
 
 // helpers
@@ -55,7 +63,20 @@ const toNum = (v) => (v === null || v === undefined || v === "" ? null : Number(
 app.get("/healthz", (_req, res) => res.status(200).send("OK"));
 app.get("/", (_req, res) => res.send("MaxTT Billing API is running ✔"));
 
-// LIST last 20 (force numeric types)
+// Simple API key guard for write endpoints
+function requireApiKey(req, res, next) {
+  const headerKey = req.header("x-api-key");
+  const queryKey = req.query.api_key;
+  const provided = headerKey || queryKey;
+  if (!API_KEY) {
+    console.warn("No API_KEY set on server; skipping auth (not recommended).");
+    return next();
+  }
+  if (provided && provided === API_KEY) return next();
+  return res.status(401).json({ error: "unauthorized" });
+}
+
+// ----- READ: last 20 invoices -----
 app.get("/api/invoices", async (_req, res) => {
   try {
     const r = await pool.query(
@@ -65,7 +86,8 @@ app.get("/api/invoices", async (_req, res) => {
          tyre_width_mm, aspect_ratio, rim_diameter_in,
          dosage_ml, price_per_ml, gst_rate,
          total_before_gst, gst_amount, total_with_gst,
-         gps_lat, gps_lng, customer_code, tyre_count
+         gps_lat, gps_lng, customer_code, tyre_count,
+         fitment_locations, customer_gstin, customer_address
        FROM invoices
        ORDER BY created_at DESC
        LIMIT 20`
@@ -93,7 +115,7 @@ app.get("/api/invoices", async (_req, res) => {
   }
 });
 
-// GET one by ID
+// ----- READ: one invoice -----
 app.get("/api/invoices/:id", async (req, res) => {
   try {
     const r = await pool.query(
@@ -103,7 +125,8 @@ app.get("/api/invoices/:id", async (req, res) => {
          tyre_width_mm, aspect_ratio, rim_diameter_in,
          dosage_ml, price_per_ml, gst_rate,
          total_before_gst, gst_amount, total_with_gst,
-         gps_lat, gps_lng, customer_code, tyre_count
+         gps_lat, gps_lng, customer_code, tyre_count,
+         fitment_locations, customer_gstin, customer_address
        FROM invoices WHERE id=$1`,
       [req.params.id]
     );
@@ -132,8 +155,8 @@ app.get("/api/invoices/:id", async (req, res) => {
   }
 });
 
-// CREATE invoice
-app.post("/api/invoices", async (req, res) => {
+// ----- WRITE: create invoice (protected) -----
+app.post("/api/invoices", requireApiKey, async (req, res) => {
   try {
     const {
       customer_name,
@@ -150,7 +173,10 @@ app.post("/api/invoices", async (req, res) => {
       gps_lat,
       gps_lng,
       customer_code,
-      tyre_count    // NEW
+      tyre_count,
+      fitment_locations, // NEW text (e.g. "Front Left, Front Right")
+      customer_gstin,    // NEW
+      customer_address   // NEW
     } = req.body || {};
 
     if (!customer_name || !vehicle_number || !dosage_ml) {
@@ -168,15 +194,17 @@ app.post("/api/invoices", async (req, res) => {
       INSERT INTO invoices
         (customer_name, mobile_number, vehicle_number, odometer, tread_depth_mm, installer_name, vehicle_type,
          tyre_width_mm, aspect_ratio, rim_diameter_in, dosage_ml, price_per_ml, gst_rate,
-         total_before_gst, gst_amount, total_with_gst, gps_lat, gps_lng, customer_code, tyre_count)
+         total_before_gst, gst_amount, total_with_gst, gps_lat, gps_lng, customer_code, tyre_count,
+         fitment_locations, customer_gstin, customer_address)
       VALUES
-        ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
+        ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)
       RETURNING id
     `;
     const vals = [
       customer_name, mobile_number, vehicle_number, odometer, tread_depth_mm, installer_name, vehicle_type,
       tyre_width_mm, aspect_ratio, rim_diameter_in, dosage_ml, price_per_ml, gst_rate,
-      total_before_gst, gst_amount, total_with_gst, gps_lat, gps_lng, customer_code, tyre_count
+      total_before_gst, gst_amount, total_with_gst, gps_lat, gps_lng, customer_code, tyre_count,
+      fitment_locations || null, customer_gstin || null, customer_address || null
     ];
     const r = await pool.query(q, vals);
 
