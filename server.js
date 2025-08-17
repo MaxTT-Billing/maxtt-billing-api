@@ -1,5 +1,6 @@
 import express from "express";
 import cors from "cors";
+import crypto from "crypto";
 import pkg from "pg";
 
 const { Pool } = pkg;
@@ -7,21 +8,48 @@ const { Pool } = pkg;
 const PORT = process.env.PORT || 10000;
 const DATABASE_URL = process.env.DATABASE_URL;
 const FRONTEND_URL = process.env.FRONTEND_URL || "https://maxtt-billing-frontend.onrender.com";
-const API_KEY = process.env.API_KEY || ""; // set this in Render
-const MRP_PER_ML = Number(process.env.MRP_PER_ML || "4.5"); // ₹/ml
-const GST_RATE = Number(process.env.GST_RATE || "0.18");    // 18%
+const API_KEY = process.env.API_KEY || "";          // already used for x-api-key
+const MRP_PER_ML = Number(process.env.MRP_PER_ML || "4.5");
+const GST_RATE   = Number(process.env.GST_RATE   || "0.18");
+
+// --- Franchisee credentials & profile (SET THESE IN RENDER) ---
+const FRANCHISEE_ID       = process.env.FRANCHISEE_ID || "";         // e.g. MAXTT-DEL-001
+const FRANCHISEE_PASSWORD = process.env.FRANCHISEE_PASSWORD || "";   // e.g. strong pass
+const FR_NAME   = process.env.FRANCHISEE_NAME    || "Franchisee Name";
+const FR_ADDR   = process.env.FRANCHISEE_ADDRESS || "Franchisee Address";
+const FR_GSTIN  = process.env.FRANCHISEE_GSTIN   || "XXABCDE1234F1Z5";
 
 const app = express();
 app.use(express.json());
 
-// CORS locked to your site
+// CORS locked to your frontend
 app.use(cors({ origin: FRONTEND_URL, credentials: false }));
 app.options("*", cors({ origin: FRONTEND_URL, credentials: false }));
 
 if (!DATABASE_URL) console.error("Missing DATABASE_URL env var");
 const pool = new Pool({ connectionString: DATABASE_URL });
 
-// ----- ONE-TIME TABLE CREATE / MIGRATE -----
+// ============== LOGIN TOKEN STORE (in-memory) =================
+const TOKENS = new Map(); // token -> { exp: ms since epoch }
+const TOKEN_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+
+function issueToken() {
+  const token = crypto.randomBytes(24).toString("hex");
+  TOKENS.set(token, { exp: Date.now() + TOKEN_TTL_MS });
+  return token;
+}
+function isValidToken(token) {
+  const entry = TOKENS.get(token);
+  if (!entry) return false;
+  if (Date.now() > entry.exp) { TOKENS.delete(token); return false; }
+  return true;
+}
+setInterval(() => { // simple garbage collector
+  const now = Date.now();
+  for (const [t, { exp }] of TOKENS) if (now > exp) TOKENS.delete(t);
+}, 60 * 60 * 1000);
+
+// ================== DB: ensure/migrate ========================
 const ensureTable = async () => {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS invoices (
@@ -46,37 +74,64 @@ const ensureTable = async () => {
       gps_lat NUMERIC,
       gps_lng NUMERIC,
       customer_code TEXT,
-      tyre_count INTEGER
+      tyre_count INTEGER,
+      fitment_locations TEXT,
+      customer_gstin TEXT,
+      customer_address TEXT
     );
   `);
-  // New fields
-  await pool.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS fitment_locations TEXT;`); // e.g. "Front Left, Front Right, Rear Left, Rear Right"
-  await pool.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS customer_gstin TEXT;`);
-  await pool.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS customer_address TEXT;`);
-  console.log("Table ready ✔ (with tyre_count, fitment_locations, customer_gstin, customer_address)");
+  console.log("Table ready ✔");
 };
 
-// helpers
 const toNum = (v) => (v === null || v === undefined || v === "" ? null : Number(v));
 
-// health & root
+// ======================= ROUTES ===============================
 app.get("/healthz", (_req, res) => res.status(200).send("OK"));
 app.get("/", (_req, res) => res.send("MaxTT Billing API is running ✔"));
 
-// Simple API key guard for write endpoints
+// ---- Login: checks franchisee id/password, issues token
+app.post("/api/login", (req, res) => {
+  const { id, password } = req.body || {};
+  if (!FRANCHISEE_ID || !FRANCHISEE_PASSWORD) {
+    return res.status(500).json({ error: "login_not_configured" });
+  }
+  if (id === FRANCHISEE_ID && password === FRANCHISEE_PASSWORD) {
+    const token = issueToken();
+    return res.json({ token });
+  }
+  return res.status(401).json({ error: "invalid_credentials" });
+});
+
+// ---- Public: franchisee profile (for invoice header)
+app.get("/api/profile", (_req, res) => {
+  res.json({
+    name: FR_NAME,
+    address: FR_ADDR,
+    gstin: FR_GSTIN
+  });
+});
+
+// ---- Middleware: API key + Bearer token for writes
 function requireApiKey(req, res, next) {
+  if (!API_KEY) {
+    console.warn("No API_KEY set; skipping x-api-key check (not recommended).");
+    return next();
+  }
   const headerKey = req.header("x-api-key");
   const queryKey = req.query.api_key;
   const provided = headerKey || queryKey;
-  if (!API_KEY) {
-    console.warn("No API_KEY set on server; skipping auth (not recommended).");
-    return next();
-  }
   if (provided && provided === API_KEY) return next();
   return res.status(401).json({ error: "unauthorized" });
 }
+function requireAuth(req, res, next) {
+  const auth = req.header("authorization") || "";
+  const m = auth.match(/^Bearer\s+(.+)$/i);
+  const token = m ? m[1] : null;
+  if (!token || !isValidToken(token)) return res.status(401).json({ error: "auth_required" });
+  next();
+}
 
-// ----- READ: last 20 invoices -----
+// ---- READ: last 20 invoices
 app.get("/api/invoices", async (_req, res) => {
   try {
     const r = await pool.query(
@@ -115,7 +170,7 @@ app.get("/api/invoices", async (_req, res) => {
   }
 });
 
-// ----- READ: one invoice -----
+// ---- READ: one invoice
 app.get("/api/invoices/:id", async (req, res) => {
   try {
     const r = await pool.query(
@@ -155,28 +210,14 @@ app.get("/api/invoices/:id", async (req, res) => {
   }
 });
 
-// ----- WRITE: create invoice (protected) -----
-app.post("/api/invoices", requireApiKey, async (req, res) => {
+// ---- WRITE: create invoice (needs x-api-key + Bearer)
+app.post("/api/invoices", requireApiKey, requireAuth, async (req, res) => {
   try {
     const {
-      customer_name,
-      mobile_number,
-      vehicle_number,
-      odometer,
-      tread_depth_mm,
-      installer_name,
-      vehicle_type,
-      tyre_width_mm,
-      aspect_ratio,
-      rim_diameter_in,
-      dosage_ml,   // TOTAL dosage
-      gps_lat,
-      gps_lng,
-      customer_code,
-      tyre_count,
-      fitment_locations, // NEW text (e.g. "Front Left, Front Right")
-      customer_gstin,    // NEW
-      customer_address   // NEW
+      customer_name, mobile_number, vehicle_number, odometer, tread_depth_mm, installer_name,
+      vehicle_type, tyre_width_mm, aspect_ratio, rim_diameter_in, dosage_ml,
+      gps_lat, gps_lng, customer_code, tyre_count,
+      fitment_locations, customer_gstin, customer_address
     } = req.body || {};
 
     if (!customer_name || !vehicle_number || !dosage_ml) {
@@ -210,9 +251,7 @@ app.post("/api/invoices", requireApiKey, async (req, res) => {
 
     res.status(201).json({
       id: r.rows[0].id,
-      total_with_gst,
-      gst_amount,
-      total_before_gst
+      total_with_gst, gst_amount, total_before_gst
     });
   } catch (e) {
     console.error(e);
