@@ -44,12 +44,11 @@ const ensureTable = async () => {
       customer_code TEXT
     );
   `);
-  // add new column for tyre count (safe if already exists)
   await pool.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS tyre_count INTEGER;`);
   console.log("Table ready ✔ (with tyre_count)");
 };
 
-// small helpers
+// helpers
 const toNum = (v) => (v === null || v === undefined || v === "" ? null : Number(v));
 
 // health & root
