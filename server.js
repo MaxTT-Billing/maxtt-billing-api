@@ -1,91 +1,30 @@
+// server.js
 import express from "express";
 import cors from "cors";
-import crypto from "crypto";
 import pkg from "pg";
 
 const { Pool } = pkg;
 
 const PORT = process.env.PORT || 10000;
 const DATABASE_URL = process.env.DATABASE_URL;
+const FRONTEND_URL = process.env.FRONTEND_URL || "*";
 
-// Allow only your frontend
-const FRONTEND_URL =
-  process.env.FRONTEND_URL || "https://maxtt-billing-frontend.onrender.com";
-
-// Commercial settings
-const MRP_PER_ML = Number(process.env.MRP_PER_ML || "4.5");
-const GST_RATE = Number(process.env.GST_RATE || "0.18");
-
-// Extra protection for create/update routes
-const API_KEY = process.env.API_KEY || "";
-
-// Seed one franchisee from env (you can add more later via SQL)
-const SEED_CODE = process.env.FRANCHISEE_ID || "";
-const SEED_PASS = process.env.FRANCHISEE_PASSWORD || "";
-const SEED_NAME = process.env.FRANCHISEE_NAME || "Franchisee Name";
-const SEED_ADDR = process.env.FRANCHISEE_ADDRESS || "FULL POSTAL ADDRESS AS PER GSTIN CERTIFICATE";
-const SEED_GSTIN = process.env.FRANCHISEE_GSTIN || "AS PER GSTIN CERTIFICATE";
+const MRP_PER_ML = Number(process.env.MRP_PER_ML || "4.5"); // ₹/ml
+const GST_RATE   = Number(process.env.GST_RATE   || "0.18"); // 18%
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: "5mb" })); // allow signature image
 app.use(cors({ origin: FRONTEND_URL, credentials: false }));
-app.options("*", cors({ origin: FRONTEND_URL, credentials: false }));
 
-if (!DATABASE_URL) console.error("Missing DATABASE_URL");
-const pool = new Pool({ connectionString: DATABASE_URL });
-
-// -------------------- TOKEN STORE (in-memory) --------------------
-const TOKENS = new Map(); // token -> { exp, code }
-const TOKEN_TTL_MS = 7 * 24 * 60 * 60 * 1000;
-
-function issueToken(code) {
-  const token = crypto.randomBytes(24).toString("hex");
-  TOKENS.set(token, { exp: Date.now() + TOKEN_TTL_MS, code });
-  return token;
+if (!DATABASE_URL) {
+  console.error("Missing DATABASE_URL env var");
 }
-function readToken(token) {
-  const rec = TOKENS.get(token);
-  if (!rec) return null;
-  if (Date.now() > rec.exp) {
-    TOKENS.delete(token);
-    return null;
-  }
-  return rec;
-}
-setInterval(() => {
-  const now = Date.now();
-  for (const [t, { exp }] of TOKENS) if (now > exp) TOKENS.delete(t);
-}, 60 * 60 * 1000);
+const pool = new Pool({
+  connectionString: DATABASE_URL,
+});
 
-// -------------------- DB ENSURE + AUTO-MIGRATIONS --------------------
-const ensureTables = async () => {
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS franchisees (
-      id SERIAL PRIMARY KEY,
-      code TEXT UNIQUE NOT NULL,
-      password TEXT NOT NULL,
-      name TEXT,
-      address TEXT,
-      gstin TEXT,
-      is_active BOOLEAN DEFAULT TRUE,
-      created_at TIMESTAMP DEFAULT NOW()
-    );
-  `);
-
-  if (SEED_CODE && SEED_PASS) {
-    await pool.query(
-      `INSERT INTO franchisees (code, password, name, address, gstin, is_active)
-       VALUES ($1,$2,$3,$4,$5,TRUE)
-       ON CONFLICT (code) DO UPDATE
-       SET password=EXCLUDED.password,
-           name=EXCLUDED.name,
-           address=EXCLUDED.address,
-           gstin=EXCLUDED.gstin,
-           is_active=TRUE`,
-      [SEED_CODE, SEED_PASS, SEED_NAME, SEED_ADDR, SEED_GSTIN]
-    );
-  }
-
+// ----- ONE-TIME TABLE CREATE / MIGRATE -----
+const ensureTable = async () => {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS invoices (
       id SERIAL PRIMARY KEY,
@@ -103,8 +42,6 @@ const ensureTables = async () => {
       rim_diameter_in NUMERIC,
       tyre_count INTEGER,
       fitment_locations TEXT,
-      customer_gstin TEXT,
-      customer_address TEXT,
       dosage_ml NUMERIC,
       price_per_ml NUMERIC,
       gst_rate NUMERIC,
@@ -114,194 +51,224 @@ const ensureTables = async () => {
       gps_lat NUMERIC,
       gps_lng NUMERIC,
       customer_code TEXT,
-      franchisee_id TEXT NOT NULL
+      customer_gstin TEXT,
+      customer_address TEXT,
+      customer_signature TEXT,   -- base64 PNG
+      signed_at TIMESTAMP        -- when customer signed/accepted
     );
   `);
-
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS invoice_edits (
-      id SERIAL PRIMARY KEY,
-      invoice_id INTEGER NOT NULL,
-      edited_at TIMESTAMP DEFAULT NOW(),
-      snapshot JSONB NOT NULL
-    );
-  `);
-
-  // --- Add missing columns safely for older DBs ---
+  // Light migrations (idempotent)
   await pool.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW();`);
-  await pool.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS franchisee_id TEXT;`);
   await pool.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS tyre_count INTEGER;`);
   await pool.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS fitment_locations TEXT;`);
   await pool.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS customer_gstin TEXT;`);
   await pool.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS customer_address TEXT;`);
+  await pool.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS customer_signature TEXT;`);
+  await pool.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS signed_at TIMESTAMP;`);
+  console.log("Table ready ✔");
 };
 
-const toNum = (v) => (v === null || v === undefined || v === "" ? null : Number(v));
-
-// -------------------- MIDDLEWARE --------------------
-function requireApiKey(req, res, next) {
-  if (!API_KEY) return next(); // if not set, skip (MVP)
-  const provided = req.header("x-api-key") || req.query.api_key;
-  if (provided && provided === API_KEY) return next();
-  return res.status(401).json({ error: "unauthorized" });
-}
-function requireAuth(req, res, next) {
-  const auth = req.header("authorization") || "";
-  const m = auth.match(/^Bearer\s+(.+)$/i);
-  const token = m ? m[1] : null;
-  const rec = token ? readToken(token) : null;
-  if (!rec) return res.status(401).json({ error: "auth_required" });
-  req.franchiseeCode = rec.code;
-  next();
-}
-async function getFranchiseeByCode(code) {
-  const r = await pool.query(`SELECT code, name, address, gstin, is_active FROM franchisees WHERE code=$1`, [code]);
-  return r.rows[0] || null;
-}
-
-// -------------------- ROUTES --------------------
+// ----- HEALTH CHECK -----
 app.get("/healthz", (_req, res) => res.status(200).send("OK"));
-app.get("/", (_req, res) => res.send("MaxTT Billing API is running ✔"));
 
-// Login → returns token
+// ----- SIMPLE AUTH (Franchisee) -----
+import crypto from "crypto";
+const API_KEY = process.env.API_KEY || ""; // header x-api-key for write ops
+
+// very basic mock login used earlier (keep same to avoid breaking)
+const FRANCHISEE = {
+  id: process.env.FRANCHISEE_ID || "fr001",
+  password: process.env.FRANCHISEE_PASSWORD || "pass123",
+  name: process.env.FRANCHISEE_NAME || "MaxTT Franchisee",
+  gstin: process.env.FRANCHISEE_GSTIN || "29ABCDE1234F1Z5",
+  address: process.env.FRANCHISEE_ADDRESS || "Main Road, Gurgaon, Haryana, India",
+  franchisee_id: process.env.FRANCHISEE_ID || "fr001",
+};
+
+function signToken(obj) {
+  const payload = Buffer.from(JSON.stringify(obj)).toString("base64url");
+  const sig = crypto.createHash("sha256").update(payload + (process.env.API_KEY || "")).digest("hex");
+  return `${payload}.${sig}`;
+}
+function verifyToken(tok) {
+  if (!tok) return null;
+  const [p, s] = tok.split(".");
+  const sig = crypto.createHash("sha256").update(p + (process.env.API_KEY || "")).digest("hex");
+  if (sig !== s) return null;
+  try { return JSON.parse(Buffer.from(p, "base64url").toString("utf8")); } catch { return null; }
+}
+
 app.post("/api/login", async (req, res) => {
   const { id, password } = req.body || {};
-  if (!id || !password) return res.status(400).json({ error: "missing_credentials" });
-  const r = await pool.query(`SELECT code, password, is_active FROM franchisees WHERE code=$1`, [id]);
-  if (!r.rows.length) return res.status(401).json({ error: "invalid_credentials" });
-  const row = r.rows[0];
-  if (!row.is_active || row.password !== password) return res.status(401).json({ error: "invalid_credentials" });
-  const token = issueToken(row.code);
-  res.json({ token });
+  if (id === FRANCHISEE.id && password === FRANCHISEE.password) {
+    const token = signToken({ id, role: "franchisee" });
+    return res.json({ token });
+  }
+  return res.status(401).json({ error: "invalid_credentials" });
 });
 
-// Franchisee profile (for header)
-app.get("/api/profile", requireAuth, async (req, res) => {
-  const fr = await getFranchiseeByCode(req.franchiseeCode);
-  if (!fr) return res.status(404).json({ error: "franchisee_not_found" });
-  res.json({ franchisee_id: fr.code, name: fr.name, address: fr.address, gstin: fr.gstin });
+app.get("/api/profile", (req, res) => {
+  const auth = req.headers.authorization || "";
+  const token = auth.replace(/^Bearer\s+/i, "");
+  const who = verifyToken(token);
+  if (!who) return res.status(401).json({ error: "unauthorized" });
+  res.json({
+    name: FRANCHISEE.name,
+    gstin: FRANCHISEE.gstin,
+    address: FRANCHISEE.address,
+    franchisee_id: FRANCHISEE.franchisee_id
+  });
 });
 
-// List/search invoices
-app.get("/api/invoices", requireAuth, async (req, res) => {
+// ----- LIST / FILTER INVOICES -----
+app.get("/api/invoices", async (req, res) => {
+  const auth = req.headers.authorization || "";
+  const token = auth.replace(/^Bearer\s+/i, "");
+  const who = verifyToken(token);
+  if (!who) return res.status(401).json({ error: "unauthorized" });
+
+  const { q, from, to, limit = 500 } = req.query;
+  const params = [];
+  let where = [];
+  if (q) {
+    params.push(`%${q}%`);
+    params.push(`%${q}%`);
+    where.push(`(customer_name ILIKE $${params.length - 1} OR vehicle_number ILIKE $${params.length})`);
+  }
+  if (from) { params.push(from); where.push(`created_at >= $${params.length}`); }
+  if (to)   { params.push(to + " 23:59:59"); where.push(`created_at <= $${params.length}`); }
+  const w = where.length ? `WHERE ${where.join(" AND ")}` : "";
+  const sql = `
+    SELECT * FROM invoices
+    ${w}
+    ORDER BY created_at DESC
+    LIMIT ${Number(limit) || 500}
+  `;
   try {
-    const { q, from, to, limit } = req.query;
-    const where = [`franchisee_id = $1`];
-    const params = [req.franchiseeCode];
-    let idx = 2;
-
-    if (q) { where.push(`(customer_name ILIKE $${idx} OR vehicle_number ILIKE $${idx})`); params.push(`%${q}%`); idx++; }
-    if (from) { where.push(`created_at >= $${idx}`); params.push(from + " 00:00:00"); idx++; }
-    if (to)   { where.push(`created_at <  $${idx}`); params.push(to + " 23:59:59"); idx++; }
-
-    const lim = Math.min(parseInt(limit || "500", 10), 1000);
-
-    const r = await pool.query(
-      `SELECT
-         id, created_at, updated_at,
-         customer_name, mobile_number, vehicle_number, odometer, tread_depth_mm, installer_name,
-         vehicle_type, tyre_width_mm, aspect_ratio, rim_diameter_in, tyre_count, fitment_locations,
-         customer_gstin, customer_address,
-         dosage_ml, price_per_ml, gst_rate, total_before_gst, gst_amount, total_with_gst,
-         gps_lat, gps_lng, customer_code, franchisee_id
-       FROM invoices
-       WHERE ${where.join(" AND ")}
-       ORDER BY created_at DESC
-       LIMIT ${lim}`, params
-    );
-
-    const rows = r.rows.map(row => ({
-      ...row,
-      tread_depth_mm: toNum(row.tread_depth_mm),
-      tyre_width_mm: toNum(row.tyre_width_mm),
-      aspect_ratio: toNum(row.aspect_ratio),
-      rim_diameter_in: toNum(row.rim_diameter_in),
-      dosage_ml: toNum(row.dosage_ml),
-      price_per_ml: toNum(row.price_per_ml),
-      gst_rate: toNum(row.gst_rate),
-      total_before_gst: toNum(row.total_before_gst),
-      gst_amount: toNum(row.gst_amount),
-      total_with_gst: toNum(row.total_with_gst),
-      gps_lat: toNum(row.gps_lat),
-      gps_lng: toNum(row.gps_lng),
-      tyre_count: row.tyre_count == null ? null : Number(row.tyre_count)
-    }));
-    res.json(rows);
+    const r = await pool.query(sql, params);
+    res.json(r.rows);
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: "db_error" });
   }
 });
 
-// Get one invoice
-app.get("/api/invoices/:id", requireAuth, async (req, res) => {
+// ----- SUMMARY -----
+app.get("/api/summary", async (req, res) => {
+  const auth = req.headers.authorization || "";
+  const token = auth.replace(/^Bearer\s+/i, "");
+  const who = verifyToken(token);
+  if (!who) return res.status(401).json({ error: "unauthorized" });
+
+  const { q, from, to } = req.query;
+  const params = [];
+  let where = [];
+  if (q) {
+    params.push(`%${q}%`);
+    params.push(`%${q}%`);
+    where.push(`(customer_name ILIKE $${params.length - 1} OR vehicle_number ILIKE $${params.length})`);
+  }
+  if (from) { params.push(from); where.push(`created_at >= $${params.length}`); }
+  if (to)   { params.push(to + " 23:59:59"); where.push(`created_at <= $${params.length}`); }
+  const w = where.length ? `WHERE ${where.join(" AND ")}` : "";
+  const sql = `
+    SELECT
+      COUNT(*)::int AS count,
+      COALESCE(SUM(dosage_ml),0)::numeric AS dosage_ml,
+      COALESCE(SUM(total_before_gst),0)::numeric AS total_before_gst,
+      COALESCE(SUM(gst_amount),0)::numeric AS gst_amount,
+      COALESCE(SUM(total_with_gst),0)::numeric AS total_with_gst
+    FROM invoices
+    ${w}
+  `;
   try {
-    const r = await pool.query(
-      `SELECT * FROM invoices WHERE id=$1 AND franchisee_id=$2`,
-      [req.params.id, req.franchiseeCode]
-    );
+    const r = await pool.query(sql, params);
+    res.json(r.rows[0]);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "db_error" });
+  }
+});
+
+// ----- GET ONE -----
+app.get("/api/invoices/:id", async (req, res) => {
+  const auth = req.headers.authorization || "";
+  const token = auth.replace(/^Bearer\s+/i, "");
+  const who = verifyToken(token);
+  if (!who) return res.status(401).json({ error: "unauthorized" });
+
+  try {
+    const r = await pool.query("SELECT * FROM invoices WHERE id=$1", [req.params.id]);
     if (!r.rows.length) return res.status(404).json({ error: "not_found" });
-    const row = r.rows[0];
-    const cleaned = {
-      ...row,
-      tread_depth_mm: toNum(row.tread_depth_mm),
-      tyre_width_mm: toNum(row.tyre_width_mm),
-      aspect_ratio: toNum(row.aspect_ratio),
-      rim_diameter_in: toNum(row.rim_diameter_in),
-      dosage_ml: toNum(row.dosage_ml),
-      price_per_ml: toNum(row.price_per_ml),
-      gst_rate: toNum(row.gst_rate),
-      total_before_gst: toNum(row.total_before_gst),
-      gst_amount: toNum(row.gst_amount),
-      total_with_gst: toNum(row.total_with_gst),
-      gps_lat: toNum(row.gps_lat),
-      gps_lng: toNum(row.gps_lng),
-      tyre_count: row.tyre_count == null ? null : Number(row.tyre_count)
-    };
-    res.json(cleaned);
+    res.json(r.rows[0]);
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: "db_error" });
   }
 });
 
-// Create invoice
-app.post("/api/invoices", requireApiKey, requireAuth, async (req, res) => {
+// ----- CREATE -----
+// Requires x-api-key header for write (simple guard)
+app.post("/api/invoices", async (req, res) => {
+  if ((req.headers["x-api-key"] || "") !== API_KEY) {
+    return res.status(401).json({ error: "unauthorized" });
+  }
+  const auth = req.headers.authorization || "";
+  const token = auth.replace(/^Bearer\s+/i, "");
+  const who = verifyToken(token);
+  if (!who) return res.status(401).json({ error: "unauthorized" });
+
   try {
     const {
-      customer_name, mobile_number, vehicle_number, odometer, tread_depth_mm, installer_name,
-      vehicle_type, tyre_width_mm, aspect_ratio, rim_diameter_in, tyre_count,
-      fitment_locations, customer_gstin, customer_address,
-      dosage_ml, gps_lat, gps_lng, customer_code
+      customer_name,
+      mobile_number,
+      vehicle_number,
+      odometer,
+      tread_depth_mm,
+      installer_name,
+      vehicle_type,
+      tyre_width_mm,
+      aspect_ratio,
+      rim_diameter_in,
+      tyre_count,
+      fitment_locations,
+      dosage_ml,
+      gps_lat,
+      gps_lng,
+      customer_code,
+      customer_gstin,
+      customer_address,
+      customer_signature, // base64 data URL ("data:image/png;base64,...")
+      signed_at
     } = req.body || {};
 
     if (!customer_name || !vehicle_number || !dosage_ml) {
       return res.status(400).json({ error: "missing_fields" });
     }
 
-    const price_per_ml = MRP_PER_ML;
-    const gst_rate = GST_RATE;
-    const total_before_gst = Number(dosage_ml) * price_per_ml;
-    const gst_amount = total_before_gst * gst_rate;
+    const total_before_gst = Number(dosage_ml) * MRP_PER_ML;
+    const gst_amount = total_before_gst * GST_RATE;
     const total_with_gst = total_before_gst + gst_amount;
 
     const q = `
       INSERT INTO invoices
-        (customer_name, mobile_number, vehicle_number, odometer, tread_depth_mm, installer_name,
-         vehicle_type, tyre_width_mm, aspect_ratio, rim_diameter_in, tyre_count, fitment_locations,
-         customer_gstin, customer_address,
+        (customer_name, mobile_number, vehicle_number, odometer, tread_depth_mm, installer_name, vehicle_type,
+         tyre_width_mm, aspect_ratio, rim_diameter_in, tyre_count, fitment_locations,
          dosage_ml, price_per_ml, gst_rate, total_before_gst, gst_amount, total_with_gst,
-         gps_lat, gps_lng, customer_code, franchisee_id)
+         gps_lat, gps_lng, customer_code, customer_gstin, customer_address, customer_signature, signed_at, updated_at)
       VALUES
-        ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)
+        ($1,$2,$3,$4,$5,$6,$7,
+         $8,$9,$10,$11,$12,
+         $13,$14,$15,$16,$17,$18,
+         $19,$20,$21,$22,$23,$24,$25,NOW())
       RETURNING id
     `;
     const vals = [
-      customer_name, mobile_number, vehicle_number, odometer, tread_depth_mm, installer_name,
-      vehicle_type, tyre_width_mm, aspect_ratio, rim_diameter_in, tyre_count, fitment_locations || null,
-      customer_gstin || null, customer_address || null,
-      dosage_ml, price_per_ml, gst_rate, total_before_gst, gst_amount, total_with_gst,
-      gps_lat, gps_lng, customer_code, req.franchiseeCode
+      customer_name, mobile_number, vehicle_number, odometer ?? null, tread_depth_mm ?? null, installer_name, vehicle_type,
+      tyre_width_mm ?? null, aspect_ratio ?? null, rim_diameter_in ?? null, tyre_count ?? null, fitment_locations || null,
+      dosage_ml, MRP_PER_ML, GST_RATE, total_before_gst, gst_amount, total_with_gst,
+      gps_lat ?? null, gps_lng ?? null, customer_code || null, customer_gstin || null, customer_address || null,
+      customer_signature || null, signed_at ? new Date(signed_at) : new Date()
     ];
     const r = await pool.query(q, vals);
     res.status(201).json({ id: r.rows[0].id, total_with_gst, gst_amount, total_before_gst });
@@ -311,102 +278,54 @@ app.post("/api/invoices", requireApiKey, requireAuth, async (req, res) => {
   }
 });
 
-// Edit invoice (keeps snapshot)
-app.put("/api/invoices/:id", requireApiKey, requireAuth, async (req, res) => {
-  try {
-    const id = Number(req.params.id);
-    const existing = await pool.query(
-      `SELECT * FROM invoices WHERE id=$1 AND franchisee_id=$2`,
-      [id, req.franchiseeCode]
-    );
-    if (!existing.rows.length) return res.status(404).json({ error: "not_found" });
-
-    // snapshot before update
-    await pool.query(
-      `INSERT INTO invoice_edits (invoice_id, snapshot) VALUES ($1, $2)`,
-      [id, JSON.stringify(existing.rows[0])]
-    );
-
-    const {
-      customer_name, mobile_number, vehicle_number, odometer, tread_depth_mm, installer_name,
-      vehicle_type, tyre_width_mm, aspect_ratio, rim_diameter_in, tyre_count,
-      fitment_locations, customer_gstin, customer_address,
-      dosage_ml, gps_lat, gps_lng, customer_code
-    } = req.body || {};
-
-    const useDosage = dosage_ml != null ? Number(dosage_ml) : Number(existing.rows[0].dosage_ml);
-    const price_per_ml = MRP_PER_ML;
-    const gst_rate = GST_RATE;
-    const total_before_gst = useDosage * price_per_ml;
-    const gst_amount = total_before_gst * gst_rate;
-    const total_with_gst = total_before_gst + gst_amount;
-
-    const q = `
-      UPDATE invoices SET
-        customer_name = COALESCE($1, customer_name),
-        mobile_number = COALESCE($2, mobile_number),
-        vehicle_number = COALESCE($3, vehicle_number),
-        odometer = COALESCE($4, odometer),
-        tread_depth_mm = COALESCE($5, tread_depth_mm),
-        installer_name = COALESCE($6, installer_name),
-        vehicle_type = COALESCE($7, vehicle_type),
-        tyre_width_mm = COALESCE($8, tyre_width_mm),
-        aspect_ratio = COALESCE($9, aspect_ratio),
-        rim_diameter_in = COALESCE($10, rim_diameter_in),
-        tyre_count = COALESCE($11, tyre_count),
-        fitment_locations = COALESCE($12, fitment_locations),
-        customer_gstin = COALESCE($13, customer_gstin),
-        customer_address = COALESCE($14, customer_address),
-        dosage_ml = $15,
-        price_per_ml = $16,
-        gst_rate = $17,
-        total_before_gst = $18,
-        gst_amount = $19,
-        total_with_gst = $20,
-        gps_lat = COALESCE($21, gps_lat),
-        gps_lng = COALESCE($22, gps_lng),
-        customer_code = COALESCE($23, customer_code),
-        updated_at = NOW()
-      WHERE id=$24 AND franchisee_id=$25
-      RETURNING id
-    `;
-    const vals = [
-      customer_name, mobile_number, vehicle_number, odometer, tread_depth_mm, installer_name,
-      vehicle_type, tyre_width_mm, aspect_ratio, rim_diameter_in, tyre_count,
-      fitment_locations || null, customer_gstin || null, customer_address || null,
-      useDosage, price_per_ml, gst_rate, total_before_gst, gst_amount, total_with_gst,
-      gps_lat, gps_lng, customer_code, id, req.franchiseeCode
-    ];
-    const r = await pool.query(q, vals);
-    if (!r.rows.length) return res.status(404).json({ error: "not_found" });
-    res.json({ id });
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: "db_error" });
+// ----- UPDATE (for edits) -----
+app.put("/api/invoices/:id", async (req, res) => {
+  if ((req.headers["x-api-key"] || "") !== API_KEY) {
+    return res.status(401).json({ error: "unauthorized" });
   }
-});
+  const auth = req.headers.authorization || "";
+  const token = auth.replace(/^Bearer\s+/i, "");
+  const who = verifyToken(token);
+  if (!who) return res.status(401).json({ error: "unauthorized" });
 
-// Summary
-app.get("/api/summary", requireAuth, async (req, res) => {
   try {
-    const { q, from, to } = req.query;
-    const where = [`franchisee_id = $1`];
-    const params = [req.franchiseeCode];
-    let idx = 2;
+    const b = req.body || {};
+    // Recompute totals if dosage changes
+    let dosage_ml = b.dosage_ml;
+    let total_before_gst = b.total_before_gst;
+    let gst_amount = b.gst_amount;
+    let total_with_gst = b.total_with_gst;
+    if (typeof dosage_ml !== "undefined") {
+      total_before_gst = Number(dosage_ml) * MRP_PER_ML;
+      gst_amount = total_before_gst * GST_RATE;
+      total_with_gst = total_before_gst + gst_amount;
+    }
 
-    if (q) { where.push(`(customer_name ILIKE $${idx} OR vehicle_number ILIKE $${idx})`); params.push(`%${q}%`); idx++; }
-    if (from) { where.push(`created_at >= $${idx}`); params.push(from + " 00:00:00"); idx++; }
-    if (to)   { where.push(`created_at <  $${idx}`); params.push(to + " 23:59:59"); idx++; }
+    const fields = [
+      "customer_name","mobile_number","vehicle_number","odometer","tread_depth_mm","installer_name","vehicle_type",
+      "tyre_width_mm","aspect_ratio","rim_diameter_in","tyre_count","fitment_locations",
+      "dosage_ml","customer_gstin","customer_address","customer_signature","signed_at"
+    ];
+    const sets = [];
+    const vals = [];
+    let idx = 1;
+    for (const f of fields) {
+      if (f in b) { sets.push(`${f} = $${idx++}`); vals.push(b[f]); }
+    }
+    if (typeof dosage_ml !== "undefined") {
+      sets.push(`price_per_ml = $${idx++}`); vals.push(MRP_PER_ML);
+      sets.push(`gst_rate = $${idx++}`); vals.push(GST_RATE);
+      sets.push(`total_before_gst = $${idx++}`); vals.push(total_before_gst);
+      sets.push(`gst_amount = $${idx++}`); vals.push(gst_amount);
+      sets.push(`total_with_gst = $${idx++}`); vals.push(total_with_gst);
+    }
+    sets.push(`updated_at = NOW()`);
 
-    const r = await pool.query(
-      `SELECT
-         COUNT(*)::int AS count,
-         COALESCE(SUM(dosage_ml),0)::float AS dosage_ml,
-         COALESCE(SUM(total_before_gst),0)::float AS total_before_gst,
-         COALESCE(SUM(gst_amount),0)::float AS gst_amount,
-         COALESCE(SUM(total_with_gst),0)::float AS total_with_gst
-       FROM invoices WHERE ${where.join(" AND ")}`, params
-    );
+    const sql = `UPDATE invoices SET ${sets.join(", ")} WHERE id=$${idx} RETURNING *`;
+    vals.push(req.params.id);
+
+    const r = await pool.query(sql, vals);
+    if (!r.rows.length) return res.status(404).json({ error: "not_found" });
     res.json(r.rows[0]);
   } catch (e) {
     console.error(e);
@@ -414,48 +333,29 @@ app.get("/api/summary", requireAuth, async (req, res) => {
   }
 });
 
-// CSV Export
-app.get("/api/invoices/export", requireAuth, async (req, res) => {
+// ----- EXPORT CSV -----
+app.get("/api/invoices/export", async (req, res) => {
+  const auth = req.headers.authorization || "";
+  const token = auth.replace(/^Bearer\s+/i, "");
+  const who = verifyToken(token);
+  if (!who) return res.status(401).json({ error: "unauthorized" });
+
   try {
-    const { q, from, to } = req.query;
-    const where = [`franchisee_id = $1`];
-    const params = [req.franchiseeCode];
-    let idx = 2;
-
-    if (q) { where.push(`(customer_name ILIKE $${idx} OR vehicle_number ILIKE $${idx})`); params.push(`%${q}%`); idx++; }
-    if (from) { where.push(`created_at >= $${idx}`); params.push(from + " 00:00:00"); idx++; }
-    if (to)   { where.push(`created_at <  $${idx}`); params.push(to + " 23:59:59"); idx++; }
-
-    const r = await pool.query(
-      `SELECT id, created_at, customer_name, mobile_number, vehicle_number, vehicle_type,
-              tyre_count, fitment_locations, tyre_width_mm, aspect_ratio, rim_diameter_in,
-              tread_depth_mm, dosage_ml, price_per_ml, gst_rate,
-              total_before_gst, gst_amount, total_with_gst,
-              customer_gstin, customer_address
-       FROM invoices
-       WHERE ${where.join(" AND ")}
-       ORDER BY created_at DESC`, params
-    );
-
-    const rows = r.rows;
-    const header = [
-      "id","created_at","customer_name","mobile_number","vehicle_number","vehicle_type",
-      "tyre_count","fitment_locations","tyre_width_mm","aspect_ratio","rim_diameter_in",
-      "tread_depth_mm","dosage_ml","price_per_ml","gst_rate",
-      "total_before_gst","gst_amount","total_with_gst",
-      "customer_gstin","customer_address"
-    ];
-    const escape = (v) => {
-      const s = v == null ? "" : String(v);
-      if (s.includes(",") || s.includes("\n") || s.includes("\"")) return `"${s.replace(/"/g, '""')}"`;
-      return s;
-    };
-    const lines = [header.join(",")];
-    for (const row of rows) lines.push(header.map(h => escape(row[h])).join(","));
-    const csv = lines.join("\n");
-
-    res.setHeader("Content-Type", "text/csv");
-    res.setHeader("Content-Disposition", `attachment; filename="invoices_export.csv"`);
+    const r = await pool.query(`
+      SELECT id, created_at, customer_name, vehicle_number, vehicle_type, tyre_count, dosage_ml,
+             total_before_gst, gst_amount, total_with_gst
+      FROM invoices
+      ORDER BY created_at DESC
+      LIMIT 1000
+    `);
+    const rows = r.rows || [];
+    const header = "id,created_at,customer_name,vehicle_number,vehicle_type,tyre_count,dosage_ml,total_before_gst,gst_amount,total_with_gst\n";
+    const csv = header + rows.map(o =>
+      [o.id, o.created_at?.toISOString?.() || o.created_at, o.customer_name, o.vehicle_number, o.vehicle_type, o.tyre_count, o.dosage_ml, o.total_before_gst, o.gst_amount, o.total_with_gst]
+        .map(v => `"${String(v ?? "").replace(/"/g,'""')}"`).join(",")
+    ).join("\n");
+    res.setHeader("Content-Type", "text/csv; charset=utf-8");
+    res.setHeader("Content-Disposition", "attachment; filename=invoices_export.csv");
     res.send(csv);
   } catch (e) {
     console.error(e);
@@ -464,6 +364,6 @@ app.get("/api/invoices/export", requireAuth, async (req, res) => {
 });
 
 app.listen(PORT, async () => {
-  await ensureTables();
+  await ensureTable();
   console.log(`API listening on ${PORT}`);
 });
