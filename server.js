@@ -8,30 +8,36 @@ const { Pool } = pkg;
 const PORT = process.env.PORT || 10000;
 const DATABASE_URL = process.env.DATABASE_URL;
 
-const FRONTEND_URL = process.env.FRONTEND_URL || "https://maxtt-billing-frontend.onrender.com";
+// Allow only your frontend
+const FRONTEND_URL =
+  process.env.FRONTEND_URL || "https://maxtt-billing-frontend.onrender.com";
+
+// Commercial settings
+const MRP_PER_ML = Number(process.env.MRP_PER_ML || "4.5");
+const GST_RATE = Number(process.env.GST_RATE || "0.18");
+
+// Extra protection for create/update routes
 const API_KEY = process.env.API_KEY || "";
 
-const MRP_PER_ML = Number(process.env.MRP_PER_ML || "4.5");
-const GST_RATE   = Number(process.env.GST_RATE   || "0.18");
-
-// Bootstrap single franchisee (for first run). You can add more later via SQL.
-const SEED_CODE    = process.env.FRANCHISEE_ID || "";       // e.g. MAXTT-DEL-001
-const SEED_PASS    = process.env.FRANCHISEE_PASSWORD || ""; // temp plain for MVP
-const SEED_NAME    = process.env.FRANCHISEE_NAME || "Franchisee Name";
-const SEED_ADDR    = process.env.FRANCHISEE_ADDRESS || "Franchisee Address";
-const SEED_GSTIN   = process.env.FRANCHISEE_GSTIN || "XXABCDE1234F1Z5";
+// Seed one franchisee from env (you can add more later via SQL)
+const SEED_CODE = process.env.FRANCHISEE_ID || "";
+const SEED_PASS = process.env.FRANCHISEE_PASSWORD || "";
+const SEED_NAME = process.env.FRANCHISEE_NAME || "Franchisee Name";
+const SEED_ADDR = process.env.FRANCHISEE_ADDRESS || "FULL POSTAL ADDRESS AS PER GSTIN CERTIFICATE";
+const SEED_GSTIN = process.env.FRANCHISEE_GSTIN || "AS PER GSTIN CERTIFICATE";
 
 const app = express();
 app.use(express.json());
 app.use(cors({ origin: FRONTEND_URL, credentials: false }));
 app.options("*", cors({ origin: FRONTEND_URL, credentials: false }));
 
-if (!DATABASE_URL) console.error("Missing DATABASE_URL env var");
+if (!DATABASE_URL) console.error("Missing DATABASE_URL");
 const pool = new Pool({ connectionString: DATABASE_URL });
 
-// ================== TOKEN STORE ==================
+// -------------------- TOKEN STORE (in-memory) --------------------
 const TOKENS = new Map(); // token -> { exp, code }
 const TOKEN_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
 function issueToken(code) {
   const token = crypto.randomBytes(24).toString("hex");
   TOKENS.set(token, { exp: Date.now() + TOKEN_TTL_MS, code });
@@ -40,21 +46,24 @@ function issueToken(code) {
 function readToken(token) {
   const rec = TOKENS.get(token);
   if (!rec) return null;
-  if (Date.now() > rec.exp) { TOKENS.delete(token); return null; }
-  return rec; // {exp, code}
+  if (Date.now() > rec.exp) {
+    TOKENS.delete(token);
+    return null;
+  }
+  return rec;
 }
 setInterval(() => {
   const now = Date.now();
   for (const [t, { exp }] of TOKENS) if (now > exp) TOKENS.delete(t);
 }, 60 * 60 * 1000);
 
-// ================== DB ENSURE ====================
+// -------------------- DB ENSURE + AUTO-MIGRATIONS --------------------
 const ensureTables = async () => {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS franchisees (
       id SERIAL PRIMARY KEY,
-      code TEXT UNIQUE NOT NULL,         -- franchisee login ID/code
-      password TEXT NOT NULL,            -- MVP: plaintext (improve later)
+      code TEXT UNIQUE NOT NULL,
+      password TEXT NOT NULL,
       name TEXT,
       address TEXT,
       gstin TEXT,
@@ -63,7 +72,6 @@ const ensureTables = async () => {
     );
   `);
 
-  // Seed single franchisee if provided
   if (SEED_CODE && SEED_PASS) {
     await pool.query(
       `INSERT INTO franchisees (code, password, name, address, gstin, is_active)
@@ -83,7 +91,6 @@ const ensureTables = async () => {
       id SERIAL PRIMARY KEY,
       created_at TIMESTAMP DEFAULT NOW(),
       updated_at TIMESTAMP DEFAULT NOW(),
-      -- customer & job
       customer_name TEXT,
       mobile_number TEXT,
       vehicle_number TEXT,
@@ -98,18 +105,15 @@ const ensureTables = async () => {
       fitment_locations TEXT,
       customer_gstin TEXT,
       customer_address TEXT,
-      -- totals
       dosage_ml NUMERIC,
       price_per_ml NUMERIC,
       gst_rate NUMERIC,
       total_before_gst NUMERIC,
       gst_amount NUMERIC,
       total_with_gst NUMERIC,
-      -- meta
       gps_lat NUMERIC,
       gps_lng NUMERIC,
       customer_code TEXT,
-      -- ownership
       franchisee_id TEXT NOT NULL
     );
   `);
@@ -123,16 +127,20 @@ const ensureTables = async () => {
     );
   `);
 
-  // Add columns if missing (for older DBs)
+  // --- Add missing columns safely for older DBs ---
   await pool.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW();`);
   await pool.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS franchisee_id TEXT;`);
+  await pool.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS tyre_count INTEGER;`);
+  await pool.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS fitment_locations TEXT;`);
+  await pool.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS customer_gstin TEXT;`);
+  await pool.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS customer_address TEXT;`);
 };
 
 const toNum = (v) => (v === null || v === undefined || v === "" ? null : Number(v));
 
-// ================== MIDDLEWARE ===================
+// -------------------- MIDDLEWARE --------------------
 function requireApiKey(req, res, next) {
-  if (!API_KEY) { console.warn("No API_KEY set; skipping x-api-key check"); return next(); }
+  if (!API_KEY) return next(); // if not set, skip (MVP)
   const provided = req.header("x-api-key") || req.query.api_key;
   if (provided && provided === API_KEY) return next();
   return res.status(401).json({ error: "unauthorized" });
@@ -151,11 +159,11 @@ async function getFranchiseeByCode(code) {
   return r.rows[0] || null;
 }
 
-// ================== ROUTES =======================
+// -------------------- ROUTES --------------------
 app.get("/healthz", (_req, res) => res.status(200).send("OK"));
 app.get("/", (_req, res) => res.send("MaxTT Billing API is running ✔"));
 
-// ---- Login (multi-franchisee)
+// Login → returns token
 app.post("/api/login", async (req, res) => {
   const { id, password } = req.body || {};
   if (!id || !password) return res.status(400).json({ error: "missing_credentials" });
@@ -167,14 +175,14 @@ app.post("/api/login", async (req, res) => {
   res.json({ token });
 });
 
-// ---- Profile (for header) - requires auth
+// Franchisee profile (for header)
 app.get("/api/profile", requireAuth, async (req, res) => {
   const fr = await getFranchiseeByCode(req.franchiseeCode);
   if (!fr) return res.status(404).json({ error: "franchisee_not_found" });
   res.json({ franchisee_id: fr.code, name: fr.name, address: fr.address, gstin: fr.gstin });
 });
 
-// ---- List / search with filters (A)
+// List/search invoices
 app.get("/api/invoices", requireAuth, async (req, res) => {
   try {
     const { q, from, to, limit } = req.query;
@@ -182,14 +190,11 @@ app.get("/api/invoices", requireAuth, async (req, res) => {
     const params = [req.franchiseeCode];
     let idx = 2;
 
-    if (q) {
-      where.push(`(customer_name ILIKE $${idx} OR vehicle_number ILIKE $${idx})`);
-      params.push(`%${q}%`); idx++;
-    }
+    if (q) { where.push(`(customer_name ILIKE $${idx} OR vehicle_number ILIKE $${idx})`); params.push(`%${q}%`); idx++; }
     if (from) { where.push(`created_at >= $${idx}`); params.push(from + " 00:00:00"); idx++; }
     if (to)   { where.push(`created_at <  $${idx}`); params.push(to + " 23:59:59"); idx++; }
 
-    const lim = Math.min(parseInt(limit || "200", 10), 1000);
+    const lim = Math.min(parseInt(limit || "500", 10), 1000);
 
     const r = await pool.query(
       `SELECT
@@ -228,7 +233,7 @@ app.get("/api/invoices", requireAuth, async (req, res) => {
   }
 });
 
-// ---- Details (A)
+// Get one invoice
 app.get("/api/invoices/:id", requireAuth, async (req, res) => {
   try {
     const r = await pool.query(
@@ -260,7 +265,7 @@ app.get("/api/invoices/:id", requireAuth, async (req, res) => {
   }
 });
 
-// ---- Create (C auto-PDF will use returned id) (requires auth + API key)
+// Create invoice
 app.post("/api/invoices", requireApiKey, requireAuth, async (req, res) => {
   try {
     const {
@@ -306,7 +311,7 @@ app.post("/api/invoices", requireApiKey, requireAuth, async (req, res) => {
   }
 });
 
-// ---- Edit & re-save (D) with history snapshot
+// Edit invoice (keeps snapshot)
 app.put("/api/invoices/:id", requireApiKey, requireAuth, async (req, res) => {
   try {
     const id = Number(req.params.id);
@@ -329,7 +334,6 @@ app.put("/api/invoices/:id", requireApiKey, requireAuth, async (req, res) => {
       dosage_ml, gps_lat, gps_lng, customer_code
     } = req.body || {};
 
-    // recompute totals if dosage provided, else keep current
     const useDosage = dosage_ml != null ? Number(dosage_ml) : Number(existing.rows[0].dosage_ml);
     const price_per_ml = MRP_PER_ML;
     const gst_rate = GST_RATE;
@@ -382,7 +386,7 @@ app.put("/api/invoices/:id", requireApiKey, requireAuth, async (req, res) => {
   }
 });
 
-// ---- Summary (B)
+// Summary
 app.get("/api/summary", requireAuth, async (req, res) => {
   try {
     const { q, from, to } = req.query;
@@ -410,7 +414,7 @@ app.get("/api/summary", requireAuth, async (req, res) => {
   }
 });
 
-// ---- CSV Export (B)
+// CSV Export
 app.get("/api/invoices/export", requireAuth, async (req, res) => {
   try {
     const { q, from, to } = req.query;
@@ -443,16 +447,13 @@ app.get("/api/invoices/export", requireAuth, async (req, res) => {
     ];
     const escape = (v) => {
       const s = v == null ? "" : String(v);
-      if (s.includes(",") || s.includes("\n") || s.includes("\"")) {
-        return `"${s.replace(/"/g, '""')}"`;
-      }
+      if (s.includes(",") || s.includes("\n") || s.includes("\"")) return `"${s.replace(/"/g, '""')}"`;
       return s;
     };
     const lines = [header.join(",")];
-    for (const row of rows) {
-      lines.push(header.map(h => escape(row[h])).join(","));
-    }
+    for (const row of rows) lines.push(header.map(h => escape(row[h])).join(","));
     const csv = lines.join("\n");
+
     res.setHeader("Content-Type", "text/csv");
     res.setHeader("Content-Disposition", `attachment; filename="invoices_export.csv"`);
     res.send(csv);
