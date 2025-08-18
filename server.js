@@ -1,4 +1,6 @@
-// server.js (ESM, regex-free, with diagnostics + create-view) — maxtt-billing-api
+// server.js — Lite version (ESM, regex-free)
+// Use when your DB does NOT have a `users` table.
+// It creates a view that only reads from `invoices` and sets role = NULL.
 
 import express from 'express'
 import cors from 'cors'
@@ -9,7 +11,7 @@ const app = express()
 app.use(cors())
 app.use(express.json())
 
-// --- DB connection (Render → Environment → DATABASE_URL must be set) ---
+// --- DB connection (Render → Environment → DATABASE_URL) ---
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false },
@@ -29,6 +31,18 @@ app.get('/api/diag/db', async (_req, res) => {
   }
 })
 
+app.get('/api/diag/whoami', async (_req, res) => {
+  try {
+    const r = await pool.query(`SELECT current_database() AS db, current_schema() AS schema`)
+    const url = process.env.DATABASE_URL || ''
+    let host = '', databaseFromUrl = ''
+    try { const u = new URL(url); host = u.hostname; databaseFromUrl = (u.pathname || '').replace('/', '') } catch {}
+    res.json({ ok: true, current_database: r.rows[0]?.db, current_schema: r.rows[0]?.schema, url_host: host, url_database: databaseFromUrl, ssl: true })
+  } catch (err) {
+    res.status(500).json({ ok: false, where: 'whoami', message: err?.message || String(err) })
+  }
+})
+
 app.get('/api/diag/view', async (_req, res) => {
   try {
     const r = await pool.query(`SELECT to_regclass('public.v_invoice_export') AS v`)
@@ -37,30 +51,6 @@ app.get('/api/diag/view', async (_req, res) => {
     res.json({ ok: true, view: String(exists) })
   } catch (err) {
     res.status(500).json({ ok: false, where: 'view_check', message: err?.message || String(err) })
-  }
-})
-
-// tells you which DB the API is using (no secrets)
-app.get('/api/diag/whoami', async (_req, res) => {
-  try {
-    const r = await pool.query(`SELECT current_database() AS db, current_schema() AS schema`)
-    const url = process.env.DATABASE_URL || ''
-    let host = '', databaseFromUrl = ''
-    try {
-      const u = new URL(url)
-      host = u.hostname
-      databaseFromUrl = (u.pathname || '').replace('/', '')
-    } catch {}
-    res.json({
-      ok: true,
-      current_database: r.rows[0]?.db,
-      current_schema: r.rows[0]?.schema,
-      url_host: host,
-      url_database: databaseFromUrl,
-      ssl: true
-    })
-  } catch (err) {
-    res.status(500).json({ ok: false, where: 'whoami', message: err?.message || String(err) })
   }
 })
 
@@ -78,8 +68,7 @@ const CSV_HEADERS = [
 function csvField(val) {
   if (val === null || val === undefined) return ''
   const s = String(val)
-  const mustQuote =
-    s.includes('"') || s.includes(',') || s.includes('\n') || s.includes('\r') || s.includes(';')
+  const mustQuote = s.includes('"') || s.includes(',') || s.includes('\n') || s.includes('\r') || s.includes(';')
   const escaped = s.split('"').join('""')
   return mustQuote ? `"${escaped}"` : escaped
 }
@@ -103,8 +92,8 @@ function rowsToCsv(rows) {
   return lines.join('\r\n') + '\r\n' // Excel-friendly CRLF
 }
 
-// ---------- Create-view helper (one-click) ----------
-const CREATE_VIEW_SQL = `
+// ---------- CREATE VIEW (LITE) — no users table needed ----------
+const CREATE_VIEW_LITE_SQL = `
 CREATE OR REPLACE VIEW public.v_invoice_export AS
 SELECT
   i.id                        AS invoice_id,
@@ -137,18 +126,16 @@ SELECT
   i.tread_depth_min_mm,
   i.speed_rating,
   i.created_by_user_id,
-  u.role
-FROM public.invoices i
-LEFT JOIN public.users u ON u.id = i.created_by_user_id;
+  NULL::text AS role
+FROM invoices i;
 `;
 
-// GET for simplicity (you can remove after it works)
-app.get('/api/admin/create-view', async (_req, res) => {
+app.get('/api/admin/create-view-lite', async (_req, res) => {
   try {
-    await pool.query(CREATE_VIEW_SQL)
+    await pool.query(CREATE_VIEW_LITE_SQL)
     res.json({ ok: true, created: 'public.v_invoice_export' })
   } catch (err) {
-    res.status(500).json({ ok: false, where: 'create_view', message: err?.message || String(err) })
+    res.status(500).json({ ok: false, where: 'create_view_lite', message: err?.message || String(err) })
   }
 })
 
@@ -187,17 +174,11 @@ app.get('/api/exports/invoices', async (req, res) => {
       res.setHeader('Content-Disposition', `attachment; filename="${filename}"`)
       res.setHeader('Cache-Control', 'no-store')
       res.status(200).send(bom + csv)
-    } catch (err) {
-      throw err
     } finally {
       client.release()
     }
   } catch (err) {
-    res.status(500).json({
-      ok: false,
-      error: 'CSV export failed',
-      message: err?.message || String(err)
-    })
+    res.status(500).json({ ok: false, error: 'CSV export failed', message: err?.message || String(err) })
   }
 })
 
