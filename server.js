@@ -1,22 +1,22 @@
-// server.js  (maxtt-billing-api)
-// Full drop-in file. No edits needed except your Render env (DATABASE_URL) must be set.
+// server.js  (ESM version)  — maxtt-billing-api
+// Works with "type": "module" in package.json and Node 18+ on Render.
 
-const express = require('express')
-const cors = require('cors')
-const { Pool } = require('pg')
+import express from 'express'
+import cors from 'cors'
+import pkg from 'pg'
+const { Pool } = pkg
 
 const app = express()
-app.use(cors())                 // allow your frontend to call this API
+app.use(cors())
 app.use(express.json())
 
-// Postgres connection: Render/Neon URL must be in env as DATABASE_URL
+// Postgres connection (Neon/Render). Make sure DATABASE_URL is set in Render → Environment.
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  // For Neon/Render SSL:
   ssl: { rejectUnauthorized: false },
 })
 
-// -------- CSV helpers --------
+// ---------- CSV helpers ----------
 const CSV_HEADERS = [
   'Invoice ID','Invoice No','Timestamp (IST)','Franchisee Code','Admin Code','SuperAdmin Code',
   'Customer Code','Referral Code','Vehicle No','Make/Model','Odometer',
@@ -76,20 +76,19 @@ function rowsToCsv(rows) {
       r.role,
     ])
   )
-  // Excel prefers CRLF endings
+  // Excel-friendly CRLF line endings
   return [header, ...data].join('\r\n') + '\r\n'
 }
 
-// -------- Health check --------
+// ---------- Health check ----------
 app.get('/api/health', (_req, res) => res.json({ ok: true }))
 
-// -------- CSV export endpoint --------
-// URL: GET /api/exports/invoices?from=YYYY-MM-DD&to=YYYY-MM-DD&franchisee=CODE&q=SEARCH
+// ---------- CSV export endpoint ----------
+// GET /api/exports/invoices?from=YYYY-MM-DD&to=YYYY-MM-DD&franchisee=CODE&q=SEARCH
 app.get('/api/exports/invoices', async (req, res) => {
   try {
     const { from, to, franchisee, q } = req.query
 
-    // Build WHERE clause with safe parameters
     const where = []
     const params = []
     let i = 1
@@ -104,14 +103,14 @@ app.get('/api/exports/invoices', async (req, res) => {
     }
 
     const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : ''
-    // Uses the SQL view you already created: v_invoice_export
+    // Uses the view you already created: v_invoice_export
     const sql = `SELECT * FROM v_invoice_export ${whereSql} ORDER BY invoice_ts_ist DESC LIMIT 50000;`
 
     const client = await pool.connect()
     try {
       const result = await client.query(sql, params)
       const csv = rowsToCsv(result.rows)
-      const bom = '\uFEFF' // UTF-8 BOM so Excel shows Hindi/UTF-8 correctly
+      const bom = '\uFEFF' // ensure Excel reads UTF-8 (Hindi OK)
 
       const now = new Date().toISOString().slice(0,19).replace(/[:T]/g,'')
       const wm = franchisee ? `_${franchisee}` : ''
@@ -130,7 +129,7 @@ app.get('/api/exports/invoices', async (req, res) => {
   }
 })
 
-// -------- Start server (Render supplies PORT) --------
+// ---------- Start server ----------
 const port = process.env.PORT || 3001
 app.listen(port, () => {
   console.log(`API listening on :${port}`)
