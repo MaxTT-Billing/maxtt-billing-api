@@ -1,22 +1,18 @@
-// server.js  (ESM version)  — maxtt-billing-api
-// Works with "type": "module" in package.json and Node 18+ on Render.
-
-import express from 'express'
-import cors from 'cors'
-import pkg from 'pg'
-const { Pool } = pkg
+const express = require('express')
+const cors = require('cors')
+const { Pool } = require('pg')
 
 const app = express()
 app.use(cors())
 app.use(express.json())
 
-// Postgres connection (Neon/Render). Make sure DATABASE_URL is set in Render → Environment.
+// Postgres pool (Render/Neon)
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false },
 })
 
-// ---------- CSV helpers ----------
+// CSV helpers
 const CSV_HEADERS = [
   'Invoice ID','Invoice No','Timestamp (IST)','Franchisee Code','Admin Code','SuperAdmin Code',
   'Customer Code','Referral Code','Vehicle No','Make/Model','Odometer',
@@ -32,7 +28,9 @@ function toCsvRow(fields) {
     .map((v) => {
       if (v === null || v === undefined) return ''
       const s = String(v)
-      const mustQuote = /[",\n\r;]/.test(s) || s.includes(',')
+      const mustQuote = /[",
+
+;]/.test(s) || s.includes(',')
       const escaped = s.replace(/"/g, '""')
       return mustQuote ? `"${escaped}"` : escaped
     })
@@ -76,15 +74,15 @@ function rowsToCsv(rows) {
       r.role,
     ])
   )
-  // Excel-friendly CRLF line endings
-  return [header, ...data].join('\r\n') + '\r\n'
+  return [header, ...data].join('
+') + '
+'
 }
 
-// ---------- Health check ----------
+// Health check
 app.get('/api/health', (_req, res) => res.json({ ok: true }))
 
-// ---------- CSV export endpoint ----------
-// GET /api/exports/invoices?from=YYYY-MM-DD&to=YYYY-MM-DD&franchisee=CODE&q=SEARCH
+// CSV export endpoint
 app.get('/api/exports/invoices', async (req, res) => {
   try {
     const { from, to, franchisee, q } = req.query
@@ -94,23 +92,22 @@ app.get('/api/exports/invoices', async (req, res) => {
     let i = 1
 
     if (from) { where.push(`invoice_ts_ist::date >= $${i++}`); params.push(from) }
-    if (to)   { where.push(`invoice_ts_ist::date <= $${i++}`); params.push(to) }
+    if (to) { where.push(`invoice_ts_ist::date <= $${i++}`); params.push(to) }
     if (franchisee) { where.push(`franchisee_code = $${i++}`); params.push(franchisee) }
     if (q) {
       const like = `%${String(q).replace(/%/g, '')}%`
       where.push(`(vehicle_no ILIKE $${i} OR customer_code ILIKE $${i})`)
       params.push(like); i++
     }
-
     const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : ''
-    // Uses the view you already created: v_invoice_export
+
     const sql = `SELECT * FROM v_invoice_export ${whereSql} ORDER BY invoice_ts_ist DESC LIMIT 50000;`
 
     const client = await pool.connect()
     try {
       const result = await client.query(sql, params)
       const csv = rowsToCsv(result.rows)
-      const bom = '\uFEFF' // ensure Excel reads UTF-8 (Hindi OK)
+      const bom = '﻿'
 
       const now = new Date().toISOString().slice(0,19).replace(/[:T]/g,'')
       const wm = franchisee ? `_${franchisee}` : ''
@@ -129,7 +126,6 @@ app.get('/api/exports/invoices', async (req, res) => {
   }
 })
 
-// ---------- Start server ----------
 const port = process.env.PORT || 3001
 app.listen(port, () => {
   console.log(`API listening on :${port}`)
