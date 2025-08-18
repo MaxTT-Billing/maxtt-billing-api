@@ -1,6 +1,6 @@
-// server.js — Lite version (ESM, regex-free)
-// Use when your DB does NOT have a `users` table.
-// It creates a view that only reads from `invoices` and sets role = NULL.
+// server.js — AUTO view creator (ESM, regex-free)
+// It detects which columns exist in `invoices` and builds a matching view.
+// Then CSV export works even if your column names are different.
 
 import express from 'express'
 import cors from 'cors'
@@ -92,50 +92,73 @@ function rowsToCsv(rows) {
   return lines.join('\r\n') + '\r\n' // Excel-friendly CRLF
 }
 
-// ---------- CREATE VIEW (LITE) — no users table needed ----------
-const CREATE_VIEW_LITE_SQL = `
-CREATE OR REPLACE VIEW public.v_invoice_export AS
-SELECT
-  i.id                        AS invoice_id,
-  i.invoice_number,
-  (i.created_at AT TIME ZONE 'Asia/Kolkata') AS invoice_ts_ist,
-  i.franchisee_code,
-  i.admin_code,
-  i.super_admin_code,
-  i.customer_code,
-  i.referral_code,
-  i.vehicle_no,
-  i.vehicle_make_model,
-  i.odometer_reading,
-  i.tyre_size_fl,
-  i.tyre_size_fr,
-  i.tyre_size_rl,
-  i.tyre_size_rr,
-  i.total_qty_ml,
-  i.mrp_per_ml,
-  i.installation_cost,
-  i.discount_amount,
-  i.subtotal_ex_gst,
-  i.gst_rate,
-  i.gst_amount,
-  i.total_amount,
-  i.stock_level_at_start_l,
-  i.gps_lat,
-  i.gps_lng,
-  i.site_address_text,
-  i.tread_depth_min_mm,
-  i.speed_rating,
-  i.created_by_user_id,
-  NULL::text AS role
-FROM invoices i;
-`;
-
-app.get('/api/admin/create-view-lite', async (_req, res) => {
+// ---------- AUTO: create view that adapts to your columns ----------
+app.get('/api/admin/create-view-auto', async (_req, res) => {
+  const client = await pool.connect()
   try {
-    await pool.query(CREATE_VIEW_LITE_SQL)
-    res.json({ ok: true, created: 'public.v_invoice_export' })
+    // 1) Read columns from public.invoices
+    const colsRes = await client.query(`
+      SELECT lower(column_name) AS name
+      FROM information_schema.columns
+      WHERE table_schema = 'public' AND table_name = 'invoices'
+    `)
+    const cols = new Set(colsRes.rows.map(r => r.name))
+
+    const has = (name) => cols.has(String(name).toLowerCase())
+    const pick = (...cands) => cands.find(c => has(c)) || null
+    const qid = (name) => `"${name}"` // quote identifier
+    const expr = (alias, candidates) => {
+      const found = pick(...candidates)
+      return found ? `i.${qid(found)}::text AS ${qid(alias)}` : `NULL::text AS ${qid(alias)}`
+    }
+
+    // 2) Build SELECT list with fallbacks (all cast to text for safety)
+    const selectParts = [
+      expr('invoice_id', ['id','invoice_id']),
+      expr('invoice_number', ['invoice_number','invoice_no','inv_no','bill_no','invoice']),
+      expr('invoice_ts_ist', ['invoice_ts_ist','created_at','invoice_date','createdon','created_on','date']),
+      expr('franchisee_code', ['franchisee_code','franchisee','franchise_code']),
+      expr('admin_code', ['admin_code','admin']),
+      expr('super_admin_code', ['super_admin_code','superadmin_code','sa_code']),
+      expr('customer_code', ['customer_code','customer_id','customer','cust_code']),
+      expr('referral_code', ['referral_code','ref_code','referral']),
+      expr('vehicle_no', ['vehicle_no','vehicle_number','registration_no','reg_no','vehicle']),
+      expr('vehicle_make_model', ['vehicle_make_model','make_model','model','make']),
+      expr('odometer_reading', ['odometer_reading','odometer','odo','kms']),
+      expr('tyre_size_fl', ['tyre_size_fl','fl_tyre','tyre_fl']),
+      expr('tyre_size_fr', ['tyre_size_fr','fr_tyre','tyre_fr']),
+      expr('tyre_size_rl', ['tyre_size_rl','rl_tyre','tyre_rl']),
+      expr('tyre_size_rr', ['tyre_size_rr','rr_tyre','tyre_rr']),
+      expr('total_qty_ml', ['total_qty_ml','qty_ml','total_ml','quantity_ml','qty']),
+      expr('mrp_per_ml', ['mrp_per_ml','price_per_ml','rate_per_ml','mrp_ml']),
+      expr('installation_cost', ['installation_cost','install_cost','labour','labour_cost']),
+      expr('discount_amount', ['discount_amount','discount','disc']),
+      expr('subtotal_ex_gst', ['subtotal_ex_gst','subtotal','sub_total','amount_before_tax','amount_ex_gst','pre_tax_total']),
+      expr('gst_rate', ['gst_rate','tax_rate','gst_percent','gst']),
+      expr('gst_amount', ['gst_amount','tax_amount','gst_value','tax']),
+      expr('total_amount', ['total_amount','grand_total','total','amount']),
+      expr('stock_level_at_start_l', ['stock_level_at_start_l','stock_before','stock_at_start_l','stock_start_liters']),
+      expr('gps_lat', ['gps_lat','latitude','lat']),
+      expr('gps_lng', ['gps_lng','longitude','lng','lon']),
+      expr('site_address_text', ['site_address_text','address','site_address','location']),
+      expr('tread_depth_min_mm', ['tread_depth_min_mm','tread_depth','min_tread_mm']),
+      expr('speed_rating', ['speed_rating','speedrate','speed']),
+      expr('created_by_user_id', ['created_by_user_id','created_by','user_id']),
+      'NULL::text AS "role"' // lite: no users table
+    ]
+
+    const createViewSql = `
+      CREATE OR REPLACE VIEW public.v_invoice_export AS
+      SELECT
+        ${selectParts.join(',\n        ')}
+      FROM public.invoices i;
+    `
+    await client.query(createViewSql)
+    res.json({ ok: true, created: 'public.v_invoice_export', used_columns: Array.from(cols).sort() })
   } catch (err) {
-    res.status(500).json({ ok: false, where: 'create_view_lite', message: err?.message || String(err) })
+    res.status(500).json({ ok: false, where: 'create_view_auto', message: err?.message || String(err) })
+  } finally {
+    client.release()
   }
 })
 
@@ -165,7 +188,6 @@ app.get('/api/exports/invoices', async (req, res) => {
       const result = await client.query(sql, params)
       const csv = rowsToCsv(result.rows)
       const bom = '\uFEFF'
-
       const now = new Date().toISOString().slice(0,19).replace(/[:T]/g,'')
       const wm = franchisee ? `_${franchisee}` : ''
       const filename = `maxtt_invoices_${now}${wm}.csv`
