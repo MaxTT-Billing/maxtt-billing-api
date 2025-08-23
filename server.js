@@ -1,11 +1,11 @@
-// server.js — Full API (ESM) with adaptive columns + CSV export + TEMP referrals test routes
+// server.js — Full API (ESM) with adaptive columns + CSV export + Referrals auto-notify
 
 import express from 'express'
 import cors from 'cors'
 import pkg from 'pg'
 const { Pool } = pkg
 
-// ✅ ESM named import for the hook
+// ✅ Referrals hook (ESM)
 import { notifyReferralForInvoice } from './referralsHook.js'
 
 const app = express()
@@ -63,39 +63,6 @@ app.get('/api/diag/view', async (_req, res) => {
     res.json({ ok:true, view: String(exists) })
   } catch (err) {
     res.status(500).json({ ok:false, where:'view_check', message: err?.message || String(err) })
-  }
-})
-
-// ------------ TEMP referrals test routes ------------
-app.get('/__test/ping', (_req, res) => res.json({ ok: true, route: '/__test/* mounted' }))
-
-/**
- * POST /__test/invoice
- * Body JSON:
- * {
- *   "invoice_code": "INV-TEST-010",
- *   "referrer_customer_code": "CUST-TEST-010",
- *   "franchisee_code": "MAXTT-DEL-001",
- *   "invoice_amount_inr": 5100,
- *   "invoice_date": "2025-08-23"
- * }
- */
-app.post('/__test/invoice', async (req, res) => {
-  try {
-    const b = req.body || {}
-    const inv = {
-      referrerCustomerCode: b.referrer_customer_code,
-      invoiceCode:          b.invoice_code,
-      franchiseeCode:       b.franchisee_code,
-      invoiceAmountInr:     Number(b.invoice_amount_inr),
-      invoiceDateIso:       String(b.invoice_date) // "YYYY-MM-DD"
-    }
-
-    // Fire-and-forget; do not block response
-    notifyReferralForInvoice(inv).catch(() => {})
-    res.json({ ok: true, invoice: inv })
-  } catch (e) {
-    res.status(500).json({ ok: false, error: String(e?.message || e) })
   }
 })
 
@@ -203,7 +170,6 @@ app.get('/api/exports/invoices', async (req, res) => {
     const params = []
     let i = 1
 
-    // Read from adaptive view if present (fallback to same name; error handled)
     let fromSql = `public.v_invoice_export`
     try {
       const r = await pool.query(`SELECT to_regclass('public.v_invoice_export') AS v`)
@@ -376,16 +342,39 @@ app.post('/api/invoices', async (req, res) => {
     const sql = `INSERT INTO public.invoices (${colSql}) VALUES (${valSql}) RETURNING *`
     const r = await client.query(sql, vals)
     const inv = r.rows[0]
+
+    // Respond immediately
     res.status(201).json(inv)
 
-    // OPTIONAL: auto-notify referrals if payload includes referral fields:
-    // notifyReferralForInvoice({
-    //   referrerCustomerCode: inv.referrer_customer_code ?? payload.referrer_customer_code ?? null,
-    //   invoiceCode:          inv.code ?? payload.invoice_code ?? inv.invoice_id ?? String(inv.id ?? ''),
-    //   franchiseeCode:       inv.franchisee_code ?? payload.franchisee_code ?? null,
-    //   invoiceAmountInr:     Number(inv.total_amount_inr ?? payload.invoice_amount_inr ?? inv.total_amount ?? 0),
-    //   invoiceDateIso:       new Date(inv.invoice_date ?? payload.invoice_date ?? inv.created_at ?? Date.now()).toISOString().slice(0,10)
-    // }).catch(()=>{})
+    // 🔔 Fire-and-forget notify to Referrals (safe if fields missing)
+    const pick = (obj, ...names) => names.find(n => obj?.[n] != null) ? obj[names.find(n => obj?.[n] != null)] : null
+    const invoiceCode =
+      pick(payload, 'invoice_code') ??
+      pick(inv, 'invoice_number', 'invoice_id', 'id')?.toString()
+    const referrerCustomerCode =
+      pick(payload, 'referrer_customer_code') ??
+      pick(inv, 'referrer_customer_code', 'referral_code')
+    const franchiseeCode =
+      pick(payload, 'franchisee_code') ??
+      pick(inv, 'franchisee_code')
+    const invoiceAmountInr =
+      Number(
+        pick(payload, 'invoice_amount_inr', 'total_amount_inr') ??
+        pick(inv, 'total_amount', 'total_with_gst', 'subtotal_ex_gst', 'total_before_gst') ??
+        0
+      )
+    const invoiceDateIso =
+      (pick(payload, 'invoice_date') ??
+       pick(inv, 'invoice_date', 'created_at') ??
+       new Date().toISOString()).toString().slice(0,10)
+
+    notifyReferralForInvoice({
+      referrerCustomerCode,
+      invoiceCode,
+      franchiseeCode,
+      invoiceAmountInr,
+      invoiceDateIso
+    }).catch(() => {})
   } catch (err) {
     res.status(500).json({ ok:false, where:'create_invoice', message: err?.message || String(err) })
   } finally {
