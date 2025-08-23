@@ -1,10 +1,13 @@
-// server.js — Full API (ESM) with adaptive columns + CSV export
-// Works with unknown column names by introspecting the "public.invoices" table.
+// server.js — Full API (ESM) with adaptive columns + CSV export + TEMP referrals test routes
 
 import express from 'express'
 import cors from 'cors'
 import pkg from 'pg'
 const { Pool } = pkg
+
+// Import referrals hook (CommonJS default export interop)
+import referralsHook from './referralsHook.js'
+const { notifyReferralForInvoice } = referralsHook
 
 const app = express()
 app.use(cors())
@@ -61,6 +64,39 @@ app.get('/api/diag/view', async (_req, res) => {
     res.json({ ok:true, view: String(exists) })
   } catch (err) {
     res.status(500).json({ ok:false, where:'view_check', message: err?.message || String(err) })
+  }
+})
+
+// ------------ TEMP referrals test routes ------------
+app.get('/__test/ping', (_req, res) => res.json({ ok: true, route: '/__test/* mounted' }))
+
+/**
+ * POST /__test/invoice
+ * Body JSON:
+ * {
+ *   "invoice_code": "INV-TEST-010",
+ *   "referrer_customer_code": "CUST-TEST-010",
+ *   "franchisee_code": "MAXTT-DEL-001",
+ *   "invoice_amount_inr": 5100,
+ *   "invoice_date": "2025-08-23"
+ * }
+ */
+app.post('/__test/invoice', async (req, res) => {
+  try {
+    const b = req.body || {}
+    const inv = {
+      referrerCustomerCode: b.referrer_customer_code,
+      invoiceCode:          b.invoice_code,
+      franchiseeCode:       b.franchisee_code,
+      invoiceAmountInr:     Number(b.invoice_amount_inr),
+      invoiceDateIso:       String(b.invoice_date) // "YYYY-MM-DD"
+    }
+
+    // Fire-and-forget; do not block response
+    notifyReferralForInvoice(inv).catch(() => {})
+    res.json({ ok: true, invoice: inv })
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e?.message || e) })
   }
 })
 
@@ -168,12 +204,12 @@ app.get('/api/exports/invoices', async (req, res) => {
     const params = []
     let i = 1
 
-    // We read from the adaptive view (created above). If not present, fallback to actual table.
+    // Read from adaptive view if present (fallback to same name; error handled)
     let fromSql = `public.v_invoice_export`
     try {
       const r = await pool.query(`SELECT to_regclass('public.v_invoice_export') AS v`)
-      if (!r.rows[0]?.v) fromSql = `public.v_invoice_export` // still try; error handled below
-    } catch { /* ignore */ }
+      if (!r.rows[0]?.v) fromSql = `public.v_invoice_export`
+    } catch {}
 
     if (from) { where.push(`invoice_ts_ist::date >= $${i++}`); params.push(from) }
     if (to)   { where.push(`invoice_ts_ist::date <= $${i++}`); params.push(to) }
@@ -208,13 +244,10 @@ app.get('/api/exports/invoices', async (req, res) => {
   }
 })
 
-// ------------ Auth (very light, demo) ------------
-app.post('/api/login', (req, res) => {
-  // Accept anything; return a token so the UI can proceed.
-  res.json({ token: 'token-franchisee' })
-})
-app.post('/api/admin/login', (req, res) => res.json({ token: 'token-admin' }))
-app.post('/api/sa/login',    (req, res) => res.json({ token: 'token-sa' }))
+// ------------ Auth (demo) ------------
+app.post('/api/login', (_req, res) => res.json({ token: 'token-franchisee' }))
+app.post('/api/admin/login', (_req, res) => res.json({ token: 'token-admin' }))
+app.post('/api/sa/login',    (_req, res) => res.json({ token: 'token-sa' }))
 
 // Profile (static demo info so UI header works)
 app.get('/api/profile', (_req, res) => {
@@ -253,7 +286,6 @@ app.get('/api/invoices', async (req, res) => {
     const where = []
     const params = []
     let i = 1
-    // filters
     if (req.query.q) {
       const like = `%${String(req.query.q).split('%').join('')}%`
       const or = []
@@ -345,7 +377,17 @@ app.post('/api/invoices', async (req, res) => {
 
     const sql = `INSERT INTO public.invoices (${colSql}) VALUES (${valSql}) RETURNING *`
     const r = await client.query(sql, vals)
-    res.status(201).json(r.rows[0])
+    const inv = r.rows[0]
+    res.status(201).json(inv)
+
+    // OPTIONAL: If your payload includes referral fields, you can automatically notify here too:
+    // notifyReferralForInvoice({
+    //   referrerCustomerCode: inv.referrer_customer_code ?? payload.referrer_customer_code ?? null,
+    //   invoiceCode:          inv.code ?? payload.invoice_code ?? inv.invoice_id ?? String(inv.id ?? ''),
+    //   franchiseeCode:       inv.franchisee_code ?? payload.franchisee_code ?? null,
+    //   invoiceAmountInr:     Number(inv.total_amount_inr ?? payload.invoice_amount_inr ?? inv.total_amount ?? 0),
+    //   invoiceDateIso:       new Date(inv.invoice_date ?? payload.invoice_date ?? inv.created_at ?? Date.now()).toISOString().slice(0,10)
+    // }).catch(()=>{})
   } catch (err) {
     res.status(500).json({ ok:false, where:'create_invoice', message: err?.message || String(err) })
   } finally {
@@ -392,8 +434,6 @@ app.get('/api/summary', async (req, res) => {
     if (req.query.from && has(cols,'created_at')) { where.push(`i."created_at"::date >= $${i++}`); params.push(req.query.from) }
     if (req.query.to   && has(cols,'created_at')) { where.push(`i."created_at"::date <= $${i++}`); params.push(req.query.to) }
 
-    // Build sums only for columns that exist
-    const sum = (c) => has(cols,c) ? `COALESCE(SUM(i.${qid(c)}::numeric),0) AS ${qid(c)}` : `0::numeric AS ${qid(c)}`
     const sql = `
       SELECT
         COUNT(*)::int AS count,
