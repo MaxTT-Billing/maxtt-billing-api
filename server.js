@@ -5,9 +5,8 @@ import cors from 'cors'
 import pkg from 'pg'
 const { Pool } = pkg
 
-// Import referrals hook (CommonJS default export interop)
-import referralsHook from './referralsHook.js'
-const { notifyReferralForInvoice } = referralsHook
+// ✅ ESM named import for the hook
+import { notifyReferralForInvoice } from './referralsHook.js'
 
 const app = express()
 app.use(cors())
@@ -366,7 +365,6 @@ app.post('/api/invoices', async (req, res) => {
   const client = await pool.connect()
   try {
     const cols = await getInvoiceCols(client)
-    // Only insert keys that exist in your table
     const payload = req.body || {}
     const keys = Object.keys(payload).filter(k => has(cols, k))
     if (!keys.length) return res.status(400).json({ ok:false, error:'no_matching_columns' })
@@ -380,7 +378,7 @@ app.post('/api/invoices', async (req, res) => {
     const inv = r.rows[0]
     res.status(201).json(inv)
 
-    // OPTIONAL: If your payload includes referral fields, you can automatically notify here too:
+    // OPTIONAL: auto-notify referrals if payload includes referral fields:
     // notifyReferralForInvoice({
     //   referrerCustomerCode: inv.referrer_customer_code ?? payload.referrer_customer_code ?? null,
     //   invoiceCode:          inv.code ?? payload.invoice_code ?? inv.invoice_id ?? String(inv.id ?? ''),
