@@ -1,12 +1,21 @@
-// server.js — Full API (ESM) with adaptive columns + CSV export + Referrals auto-notify
+// server.js — Full API (ESM) with adaptive columns + CSV export
+// + Referrals wiring (sendForInvoice + test passthrough)
+//
+// ENV needed here (Billing):
+//   DATABASE_URL
+//   REF_API_BASE_URL
+//   REF_API_WRITER_KEY
+//   (optional) REF_ENABLE=1, REF_TIMEOUT_MS, REF_DEBUG=1
 
 import express from 'express'
 import cors from 'cors'
 import pkg from 'pg'
 const { Pool } = pkg
 
-// ✅ Referrals hook (ESM)
-import { notifyReferralForInvoice } from './referralsHook.js'
+// >>> referrals wiring (Billing -> Seal & Earn)
+import { sendForInvoice } from './referralsHook.js'
+import { postReferral } from './referralsClient.js'
+// <<< referrals wiring
 
 const app = express()
 app.use(cors())
@@ -170,11 +179,12 @@ app.get('/api/exports/invoices', async (req, res) => {
     const params = []
     let i = 1
 
+    // We read from the adaptive view (created above). If not present, fallback to actual table.
     let fromSql = `public.v_invoice_export`
     try {
       const r = await pool.query(`SELECT to_regclass('public.v_invoice_export') AS v`)
-      if (!r.rows[0]?.v) fromSql = `public.v_invoice_export`
-    } catch {}
+      if (!r.rows[0]?.v) fromSql = `public.v_invoice_export` // still try; error handled below
+    } catch { /* ignore */ }
 
     if (from) { where.push(`invoice_ts_ist::date >= $${i++}`); params.push(from) }
     if (to)   { where.push(`invoice_ts_ist::date <= $${i++}`); params.push(to) }
@@ -209,10 +219,12 @@ app.get('/api/exports/invoices', async (req, res) => {
   }
 })
 
-// ------------ Auth (demo) ------------
-app.post('/api/login', (_req, res) => res.json({ token: 'token-franchisee' }))
-app.post('/api/admin/login', (_req, res) => res.json({ token: 'token-admin' }))
-app.post('/api/sa/login',    (_req, res) => res.json({ token: 'token-sa' }))
+// ------------ Auth (very light, demo) ------------
+app.post('/api/login', (req, res) => {
+  res.json({ token: 'token-franchisee' })
+})
+app.post('/api/admin/login', (req, res) => res.json({ token: 'token-admin' }))
+app.post('/api/sa/login',    (req, res) => res.json({ token: 'token-sa' }))
 
 // Profile (static demo info so UI header works)
 app.get('/api/profile', (_req, res) => {
@@ -341,40 +353,14 @@ app.post('/api/invoices', async (req, res) => {
 
     const sql = `INSERT INTO public.invoices (${colSql}) VALUES (${valSql}) RETURNING *`
     const r = await client.query(sql, vals)
-    const inv = r.rows[0]
 
-    // Respond immediately
-    res.status(201).json(inv)
+    // respond first
+    res.status(201).json(r.rows[0])
 
-    // 🔔 Fire-and-forget notify to Referrals (safe if fields missing)
-    const pick = (obj, ...names) => names.find(n => obj?.[n] != null) ? obj[names.find(n => obj?.[n] != null)] : null
-    const invoiceCode =
-      pick(payload, 'invoice_code') ??
-      pick(inv, 'invoice_number', 'invoice_id', 'id')?.toString()
-    const referrerCustomerCode =
-      pick(payload, 'referrer_customer_code') ??
-      pick(inv, 'referrer_customer_code', 'referral_code')
-    const franchiseeCode =
-      pick(payload, 'franchisee_code') ??
-      pick(inv, 'franchisee_code')
-    const invoiceAmountInr =
-      Number(
-        pick(payload, 'invoice_amount_inr', 'total_amount_inr') ??
-        pick(inv, 'total_amount', 'total_with_gst', 'subtotal_ex_gst', 'total_before_gst') ??
-        0
-      )
-    const invoiceDateIso =
-      (pick(payload, 'invoice_date') ??
-       pick(inv, 'invoice_date', 'created_at') ??
-       new Date().toISOString()).toString().slice(0,10)
-
-    notifyReferralForInvoice({
-      referrerCustomerCode,
-      invoiceCode,
-      franchiseeCode,
-      invoiceAmountInr,
-      invoiceDateIso
-    }).catch(() => {})
+    // then fire-and-forget to Seal & Earn
+    setImmediate(() => {
+      try { sendForInvoice(r.rows[0]) } catch (e) { console.warn('[referrals] hook error', e) }
+    })
   } catch (err) {
     res.status(500).json({ ok:false, where:'create_invoice', message: err?.message || String(err) })
   } finally {
@@ -416,32 +402,4 @@ app.get('/api/summary', async (req, res) => {
       const or = []
       if (has(cols,'vehicle_number')) or.push(`i."vehicle_number" ILIKE $${i}`)
       if (has(cols,'customer_name'))  or.push(`i."customer_name" ILIKE $${i}`)
-      if (or.length) { where.push(`(${or.join(' OR ')})`); params.push(like); i++ }
-    }
-    if (req.query.from && has(cols,'created_at')) { where.push(`i."created_at"::date >= $${i++}`); params.push(req.query.from) }
-    if (req.query.to   && has(cols,'created_at')) { where.push(`i."created_at"::date <= $${i++}`); params.push(req.query.to) }
-
-    const sql = `
-      SELECT
-        COUNT(*)::int AS count,
-        ${has(cols,'dosage_ml') ? `COALESCE(SUM(i."dosage_ml"::numeric),0)` : '0::numeric'} AS dosage_ml,
-        ${has(cols,'total_before_gst') ? `COALESCE(SUM(i."total_before_gst"::numeric),0)` : (has(cols,'subtotal_ex_gst') ? `COALESCE(SUM(i."subtotal_ex_gst"::numeric),0)` : '0::numeric')} AS total_before_gst,
-        ${has(cols,'gst_amount') ? `COALESCE(SUM(i."gst_amount"::numeric),0)` : '0::numeric'} AS gst_amount,
-        ${has(cols,'total_with_gst') ? `COALESCE(SUM(i."total_with_gst"::numeric),0)` : (has(cols,'total_amount') ? `COALESCE(SUM(i."total_amount"::numeric),0)` : '0::numeric')} AS total_with_gst
-      FROM public.invoices i
-      ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
-    `
-    const r = await client.query(sql, params)
-    res.json(r.rows[0])
-  } catch (err) {
-    res.status(500).json({ ok:false, where:'summary', message: err?.message || String(err) })
-  } finally {
-    client.release()
-  }
-})
-
-// ------------ Start server ------------
-const port = process.env.PORT || 3001
-app.listen(port, () => {
-  console.log(`API listening on :${port}`)
-})
+      if (or.length) { where.push(`(${or.join(' OR ')})`); params.push(like);
