@@ -1,9 +1,11 @@
 // referralsHook.js — map a Billing "invoice row" into a referral and fire-and-forget
-
 import { postReferral } from './referralsClient.js';
 
 const ON = process.env.REF_ENABLE === '1';
 const DEBUG = process.env.REF_DEBUG === '1';
+
+// how many digits to zero-pad invoice numbers when they're pure digits
+const MIN_DIGITS = Number(process.env.REF_INVOICE_MIN_DIGITS || '4');
 
 // helper to pick first non-empty
 const pick = (obj, keys = []) => {
@@ -19,36 +21,34 @@ function toISODateOnly(x) {
   try {
     const d = new Date(x);
     if (Number.isNaN(d.getTime())) return undefined;
-    // use date only (API accepts a date string or ISO)
     return d.toISOString().slice(0, 10);
   } catch {
     return undefined;
   }
 }
 
+function normalizeInvoiceCode(v) {
+  const s = String(v || '').trim();
+  if (!s) return '';
+  // if it's all digits, pad to MIN_DIGITS (e.g., 54 -> 0054)
+  if (/^\d+$/.test(s)) return s.padStart(MIN_DIGITS, '0');
+  return s;
+}
+
 /**
  * Convert an invoice row to referral payload.
- * Expected invoice object fields (we probe multiple common names):
- * - referral_code / referrer_customer_code
- * - invoice_number / invoice_no / inv_no / id
- * - franchisee_code / franchise_code
- * - total_with_gst / total_amount / grand_total / subtotal_ex_gst+gst_amount
- * - created_at / invoice_date / date / createdon / created_on
  */
 export function buildReferralFromInvoice(inv) {
   const referrer_customer_code = String(
-    pick(inv, ['referrer_customer_code', 'referral_code', 'customer_referral_code'])
-  || ''
+    pick(inv, ['referrer_customer_code', 'referral_code', 'customer_referral_code']) || ''
   ).trim();
 
-  const referred_invoice_code = String(
-    pick(inv, ['invoice_number', 'invoice_no', 'inv_no', 'bill_no', 'id'])
-  || ''
-  ).trim();
+  const rawInvoiceCode =
+    pick(inv, ['invoice_number', 'invoice_no', 'inv_no', 'bill_no', 'id']) || '';
+  const referred_invoice_code = normalizeInvoiceCode(rawInvoiceCode);
 
   const franchisee_code = String(
-    pick(inv, ['franchisee_code', 'franchise_code'])
-  || ''
+    pick(inv, ['franchisee_code', 'franchise_code']) || ''
   ).trim();
 
   // amount
@@ -61,6 +61,7 @@ export function buildReferralFromInvoice(inv) {
     invoice_amount_inr = sub + gst;
   }
   const amt = Number(invoice_amount_inr || 0);
+
   const invoice_date = toISODateOnly(
     pick(inv, ['created_at', 'invoice_date', 'date', 'createdon', 'created_on'])
   );
@@ -96,7 +97,6 @@ export function sendForInvoice(inv) {
       return;
     }
 
-    // do not await — keep it off the critical path
     postReferral(payload).then((r) => {
       if (!r.ok) console.warn('[referrals] post failed', r);
       else if (DEBUG) console.log('[referrals] posted', r.data);
