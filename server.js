@@ -1,21 +1,15 @@
-// server.js — Full API (ESM) with adaptive columns + CSV export
-// + Referrals wiring (sendForInvoice + test passthrough)
-//
-// ENV needed here (Billing):
-//   DATABASE_URL
-//   REF_API_BASE_URL
-//   REF_API_WRITER_KEY
-//   (optional) REF_ENABLE=1, REF_TIMEOUT_MS, REF_DEBUG=1
+// server.js — Billing API (ESM) with adaptive columns + CSV export
+// + Wire-up to Seal & Earn (Referrals) via sendForInvoice after create
+// Requires: referralsHook.js, referralsClient.js (already added)
 
 import express from 'express'
 import cors from 'cors'
 import pkg from 'pg'
 const { Pool } = pkg
 
-// >>> referrals wiring (Billing -> Seal & Earn)
+// === Wire to Seal & Earn ===
 import { sendForInvoice } from './referralsHook.js'
 import { postReferral } from './referralsClient.js'
-// <<< referrals wiring
 
 const app = express()
 app.use(cors())
@@ -49,7 +43,7 @@ function sel(cols, alias, candidates, type = 'text') {
 }
 
 // ------------ Basic + diagnostics ------------
-app.get('/', (_req, res) => res.send('MaxTT API is running'))
+app.get('/', (_req, res) => res.send('MaxTT Billing API is running'))
 app.get('/api/health', (_req, res) => res.json({ ok: true }))
 
 app.get('/api/diag/whoami', async (_req, res) => {
@@ -179,12 +173,8 @@ app.get('/api/exports/invoices', async (req, res) => {
     const params = []
     let i = 1
 
-    // We read from the adaptive view (created above). If not present, fallback to actual table.
+    // Read from the adaptive view; if missing, it'll error and be caught
     let fromSql = `public.v_invoice_export`
-    try {
-      const r = await pool.query(`SELECT to_regclass('public.v_invoice_export') AS v`)
-      if (!r.rows[0]?.v) fromSql = `public.v_invoice_export` // still try; error handled below
-    } catch { /* ignore */ }
 
     if (from) { where.push(`invoice_ts_ist::date >= $${i++}`); params.push(from) }
     if (to)   { where.push(`invoice_ts_ist::date <= $${i++}`); params.push(to) }
@@ -221,6 +211,7 @@ app.get('/api/exports/invoices', async (req, res) => {
 
 // ------------ Auth (very light, demo) ------------
 app.post('/api/login', (req, res) => {
+  // Accept anything; return a token so the UI can proceed.
   res.json({ token: 'token-franchisee' })
 })
 app.post('/api/admin/login', (req, res) => res.json({ token: 'token-admin' }))
@@ -263,6 +254,7 @@ app.get('/api/invoices', async (req, res) => {
     const where = []
     const params = []
     let i = 1
+    // filters
     if (req.query.q) {
       const like = `%${String(req.query.q).split('%').join('')}%`
       const or = []
@@ -343,6 +335,7 @@ app.post('/api/invoices', async (req, res) => {
   const client = await pool.connect()
   try {
     const cols = await getInvoiceCols(client)
+    // Only insert keys that exist in your table
     const payload = req.body || {}
     const keys = Object.keys(payload).filter(k => has(cols, k))
     if (!keys.length) return res.status(400).json({ ok:false, error:'no_matching_columns' })
@@ -357,9 +350,9 @@ app.post('/api/invoices', async (req, res) => {
     // respond first
     res.status(201).json(r.rows[0])
 
-    // then fire-and-forget to Seal & Earn
+    // then fire-and-forget the referral hook
     setImmediate(() => {
-      try { sendForInvoice(r.rows[0]) } catch (e) { console.warn('[referrals] hook error', e) }
+      try { sendForInvoice(r.rows[0]) } catch (e) { /* never throw */ }
     })
   } catch (err) {
     res.status(500).json({ ok:false, where:'create_invoice', message: err?.message || String(err) })
@@ -402,4 +395,49 @@ app.get('/api/summary', async (req, res) => {
       const or = []
       if (has(cols,'vehicle_number')) or.push(`i."vehicle_number" ILIKE $${i}`)
       if (has(cols,'customer_name'))  or.push(`i."customer_name" ILIKE $${i}`)
-      if (or.length) { where.push(`(${or.join(' OR ')})`); params.push(like);
+      if (or.length) { where.push(`(${or.join(' OR ')})`); params.push(like); i++ }
+    }
+    if (req.query.from && has(cols,'created_at')) { where.push(`i."created_at"::date >= $${i++}`); params.push(req.query.from) }
+    if (req.query.to   && has(cols,'created_at')) { where.push(`i."created_at"::date <= $${i++}`); params.push(req.query.to) }
+
+    const sql = `
+      SELECT
+        COUNT(*)::int AS count,
+        ${has(cols,'dosage_ml') ? `COALESCE(SUM(i."dosage_ml"::numeric),0)` : '0::numeric'} AS dosage_ml,
+        ${has(cols,'total_before_gst') ? `COALESCE(SUM(i."total_before_gst"::numeric),0)` : (has(cols,'subtotal_ex_gst') ? `COALESCE(SUM(i."subtotal_ex_gst"::numeric),0)` : '0::numeric')} AS total_before_gst,
+        ${has(cols,'gst_amount') ? `COALESCE(SUM(i."gst_amount"::numeric),0)` : '0::numeric'} AS gst_amount,
+        ${has(cols,'total_with_gst') ? `COALESCE(SUM(i."total_with_gst"::numeric),0)` : (has(cols,'total_amount') ? `COALESCE(SUM(i."total_amount"::numeric),0)` : '0::numeric')} AS total_with_gst
+      FROM public.invoices i
+      ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
+    `
+    const r = await client.query(sql, params)
+    res.json(r.rows[0])
+  } catch (err) {
+    res.status(500).json({ ok:false, where:'summary', message: err?.message || String(err) })
+  } finally {
+    client.release()
+  }
+})
+
+// ------------ Test route: forward to Referrals (optional) ------------
+app.post('/__wire/referrals/test', async (req, res) => {
+  try {
+    const key = req.get('X-REF-API-KEY') || process.env.REF_API_WRITER_KEY
+    const body = req.body || {}
+
+    const required = ['referrer_customer_code','referred_invoice_code','franchisee_code','invoice_amount_inr','invoice_date']
+    const miss = required.filter(k => !body[k])
+    if (miss.length) return res.status(400).json({ ok:false, error:'missing', fields: miss })
+
+    const r = await postReferral(body, key)
+    return res.status(r.ok ? 200 : 502).json(r)
+  } catch (e) {
+    return res.status(500).json({ ok:false, error: String(e?.message || e) })
+  }
+})
+
+// ------------ Start server ------------
+const port = process.env.PORT || 3001
+app.listen(port, () => {
+  console.log(`Billing API listening on :${port}`)
+})
