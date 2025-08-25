@@ -1,6 +1,6 @@
 // server.js — Billing API (ESM) with adaptive columns + CSV export
-// + Wire-up to Seal & Earn (Referrals) via sendForInvoice after create
-// Requires: referralsHook.js, referralsClient.js (already added)
+// + Wire-up to Seal & Earn using normalized FRAN-#### codes
+// Requires: referralsHook.js, referralsClient.js at repo root
 
 import express from 'express'
 import cors from 'cors'
@@ -174,7 +174,7 @@ app.get('/api/exports/invoices', async (req, res) => {
     let i = 1
 
     // Read from the adaptive view; if missing, it'll error and be caught
-    let fromSql = `public.v_invoice_export`
+    const fromSql = `public.v_invoice_export`
 
     if (from) { where.push(`invoice_ts_ist::date >= $${i++}`); params.push(from) }
     if (to)   { where.push(`invoice_ts_ist::date <= $${i++}`); params.push(to) }
@@ -350,9 +350,15 @@ app.post('/api/invoices', async (req, res) => {
     // respond first
     res.status(201).json(r.rows[0])
 
-    // then fire-and-forget the referral hook
+    // then fire-and-forget — pass transient fields used for referral capture
+    const refCtx = {
+      ...r.rows[0],
+      __raw_referral_code: req.body?.referral_code_raw || '',
+      __remarks: req.body?.remarks || req.body?.notes || req.body?.comment || '',
+      __franchisee_hint: req.body?.franchisee_code || ''
+    }
     setImmediate(() => {
-      try { sendForInvoice(r.rows[0]) } catch (e) { /* never throw */ }
+      try { sendForInvoice(refCtx) } catch (e) { /* never throw */ }
     })
   } catch (err) {
     res.status(500).json({ ok:false, where:'create_invoice', message: err?.message || String(err) })
