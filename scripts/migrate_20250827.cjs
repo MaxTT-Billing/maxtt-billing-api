@@ -1,36 +1,31 @@
-// File: scripts/migrate_20250827.cjs
-// Run a SQL migration file against DATABASE_URL (works with "type":"module" via .cjs)
-
+// File: scripts/migrate_20250827_treads.cjs
 const fs = require('fs');
 const path = require('path');
 const { Client } = require('pg');
 
 (async () => {
-  const databaseUrl = process.env.DATABASE_URL;
-  if (!databaseUrl) {
-    console.error('ERROR: DATABASE_URL not set');
-    process.exit(1);
-  }
+  const cs = process.env.DATABASE_URL;
+  if (!cs) { console.error('DATABASE_URL missing'); process.exit(1); }
 
-  const sqlPath = path.join(__dirname, '..', 'db', 'migrations', '20250827_add_hsn_customer_code.sql');
+  const sqlPath = path.join(__dirname, '..', 'db', 'migrations', '20250827_add_per_tyre_treads.sql');
   if (!fs.existsSync(sqlPath)) {
-    console.error('ERROR: Migration SQL not found at', sqlPath);
+    console.error('Migration SQL not found at', sqlPath);
     process.exit(1);
   }
 
   const sql = fs.readFileSync(sqlPath, 'utf8');
-  const client = new Client({ connectionString: databaseUrl, ssl: { rejectUnauthorized: false } });
+  const client = new Client({ connectionString: cs, ssl: { rejectUnauthorized: false } });
 
   try {
     await client.connect();
-    console.log('Running migration 20250827...');
+    console.log('Running migration 20250827 (per-tyre treads)...');
     await client.query(sql);
-    console.log('Migration 20250827 complete.');
+    console.log('Migration 20250827 (per-tyre treads) complete.');
     process.exit(0);
-  } catch (err) {
-    console.error('Migration failed:', err);
+  } catch (e) {
+    console.error('Migration failed:', e);
     process.exit(1);
   } finally {
-    try { await client.end(); } catch (_) {}
+    try { await client.end(); } catch {}
   }
 })();
