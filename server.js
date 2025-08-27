@@ -1,5 +1,7 @@
 // server.js — Billing API (ESM) with adaptive columns + CSV export
 // + Wire-up to Seal & Earn using normalized FRAN-#### codes
+// + FULL invoice endpoint (/api/invoices/:id/full) returning ALL columns
+//
 // Requires: referralsHook.js, referralsClient.js at repo root
 
 import express from 'express'
@@ -314,7 +316,7 @@ app.get('/api/invoices/:id', async (req, res) => {
       sel(cols,'consent_signed_at',['consent_signed_at']),
       sel(cols,'consent_snapshot',['consent_snapshot'])
     ]
-    const idCol = has(await getInvoiceCols(client),'id') ? 'id' : 'invoice_id'
+    const idCol = (await getInvoiceCols(client)).has('id') ? 'id' : 'invoice_id'
     const sql = `
       SELECT ${selects.join(',\n             ')}
       FROM public.invoices i
@@ -326,6 +328,25 @@ app.get('/api/invoices/:id', async (req, res) => {
     res.json(r.rows[0])
   } catch (err) {
     res.status(500).json({ ok:false, where:'get_invoice', message: err?.message || String(err) })
+  } finally {
+    client.release()
+  }
+})
+
+// ---------- NEW: FULL invoice endpoint (ALL columns, no projection) ----------
+app.get(['/api/invoices/:id/full', '/invoices/:id/full'], async (req, res) => {
+  const client = await pool.connect()
+  try {
+    const id = Number(req.params.id || 0)
+    if (!Number.isFinite(id) || id <= 0) return res.status(400).json({ ok:false, error:'bad_id' })
+    const cols = await getInvoiceCols(client)
+    const idCol = cols.has('id') ? 'id' : 'invoice_id'
+    const sql = `SELECT * FROM public.invoices WHERE ${qid(idCol)} = $1 LIMIT 1`
+    const r = await client.query(sql, [id])
+    if (!r.rows.length) return res.status(404).json({ ok:false, error:'not_found' })
+    res.json(r.rows[0])
+  } catch (err) {
+    res.status(500).json({ ok:false, where:'get_invoice_full', message: err?.message || String(err) })
   } finally {
     client.release()
   }
@@ -443,7 +464,7 @@ app.post('/__wire/referrals/test', async (req, res) => {
 })
 
 // ------------ Start server ------------
-const port = process.env.PORT || 3001
+const port = process.env.PORT || 10000
 app.listen(port, () => {
   console.log(`Billing API listening on :${port}`)
 })
