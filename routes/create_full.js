@@ -9,21 +9,24 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false },
 });
 
-// Insert into invoices; if created_at not provided, set to NOW() (UTC)
+/**
+ * POST /api/invoices/full
+ * - Inserts into invoices.
+ * - Server stamps created_at if not provided.
+ * - Writes per-tyre treads + odometer when sent.
+ */
 router.post(["/api/invoices/full", "/invoices/full"], async (req, res) => {
   try {
     const body = req.body || {};
 
-    // discover actual columns in DB
+    // Ensure server time if client didn't send created_at
+    if (!body.created_at) body.created_at = new Date().toISOString();
+
+    // Discover actual columns so we only insert what exists
     const { rows: colsRows } = await pool.query(
       `SELECT column_name FROM information_schema.columns WHERE table_name = 'invoices'`
     );
     const colset = new Set(colsRows.map(r => r.column_name));
-
-    // ensure created_at (server time) if absent
-    if (!body.created_at) {
-      body.created_at = new Date().toISOString(); // UTC
-    }
 
     const CANDIDATE = [
       "created_at","customer_name","mobile_number","vehicle_number","installer_name",
@@ -33,11 +36,12 @@ router.post(["/api/invoices/full", "/invoices/full"], async (req, res) => {
       "customer_address","franchisee_id","updated_at","customer_signature","signed_at",
       "consent_signature","consent_signed_at","consent_snapshot","declaration_snapshot",
       "hsn_code","invoice_number",
+      // new: odo + per-tyre + legacy
       "odometer","tread_depth_mm","tread_fl_mm","tread_fr_mm","tread_rl_mm","tread_rr_mm"
     ];
 
     const keys = CANDIDATE.filter(k => body[k] !== undefined && colset.has(k));
-    if (!keys.length) return res.status(400).json({ error: "no valid fields" });
+    if (!keys.length) return res.status(400).json({ error: "no_valid_fields" });
 
     const cols = keys.map(k => `"${k}"`).join(", ");
     const placeholders = keys.map((_, i) => `$${i + 1}`).join(", ");
@@ -47,10 +51,29 @@ router.post(["/api/invoices/full", "/invoices/full"], async (req, res) => {
       `INSERT INTO invoices (${cols}) VALUES (${placeholders}) RETURNING *`,
       values
     );
-    res.status(201).json(rows[0]);
+    return res.status(201).json(rows[0]);
   } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: "insert failed" });
+    console.error("insert failed:", e);
+    return res.status(500).json({ error: "insert_failed" });
+  }
+});
+
+/**
+ * GET /api/invoices/:id/full2
+ * - Returns ALL columns from invoices for this id.
+ * - Includes odometer + tread_fl/fr/rl/rr_mm if present in DB.
+ * - We use /full2 to bypass any older handler.
+ */
+router.get(["/api/invoices/:id/full2", "/invoices/:id/full2"], async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) return res.status(400).json({ error: "bad_id" });
+    const { rows } = await pool.query(`SELECT * FROM invoices WHERE id = $1`, [id]);
+    if (!rows.length) return res.status(404).json({ error: "not_found" });
+    return res.json(rows[0]);
+  } catch (e) {
+    console.error("full2 failed:", e);
+    return res.status(500).json({ error: "query_failed" });
   }
 });
 
