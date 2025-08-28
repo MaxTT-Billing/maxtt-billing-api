@@ -11,21 +11,24 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false },
 });
 
-// Helper: number coercion (undefined if empty)
+// number coercion (undefined if empty)
 const num = (v) => (v === null || v === undefined || v === "" ? undefined : Number(v));
 
 /**
  * POST /api/invoices/full
  * - Inserts into invoices (server stamps created_at if not provided).
  * - Accepts per-tyre treads OR legacy tread_depth_mm (auto-fills per-tyre if only legacy sent).
+ * - If hsn_code absent, defaults to Sealant HSN = 35069999.
  * - After save, extracts referral code (from body.referral_code or body.remarks) and
  *   fires a non-blocking POST to Seal & Earn.
  */
 router.post(["/api/invoices/full", "/invoices/full"], async (req, res) => {
   try {
     const body = { ...(req.body || {}) };
-
     if (!body.created_at) body.created_at = new Date().toISOString();
+
+    // Defaults
+    if (!body.hsn_code) body.hsn_code = "35069999"; // Sealant default
 
     // Normalize numeric-like fields
     body.odometer         = num(body.odometer);
@@ -100,7 +103,6 @@ router.post(["/api/invoices/full", "/invoices/full"], async (req, res) => {
           created_at: saved.created_at,
           franchisee_id: saved.franchisee_id || body.franchisee_id || body.franchisee_code || ""
         };
-        // fire-and-forget; log result without blocking response
         postReferral(payload).then(r => {
           console.log("[Seal&Earn] result:", r);
         }).catch(e => {
@@ -118,10 +120,7 @@ router.post(["/api/invoices/full", "/invoices/full"], async (req, res) => {
   }
 });
 
-/**
- * GET /api/invoices/:id/full2
- * - Returns ALL columns from invoices for this id.
- */
+/** GET /api/invoices/:id/full2 — returns SELECT * for the invoice */
 router.get(["/api/invoices/:id/full2", "/invoices/:id/full2"], async (req, res) => {
   try {
     const id = Number(req.params.id);
