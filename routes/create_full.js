@@ -1,6 +1,8 @@
 // routes/create_full.js  (ESM)
 import express from "express";
 import pkg from "pg";
+import { extractReferralCode, postReferral } from "../referralsClient.js";
+
 const { Pool } = pkg;
 
 const router = express.Router();
@@ -9,20 +11,20 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false },
 });
 
-// Helper: coerce to number if provided, else undefined
+// Helper: number coercion (undefined if empty)
 const num = (v) => (v === null || v === undefined || v === "" ? undefined : Number(v));
 
 /**
  * POST /api/invoices/full
- * - Inserts into invoices.
- * - Server stamps created_at if not provided.
- * - If only legacy tread_depth_mm is provided, auto-fill per-tyre (FL/FR/RL/RR) with that value.
+ * - Inserts into invoices (server stamps created_at if not provided).
+ * - Accepts per-tyre treads OR legacy tread_depth_mm (auto-fills per-tyre if only legacy sent).
+ * - After save, extracts referral code (from body.referral_code or body.remarks) and
+ *   fires a non-blocking POST to Seal & Earn.
  */
 router.post(["/api/invoices/full", "/invoices/full"], async (req, res) => {
   try {
     const body = { ...(req.body || {}) };
 
-    // Ensure server time if client didn't send created_at
     if (!body.created_at) body.created_at = new Date().toISOString();
 
     // Normalize numeric-like fields
@@ -42,13 +44,12 @@ router.post(["/api/invoices/full", "/invoices/full"], async (req, res) => {
     body.aspect_ratio     = num(body.aspect_ratio);
     body.rim_diameter_in  = num(body.rim_diameter_in);
 
-    // If per-tyre missing but legacy depth present, auto-fill all four with legacy
+    // If per-tyre missing but legacy depth present, auto-fill all four
     const hasPerTyre =
       body.tread_fl_mm !== undefined ||
       body.tread_fr_mm !== undefined ||
       body.tread_rl_mm !== undefined ||
       body.tread_rr_mm !== undefined;
-
     if (!hasPerTyre && body.tread_depth_mm !== undefined) {
       body.tread_fl_mm = body.tread_depth_mm;
       body.tread_fr_mm = body.tread_depth_mm;
@@ -56,7 +57,7 @@ router.post(["/api/invoices/full", "/invoices/full"], async (req, res) => {
       body.tread_rr_mm = body.tread_depth_mm;
     }
 
-    // Discover actual columns so we only insert what exists
+    // Insert only columns that exist
     const { rows: colsRows } = await pool.query(
       `SELECT column_name FROM information_schema.columns WHERE table_name = 'invoices'`
     );
@@ -70,7 +71,6 @@ router.post(["/api/invoices/full", "/invoices/full"], async (req, res) => {
       "customer_address","franchisee_id","updated_at","customer_signature","signed_at",
       "consent_signature","consent_signed_at","consent_snapshot","declaration_snapshot",
       "hsn_code","invoice_number",
-      // per-tyre + legacy + odometer
       "odometer","tread_depth_mm","tread_fl_mm","tread_fr_mm","tread_rl_mm","tread_rr_mm"
     ];
 
@@ -85,7 +85,33 @@ router.post(["/api/invoices/full", "/invoices/full"], async (req, res) => {
       `INSERT INTO invoices (${cols}) VALUES (${placeholders}) RETURNING *`,
       values
     );
-    return res.status(201).json(rows[0]);
+    const saved = rows[0];
+
+    // Kick off Seal & Earn (non-blocking)
+    try {
+      const refCode = body.referral_code || extractReferralCode(body.remarks || "");
+      if (refCode) {
+        const payload = {
+          referral_code: refCode,
+          customer_code: saved.customer_code || (saved.id ? `C${String(saved.id).padStart(6,"0")}` : ""),
+          invoice_id: saved.id,
+          invoice_number: saved.invoice_number || body.invoice_number || "",
+          amount: saved.total_with_gst || 0,
+          created_at: saved.created_at,
+          franchisee_id: saved.franchisee_id || body.franchisee_id || body.franchisee_code || ""
+        };
+        // fire-and-forget; log result without blocking response
+        postReferral(payload).then(r => {
+          console.log("[Seal&Earn] result:", r);
+        }).catch(e => {
+          console.warn("[Seal&Earn] failed:", e?.message || e);
+        });
+      }
+    } catch (e) {
+      console.warn("[Seal&Earn] skipped/error:", e?.message || e);
+    }
+
+    return res.status(201).json(saved);
   } catch (e) {
     console.error("insert failed:", e);
     return res.status(500).json({ error: "insert_failed" });
