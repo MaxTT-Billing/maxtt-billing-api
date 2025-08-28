@@ -9,18 +9,22 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false },
 });
 
-// Insert into invoices with only columns that actually exist
+// Insert into invoices; if created_at not provided, set to NOW() (UTC)
 router.post(["/api/invoices/full", "/invoices/full"], async (req, res) => {
   try {
     const body = req.body || {};
 
-    // discover real columns in DB to avoid errors
+    // discover actual columns in DB
     const { rows: colsRows } = await pool.query(
       `SELECT column_name FROM information_schema.columns WHERE table_name = 'invoices'`
     );
     const colset = new Set(colsRows.map(r => r.column_name));
 
-    // candidate fields we want to allow (covers old + new)
+    // ensure created_at (server time) if absent
+    if (!body.created_at) {
+      body.created_at = new Date().toISOString(); // UTC
+    }
+
     const CANDIDATE = [
       "created_at","customer_name","mobile_number","vehicle_number","installer_name",
       "vehicle_type","tyre_width_mm","aspect_ratio","rim_diameter_in",
@@ -29,7 +33,6 @@ router.post(["/api/invoices/full", "/invoices/full"], async (req, res) => {
       "customer_address","franchisee_id","updated_at","customer_signature","signed_at",
       "consent_signature","consent_signed_at","consent_snapshot","declaration_snapshot",
       "hsn_code","invoice_number",
-      // per-tyre + odo
       "odometer","tread_depth_mm","tread_fl_mm","tread_fr_mm","tread_rl_mm","tread_rr_mm"
     ];
 
