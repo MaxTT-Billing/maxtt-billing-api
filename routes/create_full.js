@@ -4,33 +4,51 @@ import pkg from "pg";
 import { extractReferralCode, postReferral } from "../referralsClient.js";
 
 const { Pool } = pkg;
-
 const router = express.Router();
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false },
-});
+const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
+const LOCAL_API_KEY = process.env.SEAL_EARN_API_KEY || "";
 
-// number coercion (undefined if empty)
+// util
 const num = (v) => (v === null || v === undefined || v === "" ? undefined : Number(v));
 
-/**
- * POST /api/invoices/full
- * - Inserts into invoices (server stamps created_at if not provided).
- * - Accepts per-tyre treads OR legacy tread_depth_mm (auto-fills per-tyre if only legacy sent).
- * - If hsn_code absent, defaults to Sealant HSN = 35069999.
- * - After save, extracts referral code (from body.referral_code or body.remarks) and
- *   fires a non-blocking POST to Seal & Earn.
- */
+// ---- Local S&E stub embedded here (so no server.js edit needed) ----
+router.get("/debug/referrals/ping", (_req, res) => {
+  res.json({ ok: true, where: "create_full_inline_stub" });
+});
+
+router.post("/api/referrals", express.json({ limit: "1mb" }), (req, res) => {
+  try {
+    const auth = req.headers.authorization || "";
+    const token = auth.startsWith("Bearer ") ? auth.slice(7).trim() : "";
+    if (!LOCAL_API_KEY || token !== LOCAL_API_KEY) {
+      return res.status(401).json({ ok: false, error: "unauthorized" });
+    }
+    const p = req.body || {};
+    console.log("[Seal&Earn:LOCAL-inline] referral:", {
+      referral_code: p.referral_code,
+      customer_code: p.customer_code,
+      invoice_id: p.invoice_id,
+      invoice_number: p.invoice_number,
+      amount: p.amount,
+      created_at: p.created_at,
+      franchisee_id: p.franchisee_id,
+    });
+    return res.json({ ok: true, mode: "local-inline" });
+  } catch (e) {
+    console.error("local inline se error:", e);
+    return res.status(500).json({ ok: false, error: "stub_error" });
+  }
+});
+// --------------------------------------------------------------------
+
+// POST /api/invoices/full
 router.post(["/api/invoices/full", "/invoices/full"], async (req, res) => {
   try {
     const body = { ...(req.body || {}) };
     if (!body.created_at) body.created_at = new Date().toISOString();
-
-    // Defaults
     if (!body.hsn_code) body.hsn_code = "35069999"; // Sealant default
 
-    // Normalize numeric-like fields
+    // normalize numerics
     body.odometer         = num(body.odometer);
     body.tread_depth_mm   = num(body.tread_depth_mm);
     body.tread_fl_mm      = num(body.tread_fl_mm);
@@ -47,7 +65,7 @@ router.post(["/api/invoices/full", "/invoices/full"], async (req, res) => {
     body.aspect_ratio     = num(body.aspect_ratio);
     body.rim_diameter_in  = num(body.rim_diameter_in);
 
-    // If per-tyre missing but legacy depth present, auto-fill all four
+    // per-tyre autofill from legacy
     const hasPerTyre =
       body.tread_fl_mm !== undefined ||
       body.tread_fr_mm !== undefined ||
@@ -60,12 +78,11 @@ router.post(["/api/invoices/full", "/invoices/full"], async (req, res) => {
       body.tread_rr_mm = body.tread_depth_mm;
     }
 
-    // Insert only columns that exist
+    // insert only existing columns
     const { rows: colsRows } = await pool.query(
       `SELECT column_name FROM information_schema.columns WHERE table_name = 'invoices'`
     );
     const colset = new Set(colsRows.map((r) => r.column_name));
-
     const CANDIDATE = [
       "created_at","customer_name","mobile_number","vehicle_number","installer_name",
       "vehicle_type","tyre_width_mm","aspect_ratio","rim_diameter_in",
@@ -76,7 +93,6 @@ router.post(["/api/invoices/full", "/invoices/full"], async (req, res) => {
       "hsn_code","invoice_number",
       "odometer","tread_depth_mm","tread_fl_mm","tread_fr_mm","tread_rl_mm","tread_rr_mm"
     ];
-
     const keys = CANDIDATE.filter((k) => body[k] !== undefined && colset.has(k));
     if (!keys.length) return res.status(400).json({ error: "no_valid_fields" });
 
@@ -90,7 +106,7 @@ router.post(["/api/invoices/full", "/invoices/full"], async (req, res) => {
     );
     const saved = rows[0];
 
-    // Kick off Seal & Earn (non-blocking)
+    // fire-and-forget Seal & Earn (with fallback inside postReferral)
     try {
       const refCode = body.referral_code || extractReferralCode(body.remarks || "");
       if (refCode) {
@@ -120,7 +136,7 @@ router.post(["/api/invoices/full", "/invoices/full"], async (req, res) => {
   }
 });
 
-/** GET /api/invoices/:id/full2 — returns SELECT * for the invoice */
+// GET /api/invoices/:id/full2
 router.get(["/api/invoices/:id/full2", "/invoices/:id/full2"], async (req, res) => {
   try {
     const id = Number(req.params.id);
