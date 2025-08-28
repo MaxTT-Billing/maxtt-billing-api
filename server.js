@@ -12,10 +12,12 @@ const { Pool } = pkg
 // === Wire to Seal & Earn ===
 import { sendForInvoice } from './referralsHook.js'
 import { postReferral } from './referralsClient.js'
+import createFullRouter from './routes/create_full.js'
 
 const app = express()
 app.use(cors())
 app.use(express.json({ limit: '10mb' }))
+app.use(createFullRouter)
 
 // --- DB connection ---
 const pool = new Pool({
