@@ -1,33 +1,46 @@
-// server.js — Billing API (ESM) with adaptive columns + CSV export
-// + Wire-up to Seal & Earn using normalized FRAN-#### codes
-// + FULL invoice endpoint (/api/invoices/:id/full) returning ALL columns
-//
-// Requires: referralsHook.js, referralsClient.js at repo root
+// server.js — Billing API (ESM) hardened CORS, keeps all business endpoints
+// Preserves: invoices CRUD, /api/invoices/:id/full, CSV export, admin view auto-create,
+// lightweight auth/profile, and referral wiring hooks. Debug-only routers are NOT mounted.
 
 import express from 'express'
-import cors from 'cors'
 import pkg from 'pg'
 const { Pool } = pkg
 
-// === Wire to Seal & Earn ===
+// Wire to Seal & Earn (keep existing hook behaviour)
 import { sendForInvoice } from './referralsHook.js'
 import { postReferral } from './referralsClient.js'
+
+// Business routes (strict printed-invoice format + /full2 endpoint live here)
 import createFullRouter from './routes/create_full.js'
-import debugRouter from './routes/debug.js'
 
+// ---------- App ----------
 const app = express()
-app.use(cors())
-app.use(express.json({ limit: '10mb' }))
-app.use(createFullRouter)
-app.use(debugRouter)
 
-// --- DB connection ---
+// --- Strict CORS allow-list (set env ALLOWED_ORIGINS with comma-separated origins) ---
+const ORIGINS = (process.env.ALLOWED_ORIGINS || 'https://maxtt-billing-tools.onrender.com')
+  .split(',').map(s => s.trim()).filter(Boolean)
+
+app.use((req, res, next) => {
+  const origin = req.headers.origin || ''
+  if (ORIGINS.includes(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin)
+  }
+  res.setHeader('Vary', 'Origin')
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,OPTIONS')
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-REF-API-KEY')
+  if (req.method === 'OPTIONS') return res.sendStatus(200)
+  next()
+})
+
+app.use(express.json({ limit: '10mb' }))
+
+// ---------- DB ----------
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false },
 })
 
-// ------------ Helpers ------------
+// ---------- Helpers ----------
 let cachedCols = null
 async function getInvoiceCols(client) {
   if (cachedCols) return cachedCols
@@ -48,34 +61,11 @@ function sel(cols, alias, candidates, type = 'text') {
                : `NULL::${type} AS ${qid(alias)}`
 }
 
-// ------------ Basic + diagnostics ------------
+// ---------- Health ----------
 app.get('/', (_req, res) => res.send('MaxTT Billing API is running'))
 app.get('/api/health', (_req, res) => res.json({ ok: true }))
 
-app.get('/api/diag/whoami', async (_req, res) => {
-  try {
-    const r = await pool.query(`SELECT current_database() AS db, current_schema() AS schema`)
-    const url = process.env.DATABASE_URL || ''
-    let host = '', databaseFromUrl = ''
-    try { const u = new URL(url); host = u.hostname; databaseFromUrl = (u.pathname||'').replace('/','') } catch {}
-    res.json({ ok: true, current_database: r.rows[0]?.db, current_schema: r.rows[0]?.schema, url_host: host, url_database: databaseFromUrl, ssl: true })
-  } catch (err) {
-    res.status(500).json({ ok:false, where:'whoami', message: err?.message || String(err) })
-  }
-})
-
-app.get('/api/diag/view', async (_req, res) => {
-  try {
-    const r = await pool.query(`SELECT to_regclass('public.v_invoice_export') AS v`)
-    const exists = r.rows[0]?.v
-    if (!exists) return res.json({ ok:false, where:'view_check', reason:'view_missing' })
-    res.json({ ok:true, view: String(exists) })
-  } catch (err) {
-    res.status(500).json({ ok:false, where:'view_check', message: err?.message || String(err) })
-  }
-})
-
-// ------------ Admin helper: auto-create CSV view ------------
+// ---------- Admin helper: auto-create export view ----------
 app.get('/api/admin/create-view-auto', async (_req, res) => {
   const client = await pool.connect()
   try {
@@ -90,7 +80,7 @@ app.get('/api/admin/create-view-auto', async (_req, res) => {
       expr('invoice_id', ['id','invoice_id']),
       expr('invoice_number', ['invoice_number','invoice_no','inv_no','bill_no','invoice']),
       expr('invoice_ts_ist', ['invoice_ts_ist','created_at','invoice_date','createdon','created_on','date']),
-      expr('franchisee_code', ['franchisee_code','franchisee','franchise_code']),
+      expr('franchisee_code', ['franchisee_code','franchisee','franchise_code','franchisee_id']),
       expr('admin_code', ['admin_code','admin']),
       expr('super_admin_code', ['super_admin_code','superadmin_code','sa_code']),
       expr('customer_code', ['customer_code','customer_id','customer','cust_code']),
@@ -135,7 +125,7 @@ app.get('/api/admin/create-view-auto', async (_req, res) => {
   }
 })
 
-// ------------ CSV helpers ------------
+// ---------- CSV export ----------
 const CSV_HEADERS = [
   'Invoice ID','Invoice No','Timestamp (IST)','Franchisee Code','Admin Code','SuperAdmin Code',
   'Customer Code','Referral Code','Vehicle No','Make/Model','Odometer',
@@ -171,7 +161,6 @@ function rowsToCsv(rows) {
   return lines.join('\r\n') + '\r\n'
 }
 
-// ------------ CSV export ------------
 app.get('/api/exports/invoices', async (req, res) => {
   try {
     const { from, to, franchisee, q } = req.query
@@ -179,7 +168,6 @@ app.get('/api/exports/invoices', async (req, res) => {
     const params = []
     let i = 1
 
-    // Read from the adaptive view; if missing, it'll error and be caught
     const fromSql = `public.v_invoice_export`
 
     if (from) { where.push(`invoice_ts_ist::date >= $${i++}`); params.push(from) }
@@ -215,25 +203,21 @@ app.get('/api/exports/invoices', async (req, res) => {
   }
 })
 
-// ------------ Auth (very light, demo) ------------
-app.post('/api/login', (req, res) => {
-  // Accept anything; return a token so the UI can proceed.
-  res.json({ token: 'token-franchisee' })
-})
-app.post('/api/admin/login', (req, res) => res.json({ token: 'token-admin' }))
-app.post('/api/sa/login',    (req, res) => res.json({ token: 'token-sa' }))
+// ---------- Auth (demo) ----------
+app.post('/api/login', (_req, res) => res.json({ token: 'token-franchisee' }))
+app.post('/api/admin/login', (_req, res) => res.json({ token: 'token-admin' }))
+app.post('/api/sa/login',    (_req, res) => res.json({ token: 'token-sa' }))
 
-// Profile (static demo info so UI header works)
 app.get('/api/profile', (_req, res) => {
   res.json({
     name: 'Franchisee',
-    franchisee_id: 'MAXTT-DEMO-001',
+    franchisee_id: 'TS-DL-DEL-001',
     gstin: '',
     address: 'Address not set'
   })
 })
 
-// ------------ Invoices: list / get / create / update / summary ------------
+// ---------- Invoices: list / get / create / update / summary ----------
 app.get('/api/invoices', async (req, res) => {
   const client = await pool.connect()
   try {
@@ -260,7 +244,6 @@ app.get('/api/invoices', async (req, res) => {
     const where = []
     const params = []
     let i = 1
-    // filters
     if (req.query.q) {
       const like = `%${String(req.query.q).split('%').join('')}%`
       const or = []
@@ -272,7 +255,7 @@ app.get('/api/invoices', async (req, res) => {
     if (req.query.from && has(cols,'created_at')) { where.push(`i."created_at"::date >= $${i++}`); params.push(req.query.from) }
     if (req.query.to   && has(cols,'created_at')) { where.push(`i."created_at"::date <= $${i++}`); params.push(req.query.to) }
 
-    const limit = Math.min( Number(req.query.limit || 500), 5000 )
+    const limit = Math.min(Number(req.query.limit || 500), 5000)
     const sql = `
       SELECT ${selects.join(',\n             ')}
       FROM public.invoices i
@@ -337,7 +320,7 @@ app.get('/api/invoices/:id', async (req, res) => {
   }
 })
 
-// ---------- NEW: FULL invoice endpoint (ALL columns, no projection) ----------
+// FULL invoice passthrough (ALL columns)
 app.get(['/api/invoices/:id/full', '/invoices/:id/full'], async (req, res) => {
   const client = await pool.connect()
   try {
@@ -356,11 +339,11 @@ app.get(['/api/invoices/:id/full', '/invoices/:id/full'], async (req, res) => {
   }
 })
 
+// Basic create (used by older flows)
 app.post('/api/invoices', async (req, res) => {
   const client = await pool.connect()
   try {
     const cols = await getInvoiceCols(client)
-    // Only insert keys that exist in your table
     const payload = req.body || {}
     const keys = Object.keys(payload).filter(k => has(cols, k))
     if (!keys.length) return res.status(400).json({ ok:false, error:'no_matching_columns' })
@@ -372,10 +355,9 @@ app.post('/api/invoices', async (req, res) => {
     const sql = `INSERT INTO public.invoices (${colSql}) VALUES (${valSql}) RETURNING *`
     const r = await client.query(sql, vals)
 
-    // respond first
     res.status(201).json(r.rows[0])
 
-    // then fire-and-forget — pass transient fields used for referral capture
+    // fire-and-forget referral hook
     const refCtx = {
       ...r.rows[0],
       __raw_referral_code: req.body?.referral_code_raw || '',
@@ -383,7 +365,7 @@ app.post('/api/invoices', async (req, res) => {
       __franchisee_hint: req.body?.franchisee_code || ''
     }
     setImmediate(() => {
-      try { sendForInvoice(refCtx) } catch (e) { /* never throw */ }
+      try { sendForInvoice(refCtx) } catch (e) { /* swallow */ }
     })
   } catch (err) {
     res.status(500).json({ ok:false, where:'create_invoice', message: err?.message || String(err) })
@@ -450,7 +432,7 @@ app.get('/api/summary', async (req, res) => {
   }
 })
 
-// ------------ Test route: forward to Referrals (optional) ------------
+// ---------- Referrals test passthrough (protected by key header) ----------
 app.post('/__wire/referrals/test', async (req, res) => {
   try {
     const key = req.get('X-REF-API-KEY') || process.env.REF_API_WRITER_KEY
@@ -459,6 +441,7 @@ app.post('/__wire/referrals/test', async (req, res) => {
     const required = ['referrer_customer_code','referred_invoice_code','franchisee_code','invoice_amount_inr','invoice_date']
     const miss = required.filter(k => !body[k])
     if (miss.length) return res.status(400).json({ ok:false, error:'missing', fields: miss })
+    if (!key) return res.status(401).json({ ok:false, error:'unauthorized' })
 
     const r = await postReferral(body, key)
     return res.status(r.ok ? 200 : 502).json(r)
@@ -467,7 +450,13 @@ app.post('/__wire/referrals/test', async (req, res) => {
   }
 })
 
-// ------------ Start server ------------
+// ---------- Mount business router (strict printed-invoice + /full2) ----------
+app.use(createFullRouter)
+
+// ---------- 404 ----------
+app.use((_req, res) => res.status(404).json({ error: 'not_found' }))
+
+// ---------- Start ----------
 const port = process.env.PORT || 10000
 app.listen(port, () => {
   console.log(`Billing API listening on :${port}`)
