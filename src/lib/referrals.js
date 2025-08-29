@@ -1,7 +1,5 @@
 // src/lib/referrals.js
-// ESM module. Minimal client for Seal & Earn.
-// Uses existing env: REF_API_BASE_URL
-// Adds: REF_SIGNING_KEY (required), REF_TIMEOUT_MS (optional)
+// Client for Seal & Earn service (validate + credit)
 
 import crypto from "node:crypto";
 
@@ -11,9 +9,9 @@ function required(name) {
   return v;
 }
 
-const BASE_URL = required("REF_API_BASE_URL");             // e.g., https://maxtt-referrals-api-pv5c.onrender.com
-const SIGNING_KEY = required("REF_SIGNING_KEY");           // 32+ chars shared secret
-const TIMEOUT_MS = parseInt(process.env.REF_TIMEOUT_MS ?? "5000", 10); // optional
+const BASE_URL = required("REF_API_BASE_URL");            // e.g. https://maxtt-referrals-api-pv5c.onrender.com
+const SIGNING_KEY = required("REF_SIGNING_KEY");          // 32+ chars secret
+const TIMEOUT_MS = parseInt(process.env.REF_TIMEOUT_MS ?? "5000", 10);
 
 function hmacHeader(payload) {
   const mac = crypto.createHmac("sha256", SIGNING_KEY);
@@ -44,12 +42,24 @@ async function post(path, body) {
   }
 }
 
+// --- Public API ---
+
+/**
+ * Validate referral code.
+ * @param {string} code
+ * @returns {Promise<{valid: boolean, ownerName?: string}>}
+ */
 export async function validateReferralCode(code) {
   if (!code) return { valid: false };
   return post("/api/referrals/validate", { code });
 }
 
+/**
+ * Credit referral after invoice commit.
+ * @param {object} payload
+ *   invoiceId, customerCode, refCode, subtotal, gst, litres, createdAt
+ * @returns {Promise<any>}
+ */
 export async function creditReferral(payload) {
-  // expected: { invoiceId, customerCode, refCode, subtotal, gst, litres, createdAt }
   return post("/api/referrals/credit", payload);
 }
