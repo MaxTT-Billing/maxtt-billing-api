@@ -1,78 +1,80 @@
-// referralsClient.js  (ESM)
-// Extract referral code + POST to Seal & Earn with robust fallback.
+// referralsClient.js
+// HTTP client for Seal & Earn (validate + credit) using HMAC auth.
+// Uses: REF_API_BASE_URL, REF_SIGNING_KEY, REFERRALS_TIMEOUT_MS (optional)
 
-const SE_BASE = (process.env.SEAL_EARN_BASE_URL || "").replace(/\/+$/,"");
-const SE_KEY  = process.env.SEAL_EARN_API_KEY || "";
+import crypto from "node:crypto";
 
-/** Extract a plausible referral code from free text. */
-export function extractReferralCode(txt) {
-  if (!txt || typeof txt !== "string") return null;
-  const m1 = txt.match(/REF[:\s-]*([A-Za-z0-9/_-]{6,})/i);
-  if (m1 && m1[1]) return m1[1].trim();
-  const m2 = txt.match(/(MAXTT-[A-Z0-9/_-]{4,})/i);
-  if (m2 && m2[1]) return m2[1].trim();
-  const m3 = txt.match(/([A-Za-z0-9/_-]{8,})/);
-  if (m3 && m3[1]) return m3[1].trim();
-  return null;
+function required(name) {
+  const v = process.env[name];
+  if (!v) throw new Error(`Missing environment variable: ${name}`);
+  return v;
 }
 
-function buildPayload(p) {
-  return {
-    referral_code:  String(p.referral_code || "").trim(),
-    customer_code:  String(p.customer_code || "").trim(),
-    invoice_id:     Number(p.invoice_id || 0),
-    invoice_number: String(p.invoice_number || "").trim(),
-    amount:         Number(p.amount || 0),
-    created_at:     p.created_at || new Date().toISOString(),
-    franchisee_id:  p.franchisee_id ? String(p.franchisee_id).trim() : undefined
-  };
+const BASE = required("REF_API_BASE_URL");                 // e.g. https://maxtt-referrals-api-pv5c.onrender.com
+const KEY  = required("REF_SIGNING_KEY");                  // 32+ char shared secret
+const TIMEOUT = parseInt(process.env.REFERRALS_TIMEOUT_MS ?? "5000", 10);
+
+function hmac(body) {
+  const mac = crypto.createHmac("sha256", KEY);
+  mac.update(JSON.stringify(body));
+  return `sha256=${mac.digest("hex")}`;
 }
 
-async function tryPost(url, payload, timeoutMs) {
-  const ctl = new AbortController();
-  const t = setTimeout(() => ctl.abort(), timeoutMs);
+async function post(path, body) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), TIMEOUT);
   try {
-    const res = await fetch(url, {
+    const res = await fetch(`${BASE}${path}`, {
       method: "POST",
       headers: {
-        "Authorization": `Bearer ${SE_KEY}`,
-        "Content-Type": "application/json"
+        "content-type": "application/json",
+        "x-ref-sig": hmac(body),
       },
-      body: JSON.stringify(payload),
-      signal: ctl.signal,
+      body: JSON.stringify(body),
+      signal: ctrl.signal,
     });
-    const ok = res && res.ok;
-    return { ok, status: res?.status ?? 0 };
-  } catch (e) {
-    return { ok: false, status: 0 };
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      throw new Error(`Referrals ${path} ${res.status}: ${text}`);
+    }
+    return await res.json();
   } finally {
-    clearTimeout(t);
+    clearTimeout(timer);
   }
 }
 
-/** Fire-and-forget POST to Seal & Earn with external → local fallback. */
-export async function postReferral(p) {
-  try {
-    if (!p || !p.referral_code) return { ok: false, reason: "no_referral_code" };
-    if (!SE_KEY) return { ok: false, reason: "env_missing_key" };
+/**
+ * Validate a referral code
+ * @param {string} code
+ * @returns {Promise<{valid:boolean, ownerName?:string}>}
+ */
+export async function validateReferral(code) {
+  if (!code) return { valid: false };
+  return post("/api/referrals/validate", { code });
+}
 
-    const payload = buildPayload(p);
-    const port = process.env.PORT || 10000;
-    const local = `http://127.0.0.1:${port}/api/referrals`;
+/**
+ * Credit a referral based on invoice facts (post-commit)
+ * Shape: { invoiceId, customerCode, refCode, subtotal, gst, litres, createdAt }
+ */
+export async function creditReferral(payload) {
+  return post("/api/referrals/credit", payload);
+}
 
-    // Try external first if configured; then local stub.
-    const targets = [];
-    if (SE_BASE) targets.push(SE_BASE + "/api/referrals");
-    targets.push(local);
-
-    // External: 3500ms; Local: 1500ms
-    for (const url of targets) {
-      const isLocal = url.startsWith("http://127.0.0.1:");
-      const r = await tryPost(url, payload, isLocal ? 1500 : 3500);
-      if (r.ok) return r;
-    }
-    return { ok: false, status: 0 };
-  } catch (err) {
-    return { ok: false, reason: "exception" };
-  }
+/**
+ * Legacy/test passthrough retained for /__wire/referrals/test
+ * Accepts an already-shaped body + apiKey header fallback.
+ */
+export async function postReferral(body /*, apiKey */) {
+  // Normalise into credit payload if fields look like legacy names
+  const maybe = {
+    invoiceId: body.referred_invoice_code ?? body.invoiceId,
+    customerCode: body.customer_code ?? body.customerCode,
+    refCode: body.referrer_customer_code ?? body.refCode,
+    subtotal: body.invoice_amount_inr ?? body.subtotal,
+    gst: body.gst ?? 0,
+    litres: body.litres ?? body.total_qty_ml ?? 0,
+    createdAt: body.invoice_date ?? body.createdAt,
+  };
+  return creditReferral(maybe);
 }
