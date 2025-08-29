@@ -1,5 +1,6 @@
 // routes/create_full.js  (ESM)
-// Adds CORS/OPTIONS handling at router level + enforces codes.
+// Strict printed-invoice format: TS-SS-CCC-NNN/NNNN/MMYY  (NO middle segment)
+// Customer Code = <FranchiseeCode>-<SEQ> (no fallback)
 
 import express from "express";
 import pkg from "pg";
@@ -12,7 +13,7 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false },
 });
 
-// ---- CORS & JSON (fixes “Failed to fetch” preflight) ----
+// ---- CORS & JSON ----
 router.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
@@ -21,14 +22,15 @@ router.use((req, res, next) => {
   next();
 });
 router.use(express.json({ limit: "2mb" }));
-// ---------------------------------------------------------
+// ---------------------
 
 // utils
 const num = (v) => (v === null || v === undefined || v === "" ? undefined : Number(v));
-const FR_REGEX = /^TS-[A-Z]{2}-[A-Z]{3}-\d{3}$/;
-const INV_REGEX = /^(TS-[A-Z]{2}-[A-Z]{3}-\d{3})\/[A-Z0-9-]+\/(\d{4})\/(\d{4})$/;
+const FR_REGEX  = /^TS-[A-Z]{2}-[A-Z]{3}-\d{3}$/;
+// NEW strict: 3 parts only → TS-SS-CCC-NNN/NNNN/MMYY
+const INV_REGEX = /^(TS-[A-Z]{2}-[A-Z]{3}-\d{3})\/(\d{4})\/(\d{4})$/;
 
-// inline local S&E stub (kept)
+// ---- local S&E stub (kept) ----
 const LOCAL_API_KEY = process.env.SEAL_EARN_API_KEY || "";
 router.get("/debug/referrals/ping", (_req, res) => {
   res.json({ ok: true, where: "create_full_inline_stub" });
@@ -56,26 +58,25 @@ router.post("/api/referrals", (req, res) => {
     return res.status(500).json({ ok: false, error: "stub_error" });
   }
 });
+// --------------------------------
 
 // POST /api/invoices/full
 router.post(["/api/invoices/full", "/invoices/full"], async (req, res) => {
   try {
     const body = { ...(req.body || {}) };
 
-    // Strict codes enforcement
-    const invoiceNumber = String(body.invoice_number || "").trim();
-    if (!invoiceNumber) {
-      return res.status(400).json({ error: "invoice_number_required" });
-    }
+    // STRICT: printed invoice format
+    const invoiceNumber = String(body.invoice_number || "").trim().toUpperCase();
+    if (!invoiceNumber) return res.status(400).json({ error: "invoice_number_required" });
     const invm = invoiceNumber.match(INV_REGEX);
     if (!invm) {
       return res.status(400).json({
         error: "bad_invoice_number_format",
-        expect: "TS-SS-CCC-NNN/XX/NNNN/MMYY (e.g., TS-DL-DEL-001/XX/0086/0825)"
+        expect: "TS-SS-CCC-NNN/NNNN/MMYY  (e.g., TS-DL-DEL-001/0087/0825)"
       });
     }
-    const franchiseeCode = invm[1];
-    const seq = invm[2];
+    const franchiseeCode = invm[1]; // TS-SS-CCC-NNN
+    const seq = invm[2];            // NNNN
     if (!FR_REGEX.test(franchiseeCode)) {
       return res.status(400).json({ error: "bad_franchisee_code", value: franchiseeCode });
     }
@@ -83,8 +84,8 @@ router.post(["/api/invoices/full", "/invoices/full"], async (req, res) => {
     body.franchisee_id = franchiseeCode;
     body.customer_code = derivedCustomerCode;
 
-    if (!body.created_at) body.created_at = new Date().toISOString();
     if (!body.hsn_code) body.hsn_code = "35069999"; // Sealant default
+    if (!body.created_at) body.created_at = new Date().toISOString();
 
     // numbers
     body.odometer         = num(body.odometer);
@@ -161,11 +162,8 @@ router.post(["/api/invoices/full", "/invoices/full"], async (req, res) => {
           created_at: saved.created_at,
           franchisee_id: saved.franchisee_id
         };
-        postReferral(payload).then(r => {
-          console.log("[Seal&Earn] result:", r);
-        }).catch(e => {
-          console.warn("[Seal&Earn] failed:", e?.message || e);
-        });
+        postReferral(payload).then(r => console.log("[Seal&Earn] result:", r))
+                             .catch(e => console.warn("[Seal&Earn] failed:", e?.message || e));
       }
     } catch (e) {
       console.warn("[Seal&Earn] skipped/error:", e?.message || e);
