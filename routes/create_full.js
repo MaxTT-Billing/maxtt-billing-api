@@ -1,192 +1,261 @@
-// routes/create_full.js  (ESM)
-// Strict printed-invoice format: TS-SS-CCC-NNN/NNNN/MMYY  (NO middle segment)
-// Customer Code = <FranchiseeCode>-<SEQ> (no fallback)
+// routes/create_full.js
+// Canonical "full" invoice routes for MaxTT Billing API.
+// - POST /api/invoices/full : creates an invoice; auto-generates printed invoice number
+// - GET  /api/invoices/:id/full2 : fetches full row (no-store)
+// Rules enforced here:
+//   • Printed invoice format: TS-SS-CCC-NNN/NNNN/MMYY  (e.g., TS-DL-DEL-001/0087/0825)
+//   • Customer Code = <FranchiseeCode>-<SEQ> (zero-padded 4)
+//   • Default HSN (sealant) = 35069999
+//   • GST = 18%
+//   • Optional referrals: body.referral.code → validate (non-fatal) → credit post-commit
 
 import express from "express";
 import pkg from "pg";
-import { extractReferralCode, postReferral } from "../referralsClient.js";
-
 const { Pool } = pkg;
-const router = express.Router();
+
+import { validateReferral, creditReferral } from "../referralsClient.js";
+
+// ---------- DB ----------
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false },
 });
 
-// ---- CORS & JSON ----
-router.use((req, res, next) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
-  if (req.method === "OPTIONS") return res.sendStatus(200);
-  next();
-});
-router.use(express.json({ limit: "2mb" }));
-// ---------------------
+// ---------- Helpers ----------
+let cachedCols = null;
+/** Return Set of lowercase column names for public.invoices */
+async function getInvoiceCols(client) {
+  if (cachedCols) return cachedCols;
+  const r = await client.query(`
+    SELECT lower(column_name) AS name
+    FROM information_schema.columns
+    WHERE table_schema = 'public' AND table_name = 'invoices'
+  `);
+  cachedCols = new Set(r.rows.map((x) => x.name));
+  return cachedCols;
+}
+const has = (cols, name) => cols.has(String(name).toLowerCase());
+const qid = (s) => `"${s}"`;
 
-// utils
-const num = (v) => (v === null || v === undefined || v === "" ? undefined : Number(v));
-const FR_REGEX  = /^TS-[A-Z]{2}-[A-Z]{3}-\d{3}$/;
-// NEW strict: 3 parts only → TS-SS-CCC-NNN/NNNN/MMYY
-const INV_REGEX = /^(TS-[A-Z]{2}-[A-Z]{3}-\d{3})\/(\d{4})\/(\d{4})$/;
+/** Get IST (UTC+5:30) Date object as ISO string */
+function istNow() {
+  const now = new Date();
+  const ist = new Date(now.getTime() + 330 * 60 * 1000);
+  return ist;
+}
+function fmtMMYY(d) {
+  const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const yy = String(d.getUTCFullYear()).slice(-2);
+  return `${mm}${yy}`;
+}
 
-// ---- local S&E stub (kept) ----
-const LOCAL_API_KEY = process.env.SEAL_EARN_API_KEY || "";
-router.get("/debug/referrals/ping", (_req, res) => {
-  res.json({ ok: true, where: "create_full_inline_stub" });
-});
-router.post("/api/referrals", (req, res) => {
+/** Parse last 4-digit sequence from an invoice_number like TS-.../0087/0825 */
+function parseSeq(invNo) {
+  if (!invNo) return 0;
+  const m = String(invNo).match(/\/(\d{1,4})\//);
+  return m ? parseInt(m[1], 10) || 0 : 0;
+}
+/** Parse last 4-digit suffix from a customer_code like TS-...-0007 */
+function parseCustSeq(cc) {
+  if (!cc) return 0;
+  const m = String(cc).match(/-(\d{1,4})$/);
+  return m ? parseInt(m[1], 10) || 0 : 0;
+}
+
+/** Compute totals with GST 18% and default HSN */
+function computePricing(input = {}) {
+  const qty = Number(input.total_qty_ml ?? input.qty_ml ?? 0) || 0;
+  const mrp = Number(input.mrp_per_ml ?? input.price_per_ml ?? 0) || 0;
+  const install = Number(input.installation_cost ?? 0) || 0;
+  const disc = Number(input.discount_amount ?? 0) || 0;
+  let subtotal = qty * mrp + install - disc;
+  if (!Number.isFinite(subtotal) || subtotal < 0) subtotal = 0;
+  const gstRate = 18;
+  const gstAmt = +(subtotal * 0.18).toFixed(2);
+  const total = +(subtotal + gstAmt).toFixed(2);
+  return {
+    subtotal_ex_gst: subtotal,
+    gst_rate: gstRate,
+    gst_amount: gstAmt,
+    total_amount: total,
+    hsn_code: "35069999",
+  };
+}
+
+/** Insert row with dynamic column set */
+async function insertInvoice(client, payload) {
+  const cols = await getInvoiceCols(client);
+  const data = {};
+  for (const [k, v] of Object.entries(payload)) {
+    if (has(cols, k) && v !== undefined) data[k] = v;
+  }
+  const keys = Object.keys(data);
+  if (!keys.length) throw new Error("no_matching_columns");
+  const colSql = keys.map(qid).join(", ");
+  const valSql = keys.map((_, i) => `$${i + 1}`).join(", ");
+  const vals = keys.map((k) => data[k]);
+  const sql = `INSERT INTO public.invoices (${colSql}) VALUES (${valSql}) RETURNING *`;
+  const r = await client.query(sql, vals);
+  return r.rows[0];
+}
+
+// ---------- Router ----------
+const router = express.Router();
+
+/**
+ * POST /api/invoices/full
+ * Accepts body; if invoice_number missing, generate it.
+ * Also fills customer_code, pricing (GST 18%, HSN 35069999), and sets invoice_ts_ist when column exists.
+ */
+router.post("/api/invoices/full", async (req, res) => {
+  const body = req.body || {};
+  const refCode =
+    (body.referral && typeof body.referral.code === "string" && body.referral.code.trim()) || "";
+
+  const client = await pool.connect();
   try {
-    const auth = req.headers.authorization || "";
-    const token = auth.startsWith("Bearer ") ? auth.slice(7).trim() : "";
-    if (!LOCAL_API_KEY || token !== LOCAL_API_KEY) {
-      return res.status(401).json({ ok: false, error: "unauthorized" });
+    await client.query("BEGIN");
+
+    const cols = await getInvoiceCols(client);
+
+    // --- Franchisee code is required to build printed number & customer code
+    const franchisee = String(
+      body.franchisee_code ??
+        body.franchisee_id ??
+        body.franchise_code ??
+        ""
+    ).trim();
+    if (!franchisee) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ error: "franchisee_code_required" });
     }
-    const p = req.body || {};
-    console.log("[Seal&Earn:LOCAL-inline] referral:", {
-      referral_code: p.referral_code,
-      customer_code: p.customer_code,
-      invoice_id: p.invoice_id,
-      invoice_number: p.invoice_number,
-      amount: p.amount,
-      created_at: p.created_at,
-      franchisee_id: p.franchisee_id,
+
+    // --- Advisory lock to avoid concurrent sequence clashes per franchisee
+    await client.query(`SELECT pg_advisory_xact_lock(hashtext($1))`, [franchisee]);
+
+    // --- Build invoice_number if not provided
+    let invoice_number = String(body.invoice_number || "").trim();
+    if (!invoice_number) {
+      // find latest sequence for this franchisee
+      let seq = 0;
+      if (has(cols, "invoice_number") && has(cols, "franchisee_code")) {
+        const r = await client.query(
+          `SELECT ${qid("invoice_number")} 
+             FROM public.invoices 
+            WHERE ${qid("franchisee_code")} = $1 
+            ORDER BY ${has(cols, "id") ? qid("id") : qid("invoice_id")} DESC 
+            LIMIT 1`,
+          [franchisee]
+        );
+        if (r.rows.length) seq = parseSeq(r.rows[0].invoice_number);
+      }
+      const next = (seq || 0) + 1;
+      const seqStr = String(next).padStart(4, "0");
+      const mmyy = fmtMMYY(istNow());
+      invoice_number = `${franchisee}/${seqStr}/${mmyy}`;
+    }
+
+    // --- Build customer_code if not provided: <FranchiseeCode>-<SEQ4>
+    let customer_code = String(body.customer_code || "").trim();
+    if (!customer_code) {
+      let cseq = 0;
+      if (has(cols, "customer_code") && has(cols, "franchisee_code")) {
+        const r = await client.query(
+          `SELECT ${qid("customer_code")} 
+             FROM public.invoices 
+            WHERE ${qid("franchisee_code")} = $1 
+            ORDER BY ${has(cols, "id") ? qid("id") : qid("invoice_id")} DESC 
+            LIMIT 1`,
+          [franchisee]
+        );
+        if (r.rows.length) cseq = parseCustSeq(r.rows[0].customer_code);
+      }
+      const next = (cseq || 0) + 1;
+      const seqStr = String(next).padStart(4, "0");
+      customer_code = `${franchisee}-${seqStr}`;
+    }
+
+    // --- Compute pricing (GST 18%, HSN 35069999)
+    const pricing = computePricing(body);
+
+    // --- Prepare row
+    const nowIst = istNow().toISOString();
+    const baseRow = {
+      ...body,
+      invoice_number,
+      customer_code,
+      subtotal_ex_gst: pricing.subtotal_ex_gst,
+      gst_rate: pricing.gst_rate,
+      gst_amount: pricing.gst_amount,
+      total_amount: pricing.total_amount,
+      hsn_code: pricing.hsn_code,
+    };
+    if (has(cols, "invoice_ts_ist")) baseRow.invoice_ts_ist = nowIst;
+    if (!baseRow.franchisee_code && has(cols, "franchisee_code")) baseRow.franchisee_code = franchisee;
+
+    // --- Insert
+    const row = await insertInvoice(client, baseRow);
+
+    await client.query("COMMIT");
+
+    // Respond first
+    res.status(201).json({
+      ok: true,
+      id: row.id ?? row.invoice_id,
+      invoice_number,
+      customer_code,
     });
-    return res.json({ ok: true, mode: "local-inline" });
-  } catch (e) {
-    console.error("local inline se error:", e);
-    return res.status(500).json({ ok: false, error: "stub_error" });
+
+    // --- Post-commit: referrals (non-blocking)
+    if (refCode) {
+      try {
+        // validate is non-fatal; ignore failures
+        await validateReferral(refCode).catch(() => {});
+        await creditReferral({
+          invoiceId: row.id ?? row.invoice_id,
+          customerCode: customer_code,
+          refCode,
+          subtotal: pricing.subtotal_ex_gst,
+          gst: pricing.gst_amount,
+          litres: Number(body.total_qty_ml ?? body.dosage_ml ?? 0) / 1000, // if you store ml, convert to L for credits
+          createdAt: row.created_at ?? nowIst,
+        }).catch(() => {});
+      } catch {
+        // swallow — never fail the request due to referral side
+      }
+    }
+  } catch (err) {
+    try { await client.query("ROLLBACK"); } catch {}
+    console.error("create_full error:", err);
+    const msg = err && err.message ? String(err.message) : "Create failed";
+    res.status(400).json({ error: msg });
+  } finally {
+    client.release();
   }
 });
-// --------------------------------
 
-// POST /api/invoices/full
-router.post(["/api/invoices/full", "/invoices/full"], async (req, res) => {
+/**
+ * GET /api/invoices/:id/full2   (no-store)
+ * Returns complete row from public.invoices
+ */
+router.get("/api/invoices/:id/full2", async (req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+  const idRaw = req.params.id;
+  const client = await pool.connect();
   try {
-    const body = { ...(req.body || {}) };
-
-    // STRICT: printed invoice format
-    const invoiceNumber = String(body.invoice_number || "").trim().toUpperCase();
-    if (!invoiceNumber) return res.status(400).json({ error: "invoice_number_required" });
-    const invm = invoiceNumber.match(INV_REGEX);
-    if (!invm) {
-      return res.status(400).json({
-        error: "bad_invoice_number_format",
-        expect: "TS-SS-CCC-NNN/NNNN/MMYY  (e.g., TS-DL-DEL-001/0087/0825)"
-      });
-    }
-    const franchiseeCode = invm[1]; // TS-SS-CCC-NNN
-    const seq = invm[2];            // NNNN
-    if (!FR_REGEX.test(franchiseeCode)) {
-      return res.status(400).json({ error: "bad_franchisee_code", value: franchiseeCode });
-    }
-    const derivedCustomerCode = `${franchiseeCode}-${seq}`;
-    body.franchisee_id = franchiseeCode;
-    body.customer_code = derivedCustomerCode;
-
-    if (!body.hsn_code) body.hsn_code = "35069999"; // Sealant default
-    if (!body.created_at) body.created_at = new Date().toISOString();
-
-    // numbers
-    body.odometer         = num(body.odometer);
-    body.tread_depth_mm   = num(body.tread_depth_mm);
-    body.tread_fl_mm      = num(body.tread_fl_mm);
-    body.tread_fr_mm      = num(body.tread_fr_mm);
-    body.tread_rl_mm      = num(body.tread_rl_mm);
-    body.tread_rr_mm      = num(body.tread_rr_mm);
-    body.dosage_ml        = num(body.dosage_ml);
-    body.price_per_ml     = num(body.price_per_ml);
-    body.gst_rate         = num(body.gst_rate);
-    body.total_before_gst = num(body.total_before_gst);
-    body.gst_amount       = num(body.gst_amount);
-    body.total_with_gst   = num(body.total_with_gst);
-    body.tyre_width_mm    = num(body.tyre_width_mm);
-    body.aspect_ratio     = num(body.aspect_ratio);
-    body.rim_diameter_in  = num(body.rim_diameter_in);
-
-    // per-tyre from legacy
-    const hasPerTyre = [body.tread_fl_mm, body.tread_fr_mm, body.tread_rl_mm, body.tread_rr_mm]
-      .some(v => v !== undefined);
-    if (!hasPerTyre && body.tread_depth_mm !== undefined) {
-      body.tread_fl_mm = body.tread_depth_mm;
-      body.tread_fr_mm = body.tread_depth_mm;
-      body.tread_rl_mm = body.tread_depth_mm;
-      body.tread_rr_mm = body.tread_depth_mm;
-    }
-
-    // insert
-    const { rows: colsRows } = await pool.query(
-      `SELECT column_name FROM information_schema.columns WHERE table_name = 'invoices'`
+    const cols = await getInvoiceCols(client);
+    const idCol = has(cols, "id") ? "id" : "invoice_id";
+    const r = await client.query(
+      `SELECT * FROM public.invoices WHERE ${qid(idCol)} = $1 LIMIT 1`,
+      [idRaw]
     );
-    const colset = new Set(colsRows.map((r) => r.column_name));
-    const CANDIDATE = [
-      "created_at","customer_name","mobile_number","vehicle_number","installer_name",
-      "vehicle_type","tyre_width_mm","aspect_ratio","rim_diameter_in",
-      "dosage_ml","price_per_ml","gst_rate","total_before_gst","gst_amount","total_with_gst",
-      "gps_lat","gps_lng","customer_code","tyre_count","fitment_locations","customer_gstin",
-      "customer_address","franchisee_id","updated_at","customer_signature","signed_at",
-      "consent_signature","consent_signed_at","consent_snapshot","declaration_snapshot",
-      "hsn_code","invoice_number",
-      "odometer","tread_depth_mm","tread_fl_mm","tread_fr_mm","tread_rl_mm","tread_rr_mm"
-    ];
-    const keys = CANDIDATE.filter((k) => body[k] !== undefined && colset.has(k));
-    if (!keys.length) return res.status(400).json({ error: "no_valid_fields" });
-    const cols = keys.map((k) => `"${k}"`).join(", ");
-    const placeholders = keys.map((_, i) => `$${i + 1}`).join(", ");
-    const values = keys.map((k) => body[k]);
-
-    let saved;
-    try {
-      const r = await pool.query(
-        `INSERT INTO invoices (${cols}) VALUES (${placeholders}) RETURNING *`,
-        values
-      );
-      saved = r.rows[0];
-    } catch (e) {
-      if (e && e.code === "23505") {
-        return res.status(409).json({ error: "duplicate_customer_code", customer_code: body.customer_code });
-      }
-      throw e;
-    }
-
-    // Seal & Earn (non-blocking)
-    try {
-      const refCode = body.referral_code || extractReferralCode(body.remarks || "");
-      if (refCode) {
-        const payload = {
-          referral_code: refCode,
-          customer_code: saved.customer_code,
-          invoice_id: saved.id,
-          invoice_number: saved.invoice_number || invoiceNumber,
-          amount: saved.total_with_gst || 0,
-          created_at: saved.created_at,
-          franchisee_id: saved.franchisee_id
-        };
-        postReferral(payload).then(r => console.log("[Seal&Earn] result:", r))
-                             .catch(e => console.warn("[Seal&Earn] failed:", e?.message || e));
-      }
-    } catch (e) {
-      console.warn("[Seal&Earn] skipped/error:", e?.message || e);
-    }
-
-    return res.status(201).json(saved);
+    if (!r.rows.length) return res.status(404).json({ error: "not_found" });
+    return res.json(r.rows[0]);
   } catch (e) {
-    console.error("insert failed:", e);
-    return res.status(500).json({ error: "insert_failed" });
-  }
-});
-
-// GET /api/invoices/:id/full2
-router.get(["/api/invoices/:id/full2", "/invoices/:id/full2"], async (req, res) => {
-  try {
-    const id = Number(req.params.id);
-    if (!Number.isFinite(id)) return res.status(400).json({ error: "bad_id" });
-    const { rows } = await pool.query(`SELECT * FROM invoices WHERE id = $1`, [id]);
-    if (!rows.length) return res.status(404).json({ error: "not_found" });
-    return res.json(rows[0]);
-  } catch (e) {
-    console.error("full2 failed:", e);
-    return res.status(500).json({ error: "query_failed" });
+    console.error("full2 fetch error:", e);
+    return res.status(500).json({ error: "fetch_failed" });
+  } finally {
+    client.release();
   }
 });
 
