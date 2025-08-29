@@ -1,21 +1,29 @@
 // routes/create_full.js  (ESM)
+// Enforces Franchisee Code + Customer Code (NO fallback)
+// Customer Code = <FranchiseeCode>-<SEQ> where SEQ is from printed invoice_number
+// invoice_number format expected: TS-SS-CCC-NNN/XX/NNNN/MMYY
+
 import express from "express";
 import pkg from "pg";
 import { extractReferralCode, postReferral } from "../referralsClient.js";
 
 const { Pool } = pkg;
 const router = express.Router();
-const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
-const LOCAL_API_KEY = process.env.SEAL_EARN_API_KEY || "";
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false },
+});
 
-// util
+// utils
 const num = (v) => (v === null || v === undefined || v === "" ? undefined : Number(v));
+const FR_REGEX = /^TS-[A-Z]{2}-[A-Z]{3}-\d{3}$/;
+const INV_REGEX = /^(TS-[A-Z]{2}-[A-Z]{3}-\d{3})\/[A-Z0-9-]+\/(\d{4})\/(\d{4})$/;
 
-// ---- Local S&E stub embedded here (so no server.js edit needed) ----
+// inline local S&E stub (kept from earlier; ok for now)
+const LOCAL_API_KEY = process.env.SEAL_EARN_API_KEY || "";
 router.get("/debug/referrals/ping", (_req, res) => {
   res.json({ ok: true, where: "create_full_inline_stub" });
 });
-
 router.post("/api/referrals", express.json({ limit: "1mb" }), (req, res) => {
   try {
     const auth = req.headers.authorization || "";
@@ -39,16 +47,41 @@ router.post("/api/referrals", express.json({ limit: "1mb" }), (req, res) => {
     return res.status(500).json({ ok: false, error: "stub_error" });
   }
 });
-// --------------------------------------------------------------------
 
 // POST /api/invoices/full
 router.post(["/api/invoices/full", "/invoices/full"], async (req, res) => {
   try {
     const body = { ...(req.body || {}) };
+
+    // ------ STRICT CODES ENFORCEMENT ------
+    const invoiceNumber = String(body.invoice_number || "").trim();
+    if (!invoiceNumber) {
+      return res.status(400).json({ error: "invoice_number_required" });
+    }
+    const invm = invoiceNumber.match(INV_REGEX);
+    if (!invm) {
+      return res.status(400).json({
+        error: "bad_invoice_number_format",
+        expect: "TS-SS-CCC-NNN/XX/NNNN/MMYY (e.g., TS-DL-DEL-001/XX/0085/0825)"
+      });
+    }
+    const franchiseeCode = invm[1];    // TS-SS-CCC-NNN
+    const seq = invm[2];               // NNNN (4 digits)
+    if (!FR_REGEX.test(franchiseeCode)) {
+      return res.status(400).json({ error: "bad_franchisee_code", value: franchiseeCode });
+    }
+    const derivedCustomerCode = `${franchiseeCode}-${seq}`;
+
+    // Override any incoming values to the enforced ones
+    body.franchisee_id = franchiseeCode;
+    body.customer_code = derivedCustomerCode;
+
+    // --------------------------------------
+
     if (!body.created_at) body.created_at = new Date().toISOString();
     if (!body.hsn_code) body.hsn_code = "35069999"; // Sealant default
 
-    // normalize numerics
+    // Normalize numeric-like fields
     body.odometer         = num(body.odometer);
     body.tread_depth_mm   = num(body.tread_depth_mm);
     body.tread_fl_mm      = num(body.tread_fl_mm);
@@ -65,7 +98,7 @@ router.post(["/api/invoices/full", "/invoices/full"], async (req, res) => {
     body.aspect_ratio     = num(body.aspect_ratio);
     body.rim_diameter_in  = num(body.rim_diameter_in);
 
-    // per-tyre autofill from legacy
+    // If per-tyre missing but legacy depth present, auto-fill all four
     const hasPerTyre =
       body.tread_fl_mm !== undefined ||
       body.tread_fr_mm !== undefined ||
@@ -78,11 +111,12 @@ router.post(["/api/invoices/full", "/invoices/full"], async (req, res) => {
       body.tread_rr_mm = body.tread_depth_mm;
     }
 
-    // insert only existing columns
+    // Insert only columns that exist
     const { rows: colsRows } = await pool.query(
       `SELECT column_name FROM information_schema.columns WHERE table_name = 'invoices'`
     );
     const colset = new Set(colsRows.map((r) => r.column_name));
+
     const CANDIDATE = [
       "created_at","customer_name","mobile_number","vehicle_number","installer_name",
       "vehicle_type","tyre_width_mm","aspect_ratio","rim_diameter_in",
@@ -93,6 +127,7 @@ router.post(["/api/invoices/full", "/invoices/full"], async (req, res) => {
       "hsn_code","invoice_number",
       "odometer","tread_depth_mm","tread_fl_mm","tread_fr_mm","tread_rl_mm","tread_rr_mm"
     ];
+
     const keys = CANDIDATE.filter((k) => body[k] !== undefined && colset.has(k));
     if (!keys.length) return res.status(400).json({ error: "no_valid_fields" });
 
@@ -100,24 +135,33 @@ router.post(["/api/invoices/full", "/invoices/full"], async (req, res) => {
     const placeholders = keys.map((_, i) => `$${i + 1}`).join(", ");
     const values = keys.map((k) => body[k]);
 
-    const { rows } = await pool.query(
-      `INSERT INTO invoices (${cols}) VALUES (${placeholders}) RETURNING *`,
-      values
-    );
-    const saved = rows[0];
+    let saved;
+    try {
+      const r = await pool.query(
+        `INSERT INTO invoices (${cols}) VALUES (${placeholders}) RETURNING *`,
+        values
+      );
+      saved = r.rows[0];
+    } catch (e) {
+      // Unique violation on customer_code
+      if (e && e.code === "23505") {
+        return res.status(409).json({ error: "duplicate_customer_code", customer_code: body.customer_code });
+      }
+      throw e;
+    }
 
-    // fire-and-forget Seal & Earn (with fallback inside postReferral)
+    // Kick off Seal & Earn (non-blocking)
     try {
       const refCode = body.referral_code || extractReferralCode(body.remarks || "");
       if (refCode) {
         const payload = {
           referral_code: refCode,
-          customer_code: saved.customer_code || (saved.id ? `C${String(saved.id).padStart(6,"0")}` : ""),
+          customer_code: saved.customer_code,
           invoice_id: saved.id,
-          invoice_number: saved.invoice_number || body.invoice_number || "",
+          invoice_number: saved.invoice_number || invoiceNumber,
           amount: saved.total_with_gst || 0,
           created_at: saved.created_at,
-          franchisee_id: saved.franchisee_id || body.franchisee_id || body.franchisee_code || ""
+          franchisee_id: saved.franchisee_id
         };
         postReferral(payload).then(r => {
           console.log("[Seal&Earn] result:", r);
