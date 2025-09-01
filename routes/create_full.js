@@ -1,16 +1,19 @@
-// routes/create_full.js
-// POST /api/invoices/full   — auto-generates printed invoice + unique customer_code
-// GET  /api/invoices/:id/full2  — no-store fetch
+// routes/create_full.js — Column-aware "full" invoice routes
+// POST /api/invoices/full  -> creates an invoice (auto printed no + customer code)
+// GET  /api/invoices/:id/full2 -> returns full row (no-store)
 //
-// Enforces:
-//  • Printed invoice: TS-SS-CCC-NNNN/MMYY (e.g., TS-DL-DEL-001/0087/0825)
-//  • Customer Code:  <FranchiseeCode>-NNNN (unique via DB constraint)
-//  • Default HSN (sealant) = 35069999, GST = 18%
-//  • After commit: referral validate (non-fatal) + credit
+// Key behavior:
+//  • Detects actual DB column names (franchisee, invoice_number, customer_code, etc.) at runtime
+//  • Generates printed invoice number TS-SS-CCC-NNNN/MMYY and customer code <Franchisee>-NNNN
+//  • Only inserts into columns that really exist
+//  • If a target column is missing in DB, still generates values (for response + referrals)
+//  • Enforces GST 18% + HSN 35069999
+//  • Posts referral credit after commit (fire-and-forget)
 
 import express from "express";
 import pkg from "pg";
 const { Pool } = pkg;
+
 import { validateReferral, creditReferral } from "../referralsClient.js";
 
 const router = express.Router();
@@ -35,6 +38,7 @@ async function getInvoiceCols(client) {
 }
 const has = (cols, name) => cols.has(String(name).toLowerCase());
 const qid = (s) => `"${s}"`;
+const pick = (cols, candidates) => candidates.find((c) => has(cols, c)) || null;
 
 function istNow() {
   const now = new Date();
@@ -45,12 +49,11 @@ function fmtMMYY(d) {
   const yy = String(d.getUTCFullYear()).slice(-2);
   return `${mm}${yy}`;
 }
-
 function computePricing(input = {}) {
-  const qty = Number(input.total_qty_ml ?? input.qty_ml ?? 0) || 0;
-  const mrp = Number(input.mrp_per_ml ?? input.price_per_ml ?? 0) || 0;
-  const install = Number(input.installation_cost ?? 0) || 0;
-  const disc = Number(input.discount_amount ?? 0) || 0;
+  const qty = Number(input.total_qty_ml ?? input.qty_ml ?? input.quantity_ml ?? input.dosage_ml ?? 0) || 0;
+  const mrp = Number(input.mrp_per_ml ?? input.price_per_ml ?? input.rate_per_ml ?? input.mrp_ml ?? 0) || 0;
+  const install = Number(input.installation_cost ?? input.install_cost ?? input.labour ?? input.labour_cost ?? 0) || 0;
+  const disc = Number(input.discount_amount ?? input.discount ?? input.disc ?? 0) || 0;
   let subtotal = qty * mrp + install - disc;
   if (!Number.isFinite(subtotal) || subtotal < 0) subtotal = 0;
   const gstRate = 18;
@@ -62,14 +65,15 @@ function computePricing(input = {}) {
     gst_amount: gstAmt,
     total_amount: total,
     hsn_code: "35069999",
+    litres: qty / 1000,
   };
 }
-
 async function insertInvoice(client, payload) {
   const cols = await getInvoiceCols(client);
   const data = {};
   for (const [k, v] of Object.entries(payload)) {
-    if (has(cols, k) && v !== undefined) data[k] = v;
+    if (v === undefined) continue;
+    if (has(cols, k)) data[k] = v;
   }
   const keys = Object.keys(data);
   if (!keys.length) throw new Error("no_matching_columns");
@@ -81,35 +85,6 @@ async function insertInvoice(client, payload) {
   return r.rows[0];
 }
 
-// ---------- Seq helpers (DB-driven, safe against duplicates) ----------
-async function nextCustomerSeq(client, franchisee) {
-  // Find current max NNNN for this franchisee in "<Franchisee>-NNNN"
-  const r = await client.query(
-    `
-    SELECT COALESCE(MAX(CAST(regexp_replace(${qid("customer_code")},
-           '.*-(\\d{1,4})$','\\1') AS integer)), 0) AS maxseq
-    FROM public.invoices
-    WHERE ${qid("franchisee_code")} = $1
-    `,
-    [franchisee]
-  );
-  return Number(r.rows[0]?.maxseq || 0) + 1;
-}
-
-async function nextInvoiceSeqFromInvno(client, franchisee) {
-  // Find max NNNN inside "TS-..../NNNN/MMYY" for this franchisee
-  const r = await client.query(
-    `
-    SELECT COALESCE(MAX(CAST(regexp_replace(${qid("invoice_number")},
-           '.*/(\\d{1,4})/\\d{4}$','\\1') AS integer)), 0) AS maxseq
-    FROM public.invoices
-    WHERE ${qid("franchisee_code")} = $1
-    `,
-    [franchisee]
-  );
-  return Number(r.rows[0]?.maxseq || 0) + 1;
-}
-
 // ---------- Routes ----------
 router.post("/api/invoices/full", async (req, res) => {
   const body = req.body || {};
@@ -119,98 +94,134 @@ router.post("/api/invoices/full", async (req, res) => {
   try {
     const cols = await getInvoiceCols(client);
 
+    // Resolve actual column names
+    const COL = {
+      franch: pick(cols, ["franchisee_code", "franchisee", "franchise_code", "franchisee_id"]),
+      invNo: pick(cols, ["invoice_number", "invoice_no", "inv_no", "bill_no", "invoice"]),
+      custCode: pick(cols, ["customer_code", "customer_id", "customer", "cust_code"]),
+      createdAt: pick(cols, ["created_at", "invoice_date", "date", "createdon", "created_on"]),
+      invTsIst: pick(cols, ["invoice_ts_ist"]),
+      subtotal: pick(cols, ["subtotal_ex_gst", "subtotal", "amount_before_tax", "amount_ex_gst", "pre_tax_total", "total_before_gst"]),
+      gstRate: pick(cols, ["gst_rate", "tax_rate", "gst_percent", "gst"]),
+      gstAmt: pick(cols, ["gst_amount", "tax_amount", "gst_value"]),
+      totalAmt: pick(cols, ["total_amount", "grand_total", "total", "amount", "total_with_gst"]),
+      hsn: pick(cols, ["hsn_code", "hsn", "hsncode"]),
+    };
+
+    // Franchisee code (required for numbering), but we store it only if that column exists.
     const franchisee = String(
-      body.franchisee_code ?? body.franchisee_id ?? body.franchise_code ?? ""
+      body.franchisee_code ?? body.franchisee ?? body.franchise_code ?? body.franchisee_id ?? ""
     ).trim();
-    if (!franchisee) return res.status(400).json({ error: "franchisee_code_required" });
+    if (!franchisee) {
+      return res.status(400).json({ error: "franchisee_code_required" });
+    }
 
     // Lock per franchisee to avoid races
     await client.query("BEGIN");
     await client.query(`SELECT pg_advisory_xact_lock(hashtext($1))`, [franchisee]);
 
-    const nowIstISO = istNow().toISOString();
-    const pricing = computePricing(body);
-
-    // Compute starting sequences from DB MAX (safer than "last row")
-    let cseq = await nextCustomerSeq(client, franchisee);
-    let iseq = await nextInvoiceSeqFromInvno(client, franchisee);
-
-    // Fill fields (may be overwritten in retry)
-    const base = {
-      ...body,
-      franchisee_code: franchisee,
-      subtotal_ex_gst: pricing.subtotal_ex_gst,
-      gst_rate: pricing.gst_rate,
-      gst_amount: pricing.gst_amount,
-      total_amount: pricing.total_amount,
-      hsn_code: pricing.hsn_code,
-    };
-    if (has(cols, "invoice_ts_ist")) base.invoice_ts_ist = nowIstISO;
-
-    // Try insert with retry on duplicate customer_code
-    const MAX_RETRIES = 5;
-    let lastErr = null;
-    let row = null;
-
-    for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
-      const customer_code = body.customer_code?.trim() || `${franchisee}-${String(cseq).padStart(4, "0")}`;
-      const mmyy = fmtMMYY(istNow());
-      const invoice_number = body.invoice_number?.trim() || `${franchisee}/${String(iseq).padStart(4, "0")}/${mmyy}`;
-
-      try {
-        row = await insertInvoice(client, { ...base, customer_code, invoice_number });
-        lastErr = null;
-        break;
-      } catch (e) {
-        const msg = String(e?.message || e);
-        lastErr = msg;
-        // On unique violation for customer_code, bump seq and retry
-        if (/duplicate key value.*customer_code/i.test(msg)) {
-          cseq++;
-          iseq++; // keep invoice seq in step to avoid aesthetic gaps
-          continue;
-        }
-        throw e; // some other error
-      }
+    // Compute current max sequences ONLY if those columns exist; else start at 0
+    let cseq = 0;
+    if (COL.custCode && COL.franch) {
+      const r = await client.query(
+        `
+        SELECT COALESCE(MAX(CAST(regexp_replace(${qid(COL.custCode)},
+               '.*-(\\d{1,4})$','\\1') AS integer)), 0) AS maxseq
+        FROM public.invoices
+        WHERE ${qid(COL.franch)} = $1
+        `,
+        [franchisee]
+      );
+      cseq = Number(r.rows[0]?.maxseq || 0);
     }
 
-    if (!row) throw new Error(lastErr || "insert_failed");
+    let iseq = 0;
+    if (COL.invNo && COL.franch) {
+      const r = await client.query(
+        `
+        SELECT COALESCE(MAX(CAST(regexp_replace(${qid(COL.invNo)},
+               '.*/(\\d{1,4})/\\d{4}$','\\1') AS integer)), 0) AS maxseq
+        FROM public.invoices
+        WHERE ${qid(COL.franch)} = $1
+        `,
+        [franchisee]
+      );
+      iseq = Number(r.rows[0]?.maxseq || 0);
+    }
+
+    const mmyy = fmtMMYY(istNow());
+    const nextCustSeq = (cseq || 0) + 1;
+    const nextInvSeq = (iseq || 0) + 1;
+
+    const genCustomerCode = `${franchisee}-${String(nextCustSeq).padStart(4, "0")}`;
+    const genInvoiceNumber = `${franchisee}/${String(nextInvSeq).padStart(4, "0")}/${mmyy}`;
+
+    // Compute pricing
+    const pricing = computePricing(body);
+    const nowIstISO = istNow().toISOString();
+
+    // Build row to insert — include only columns that exist
+    const rowToInsert = {
+      // store franchisee if column exists
+      ...(COL.franch ? { [COL.franch]: franchisee } : {}),
+      // store generated numbers into whichever columns exist
+      ...(COL.invNo ? { [COL.invNo]: body.invoice_number?.trim() || genInvoiceNumber } : {}),
+      ...(COL.custCode ? { [COL.custCode]: body.customer_code?.trim() || genCustomerCode } : {}),
+
+      // pricing
+      ...(COL.subtotal ? { [COL.subtotal]: pricing.subtotal_ex_gst } : {}),
+      ...(COL.gstRate ? { [COL.gstRate]: pricing.gst_rate } : {}),
+      ...(COL.gstAmt ? { [COL.gstAmt]: pricing.gst_amount } : {}),
+      ...(COL.totalAmt ? { [COL.totalAmt]: pricing.total_amount } : {}),
+      ...(COL.hsn ? { [COL.hsn]: pricing.hsn_code } : {}),
+
+      // invoice timestamp (if column exists)
+      ...(COL.invTsIst ? { [COL.invTsIst]: nowIstISO } : {}),
+      // include all passthrough body fields that match existing columns
+      ...body,
+    };
+
+    // Insert (only existing columns are included by insertInvoice)
+    const row = await insertInvoice(client, rowToInsert);
 
     await client.query("COMMIT");
 
-    // Respond
-    const out = {
-      ok: true,
-      id: row.id ?? row.invoice_id,
-      invoice_number: row.invoice_number,
-      customer_code: row.customer_code,
-    };
-    res.status(201).json(out);
+    // Respond with generated numbers even if those columns don't exist in DB
+    const id = row.id ?? row.invoice_id;
+    const outInvoiceNo = row[COL.invNo] ?? (body.invoice_number?.trim() || genInvoiceNumber);
+    const outCustomerCode = row[COL.custCode] ?? (body.customer_code?.trim() || genCustomerCode);
 
-    // Post-commit: referrals (non-blocking)
+    res.status(201).json({
+      ok: true,
+      id,
+      invoice_number: outInvoiceNo,
+      customer_code: outCustomerCode,
+    });
+
+    // Post-commit referrals (non-blocking)
     if (refCode) {
       try {
         await validateReferral(refCode).catch(() => {});
         await creditReferral({
-          invoiceId: row.id ?? row.invoice_id,
-          customerCode: row.customer_code,
+          invoiceId: id,
+          customerCode: outCustomerCode,
           refCode,
           subtotal: pricing.subtotal_ex_gst,
           gst: pricing.gst_amount,
-          litres: Number(body.total_qty_ml ?? body.dosage_ml ?? 0) / 1000,
+          litres: pricing.litres,
           createdAt: row.created_at ?? nowIstISO,
         }).catch(() => {});
       } catch {}
     }
   } catch (err) {
     try { await client.query("ROLLBACK"); } catch {}
-    const msg = err?.message || String(err);
-    return res.status(400).json({ error: msg });
+    return res.status(400).json({ error: err?.message || String(err) });
   } finally {
     client.release();
   }
 });
 
+// FULL invoice passthrough (ALL columns) — /full2
 router.get("/api/invoices/:id/full2", async (req, res) => {
   res.setHeader("Cache-Control", "no-store");
   const idRaw = req.params.id;
