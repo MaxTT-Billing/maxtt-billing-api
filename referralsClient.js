@@ -1,80 +1,53 @@
-// referralsClient.js
-// HTTP client for Seal & Earn (validate + credit) using HMAC auth.
-// Uses: REF_API_BASE_URL, REF_SIGNING_KEY, REFERRALS_TIMEOUT_MS (optional)
+// referralsClient.js — Billing-side client for Referrals API (ESM)
+// Uses HMAC (X-REF-SIG) with REF_SIGNING_KEY
+// Env:
+//   REF_API_BASE_URL (default: https://maxtt-referrals-api-pv5c.onrender.com)
+//   REF_SIGNING_KEY  (must match referrals-api; TEMP ok: TS!MAXTT-2025)
+//   REFERRALS_TIMEOUT_MS (default 5000)
 
-import crypto from "node:crypto";
+import crypto from 'node:crypto';
 
-function required(name) {
-  const v = process.env[name];
-  if (!v) throw new Error(`Missing environment variable: ${name}`);
-  return v;
-}
-
-const BASE = required("REF_API_BASE_URL");                 // e.g. https://maxtt-referrals-api-pv5c.onrender.com
-const KEY  = required("REF_SIGNING_KEY");                  // 32+ char shared secret
-const TIMEOUT = parseInt(process.env.REFERRALS_TIMEOUT_MS ?? "5000", 10);
+const BASE = process.env.REF_API_BASE_URL || 'https://maxtt-referrals-api-pv5c.onrender.com';
+const KEY  = process.env.REF_SIGNING_KEY || 'TS!MAXTT-2025';
+const TIMEOUT_MS = Number(process.env.REFERRALS_TIMEOUT_MS || 5000);
 
 function hmac(body) {
-  const mac = crypto.createHmac("sha256", KEY);
+  const mac = crypto.createHmac('sha256', KEY);
   mac.update(JSON.stringify(body));
-  return `sha256=${mac.digest("hex")}`;
+  return `sha256=${mac.digest('hex')}`;
 }
 
-async function post(path, body) {
+async function _post(path, body) {
   const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), TIMEOUT);
+  const t = setTimeout(() => ctrl.abort(), TIMEOUT_MS);
   try {
-    const res = await fetch(`${BASE}${path}`, {
-      method: "POST",
+    const r = await fetch(`${BASE}${path}`, {
+      method: 'POST',
       headers: {
-        "content-type": "application/json",
-        "x-ref-sig": hmac(body),
+        'content-type': 'application/json',
+        'X-REF-SIG': hmac(body),
       },
       body: JSON.stringify(body),
       signal: ctrl.signal,
     });
-    if (!res.ok) {
-      const text = await res.text().catch(() => "");
-      throw new Error(`Referrals ${path} ${res.status}: ${text}`);
-    }
-    return await res.json();
+    const text = await r.text().catch(() => '');
+    let json = {};
+    try { json = text ? JSON.parse(text) : {}; } catch { json = { ok:false, error:'bad_json', raw:text }; }
+    return { status: r.status, ok: r.ok, data: json };
   } finally {
-    clearTimeout(timer);
+    clearTimeout(t);
   }
 }
 
-/**
- * Validate a referral code
- * @param {string} code
- * @returns {Promise<{valid:boolean, ownerName?:string}>}
- */
+/** Validate a referral code (non-fatal — caller may ignore failure) */
 export async function validateReferral(code) {
-  if (!code) return { valid: false };
-  return post("/api/referrals/validate", { code });
+  if (!code) return { ok:false, error:'empty_code' };
+  const body = { code };
+  return _post('/api/referrals/validate', body);
 }
 
-/**
- * Credit a referral based on invoice facts (post-commit)
- * Shape: { invoiceId, customerCode, refCode, subtotal, gst, litres, createdAt }
- */
-export async function creditReferral(payload) {
-  return post("/api/referrals/credit", payload);
-}
-
-/**
- * Legacy/test passthrough retained for /__wire/referrals/test
- * Accepts an already-shaped body + apiKey header fallback.
- */
-export async function postReferral(body /*, apiKey */) {
-  // Normalise into credit payload if fields look like legacy names
-  const maybe = {
-    invoiceId: body.referred_invoice_code ?? body.invoiceId,
-    customerCode: body.customer_code ?? body.customerCode,
-    refCode: body.referrer_customer_code ?? body.refCode,
-    subtotal: body.invoice_amount_inr ?? body.subtotal,
-    gst: body.gst ?? 0,
-    litres: body.litres ?? body.total_qty_ml ?? 0,
-    createdAt: body.invoice_date ?? body.createdAt,
-  };
-  return creditReferral(maybe);
+/** Credit a referral after invoice commit */
+export async function creditReferral({ invoiceId, customerCode, refCode, subtotal, gst, litres, createdAt }) {
+  const body = { invoiceId, customerCode, refCode, subtotal, gst, litres, createdAt };
+  return _post('/api/referrals/credit', body);
 }
