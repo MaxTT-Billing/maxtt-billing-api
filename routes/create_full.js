@@ -1,19 +1,19 @@
 // routes/create_full.js
-// Canonical "full" invoice routes for MaxTT Billing API.
-// - POST /api/invoices/full : creates an invoice; auto-generates printed invoice number
-// - GET  /api/invoices/:id/full2 : fetches full row (no-store)
-// Rules enforced here:
-//   • Printed invoice format: TS-SS-CCC-NNN/NNNN/MMYY  (e.g., TS-DL-DEL-001/0087/0825)
-//   • Customer Code = <FranchiseeCode>-<SEQ> (zero-padded 4)
-//   • Default HSN (sealant) = 35069999
-//   • GST = 18%
-//   • Optional referrals: body.referral.code → validate (non-fatal) → credit post-commit
+// POST /api/invoices/full   — auto-generates printed invoice + unique customer_code
+// GET  /api/invoices/:id/full2  — no-store fetch
+//
+// Enforces:
+//  • Printed invoice: TS-SS-CCC-NNNN/MMYY (e.g., TS-DL-DEL-001/0087/0825)
+//  • Customer Code:  <FranchiseeCode>-NNNN (unique via DB constraint)
+//  • Default HSN (sealant) = 35069999, GST = 18%
+//  • After commit: referral validate (non-fatal) + credit
 
 import express from "express";
 import pkg from "pg";
 const { Pool } = pkg;
-
 import { validateReferral, creditReferral } from "../referralsClient.js";
+
+const router = express.Router();
 
 // ---------- DB ----------
 const pool = new Pool({
@@ -23,7 +23,6 @@ const pool = new Pool({
 
 // ---------- Helpers ----------
 let cachedCols = null;
-/** Return Set of lowercase column names for public.invoices */
 async function getInvoiceCols(client) {
   if (cachedCols) return cachedCols;
   const r = await client.query(`
@@ -37,11 +36,9 @@ async function getInvoiceCols(client) {
 const has = (cols, name) => cols.has(String(name).toLowerCase());
 const qid = (s) => `"${s}"`;
 
-/** Get IST (UTC+5:30) Date object as ISO string */
 function istNow() {
   const now = new Date();
-  const ist = new Date(now.getTime() + 330 * 60 * 1000);
-  return ist;
+  return new Date(now.getTime() + 330 * 60 * 1000);
 }
 function fmtMMYY(d) {
   const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
@@ -49,20 +46,6 @@ function fmtMMYY(d) {
   return `${mm}${yy}`;
 }
 
-/** Parse last 4-digit sequence from an invoice_number like TS-.../0087/0825 */
-function parseSeq(invNo) {
-  if (!invNo) return 0;
-  const m = String(invNo).match(/\/(\d{1,4})\//);
-  return m ? parseInt(m[1], 10) || 0 : 0;
-}
-/** Parse last 4-digit suffix from a customer_code like TS-...-0007 */
-function parseCustSeq(cc) {
-  if (!cc) return 0;
-  const m = String(cc).match(/-(\d{1,4})$/);
-  return m ? parseInt(m[1], 10) || 0 : 0;
-}
-
-/** Compute totals with GST 18% and default HSN */
 function computePricing(input = {}) {
   const qty = Number(input.total_qty_ml ?? input.qty_ml ?? 0) || 0;
   const mrp = Number(input.mrp_per_ml ?? input.price_per_ml ?? 0) || 0;
@@ -82,7 +65,6 @@ function computePricing(input = {}) {
   };
 }
 
-/** Insert row with dynamic column set */
 async function insertInvoice(client, payload) {
   const cols = await getInvoiceCols(client);
   const data = {};
@@ -99,145 +81,136 @@ async function insertInvoice(client, payload) {
   return r.rows[0];
 }
 
-// ---------- Router ----------
-const router = express.Router();
+// ---------- Seq helpers (DB-driven, safe against duplicates) ----------
+async function nextCustomerSeq(client, franchisee) {
+  // Find current max NNNN for this franchisee in "<Franchisee>-NNNN"
+  const r = await client.query(
+    `
+    SELECT COALESCE(MAX(CAST(regexp_replace(${qid("customer_code")},
+           '.*-(\\d{1,4})$','\\1') AS integer)), 0) AS maxseq
+    FROM public.invoices
+    WHERE ${qid("franchisee_code")} = $1
+    `,
+    [franchisee]
+  );
+  return Number(r.rows[0]?.maxseq || 0) + 1;
+}
 
-/**
- * POST /api/invoices/full
- * Accepts body; if invoice_number missing, generate it.
- * Also fills customer_code, pricing (GST 18%, HSN 35069999), and sets invoice_ts_ist when column exists.
- */
+async function nextInvoiceSeqFromInvno(client, franchisee) {
+  // Find max NNNN inside "TS-..../NNNN/MMYY" for this franchisee
+  const r = await client.query(
+    `
+    SELECT COALESCE(MAX(CAST(regexp_replace(${qid("invoice_number")},
+           '.*/(\\d{1,4})/\\d{4}$','\\1') AS integer)), 0) AS maxseq
+    FROM public.invoices
+    WHERE ${qid("franchisee_code")} = $1
+    `,
+    [franchisee]
+  );
+  return Number(r.rows[0]?.maxseq || 0) + 1;
+}
+
+// ---------- Routes ----------
 router.post("/api/invoices/full", async (req, res) => {
   const body = req.body || {};
-  const refCode =
-    (body.referral && typeof body.referral.code === "string" && body.referral.code.trim()) || "";
+  const refCode = (body?.referral?.code || "").trim();
 
   const client = await pool.connect();
   try {
-    await client.query("BEGIN");
-
     const cols = await getInvoiceCols(client);
 
-    // --- Franchisee code is required to build printed number & customer code
     const franchisee = String(
-      body.franchisee_code ??
-        body.franchisee_id ??
-        body.franchise_code ??
-        ""
+      body.franchisee_code ?? body.franchisee_id ?? body.franchise_code ?? ""
     ).trim();
-    if (!franchisee) {
-      await client.query("ROLLBACK");
-      return res.status(400).json({ error: "franchisee_code_required" });
-    }
+    if (!franchisee) return res.status(400).json({ error: "franchisee_code_required" });
 
-    // --- Advisory lock to avoid concurrent sequence clashes per franchisee
+    // Lock per franchisee to avoid races
+    await client.query("BEGIN");
     await client.query(`SELECT pg_advisory_xact_lock(hashtext($1))`, [franchisee]);
 
-    // --- Build invoice_number if not provided
-    let invoice_number = String(body.invoice_number || "").trim();
-    if (!invoice_number) {
-      // find latest sequence for this franchisee
-      let seq = 0;
-      if (has(cols, "invoice_number") && has(cols, "franchisee_code")) {
-        const r = await client.query(
-          `SELECT ${qid("invoice_number")} 
-             FROM public.invoices 
-            WHERE ${qid("franchisee_code")} = $1 
-            ORDER BY ${has(cols, "id") ? qid("id") : qid("invoice_id")} DESC 
-            LIMIT 1`,
-          [franchisee]
-        );
-        if (r.rows.length) seq = parseSeq(r.rows[0].invoice_number);
-      }
-      const next = (seq || 0) + 1;
-      const seqStr = String(next).padStart(4, "0");
-      const mmyy = fmtMMYY(istNow());
-      invoice_number = `${franchisee}/${seqStr}/${mmyy}`;
-    }
-
-    // --- Build customer_code if not provided: <FranchiseeCode>-<SEQ4>
-    let customer_code = String(body.customer_code || "").trim();
-    if (!customer_code) {
-      let cseq = 0;
-      if (has(cols, "customer_code") && has(cols, "franchisee_code")) {
-        const r = await client.query(
-          `SELECT ${qid("customer_code")} 
-             FROM public.invoices 
-            WHERE ${qid("franchisee_code")} = $1 
-            ORDER BY ${has(cols, "id") ? qid("id") : qid("invoice_id")} DESC 
-            LIMIT 1`,
-          [franchisee]
-        );
-        if (r.rows.length) cseq = parseCustSeq(r.rows[0].customer_code);
-      }
-      const next = (cseq || 0) + 1;
-      const seqStr = String(next).padStart(4, "0");
-      customer_code = `${franchisee}-${seqStr}`;
-    }
-
-    // --- Compute pricing (GST 18%, HSN 35069999)
+    const nowIstISO = istNow().toISOString();
     const pricing = computePricing(body);
 
-    // --- Prepare row
-    const nowIst = istNow().toISOString();
-    const baseRow = {
+    // Compute starting sequences from DB MAX (safer than "last row")
+    let cseq = await nextCustomerSeq(client, franchisee);
+    let iseq = await nextInvoiceSeqFromInvno(client, franchisee);
+
+    // Fill fields (may be overwritten in retry)
+    const base = {
       ...body,
-      invoice_number,
-      customer_code,
+      franchisee_code: franchisee,
       subtotal_ex_gst: pricing.subtotal_ex_gst,
       gst_rate: pricing.gst_rate,
       gst_amount: pricing.gst_amount,
       total_amount: pricing.total_amount,
       hsn_code: pricing.hsn_code,
     };
-    if (has(cols, "invoice_ts_ist")) baseRow.invoice_ts_ist = nowIst;
-    if (!baseRow.franchisee_code && has(cols, "franchisee_code")) baseRow.franchisee_code = franchisee;
+    if (has(cols, "invoice_ts_ist")) base.invoice_ts_ist = nowIstISO;
 
-    // --- Insert
-    const row = await insertInvoice(client, baseRow);
+    // Try insert with retry on duplicate customer_code
+    const MAX_RETRIES = 5;
+    let lastErr = null;
+    let row = null;
+
+    for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+      const customer_code = body.customer_code?.trim() || `${franchisee}-${String(cseq).padStart(4, "0")}`;
+      const mmyy = fmtMMYY(istNow());
+      const invoice_number = body.invoice_number?.trim() || `${franchisee}/${String(iseq).padStart(4, "0")}/${mmyy}`;
+
+      try {
+        row = await insertInvoice(client, { ...base, customer_code, invoice_number });
+        lastErr = null;
+        break;
+      } catch (e) {
+        const msg = String(e?.message || e);
+        lastErr = msg;
+        // On unique violation for customer_code, bump seq and retry
+        if (/duplicate key value.*customer_code/i.test(msg)) {
+          cseq++;
+          iseq++; // keep invoice seq in step to avoid aesthetic gaps
+          continue;
+        }
+        throw e; // some other error
+      }
+    }
+
+    if (!row) throw new Error(lastErr || "insert_failed");
 
     await client.query("COMMIT");
 
-    // Respond first
-    res.status(201).json({
+    // Respond
+    const out = {
       ok: true,
       id: row.id ?? row.invoice_id,
-      invoice_number,
-      customer_code,
-    });
+      invoice_number: row.invoice_number,
+      customer_code: row.customer_code,
+    };
+    res.status(201).json(out);
 
-    // --- Post-commit: referrals (non-blocking)
+    // Post-commit: referrals (non-blocking)
     if (refCode) {
       try {
-        // validate is non-fatal; ignore failures
         await validateReferral(refCode).catch(() => {});
         await creditReferral({
           invoiceId: row.id ?? row.invoice_id,
-          customerCode: customer_code,
+          customerCode: row.customer_code,
           refCode,
           subtotal: pricing.subtotal_ex_gst,
           gst: pricing.gst_amount,
-          litres: Number(body.total_qty_ml ?? body.dosage_ml ?? 0) / 1000, // if you store ml, convert to L for credits
-          createdAt: row.created_at ?? nowIst,
+          litres: Number(body.total_qty_ml ?? body.dosage_ml ?? 0) / 1000,
+          createdAt: row.created_at ?? nowIstISO,
         }).catch(() => {});
-      } catch {
-        // swallow — never fail the request due to referral side
-      }
+      } catch {}
     }
   } catch (err) {
     try { await client.query("ROLLBACK"); } catch {}
-    console.error("create_full error:", err);
-    const msg = err && err.message ? String(err.message) : "Create failed";
-    res.status(400).json({ error: msg });
+    const msg = err?.message || String(err);
+    return res.status(400).json({ error: msg });
   } finally {
     client.release();
   }
 });
 
-/**
- * GET /api/invoices/:id/full2   (no-store)
- * Returns complete row from public.invoices
- */
 router.get("/api/invoices/:id/full2", async (req, res) => {
   res.setHeader("Cache-Control", "no-store");
   const idRaw = req.params.id;
@@ -252,7 +225,6 @@ router.get("/api/invoices/:id/full2", async (req, res) => {
     if (!r.rows.length) return res.status(404).json({ error: "not_found" });
     return res.json(r.rows[0]);
   } catch (e) {
-    console.error("full2 fetch error:", e);
     return res.status(500).json({ error: "fetch_failed" });
   } finally {
     client.release();
