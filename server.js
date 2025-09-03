@@ -1,5 +1,6 @@
 // server.js — MaxTT Billing API (ESM)
-// Summary fix v3: prefer first non-zero candidate; IST CSV filter; CSV header "MRP (₹/ml)"
+// Summary v4: dosage fallback = per-row (exGST / mrp_per_ml) when qty fields are blank.
+// Also: robust numeric cleaning, CSV export, admin view helper, health, full2 passthrough, full create.
 import express from 'express'
 import pkg from 'pg'
 const { Pool } = pkg
@@ -46,7 +47,7 @@ const qid = (n) => `"${n}"`
 app.get('/', (_req, res) => res.send('MaxTT Billing API is running'))
 app.get('/api/health', (_req, res) => res.json({ ok: true }))
 
-// --- Admin export VIEW helper (unchanged) ---
+// --- Admin export VIEW helper (adaptive) ---
 app.get('/api/admin/create-view-auto', async (_req, res) => {
   const client = await pool.connect()
   try {
@@ -100,7 +101,7 @@ app.get('/api/admin/create-view-auto', async (_req, res) => {
   } finally { client.release() }
 })
 
-// --- CSV export (kept) ---
+// --- CSV export (invoices) ---
 const csvField = v => v==null ? '' : (/["\n,\r;]/.test(String(v)) ? `"${String(v).replace(/"/g,'""')}"` : String(v))
 function rowsToCsv(rows){
   const headers=['Invoice ID','Invoice No','Timestamp (IST)','Franchisee Code','Admin Code','SuperAdmin Code','Customer Code','Referral Code','Vehicle No','Make/Model','Odometer','Tyre Size FL','Tyre Size FR','Tyre Size RL','Tyre Size RR','Qty (ml)','MRP (₹/ml)','Installation Cost ₹','Discount ₹','Subtotal (ex-GST) ₹','GST Rate','GST Amount ₹','Total Amount ₹','Stock@Start (L)','GPS Lat','GPS Lng','Site Address','Min Tread Depth (mm)','Speed Rating','Created By UserId','Created By Role']
@@ -136,7 +137,7 @@ app.get('/api/exports/invoices', async (req,res)=>{
   }catch(err){ res.status(500).json({ ok:false, error:'CSV export failed', message: err?.message || String(err) }) }
 })
 
-// --- SUMMARY (first non-zero candidate logic) ---
+// --- SUMMARY (dosage fallback uses per-row exGST/mrp when qty blank) ---
 app.get('/api/summary', async (req,res)=>{
   const client=await pool.connect()
   try{
@@ -146,34 +147,53 @@ app.get('/api/summary', async (req,res)=>{
     if (dateCol && req.query.from) { where.push(`i.${qid(dateCol)}::date >= $${i++}`); params.push(req.query.from) }
     if (dateCol && req.query.to)   { where.push(`i.${qid(dateCol)}::date <= $${i++}`); params.push(req.query.to) }
 
-    // numeric cleaner (text -> trim -> strip non-numeric -> NULLIF '' -> numeric)
-    const asNum = (col) => `NULLIF(regexp_replace(trim(i.${qid(col)}::text),'[^0-9.+-]','','g'),'')::numeric`
+    // numeric cleaner
+    const clean = (col) => `NULLIF(regexp_replace(trim(i.${qid(col)}::text),'[^0-9.+-]','','g'),'')::numeric`
 
-    // candidates
-    const sumQtyTotal   = has(cols,'total_qty_ml')     ? `COALESCE(SUM(${asNum('total_qty_ml')}),0)`     : '0::numeric'
-    const sumQtyDosage  = has(cols,'dosage_ml')        ? `COALESCE(SUM(${asNum('dosage_ml')}),0)`        : '0::numeric'
+    // per-row ex-GST
+    const exGstRow =
+      (has(cols,'total_before_gst') ? `COALESCE(${clean('total_before_gst')},` : 'COALESCE(') +
+      (has(cols,'subtotal_ex_gst')  ? ` ${clean('subtotal_ex_gst')},` : ' ') +
+      ` GREATEST(COALESCE(${has(cols,'total_with_gst')?clean('total_with_gst'):'NULL'},0) - COALESCE(${has(cols,'gst_amount')?clean('gst_amount'):'NULL'},0),0), 0)`
 
-    const sumBefore     = has(cols,'total_before_gst') ? `COALESCE(SUM(${asNum('total_before_gst')}),0)` : '0::numeric'
-    const sumSubtotal   = has(cols,'subtotal_ex_gst')  ? `COALESCE(SUM(${asNum('subtotal_ex_gst')}),0)`  : '0::numeric'
-    const sumTotal      = has(cols,'total_with_gst')   ? `COALESCE(SUM(${asNum('total_with_gst')}),0)`   : '0::numeric'
-    const sumGst        = has(cols,'gst_amount')       ? `COALESCE(SUM(${asNum('gst_amount')}),0)`       : '0::numeric'
-    const sumDerived    = `GREATEST(${sumTotal} - ${sumGst}, 0)`
+    // per-row qty
+    const qtyRow = `
+      COALESCE(
+        ${has(cols,'total_qty_ml') ? clean('total_qty_ml') : 'NULL'},
+        ${has(cols,'dosage_ml') ? clean('dosage_ml') : 'NULL'},
+        CASE
+          WHEN COALESCE(${has(cols,'mrp_per_ml') ? clean('mrp_per_ml') : 'NULL'},0) <> 0
+          THEN (${exGstRow}) / ${has(cols,'mrp_per_ml') ? clean('mrp_per_ml') : 'NULL'}
+          ELSE NULL
+        END,
+        0
+      )`
 
-    // pick first non-zero
-    const dosageExpr = `COALESCE(NULLIF(${sumQtyTotal},0), NULLIF(${sumQtyDosage},0), 0::numeric)`
-    const revExpr    = `COALESCE(NULLIF(${sumBefore},0), NULLIF(${sumSubtotal},0), ${sumDerived}, 0::numeric)`
-    const gstExpr    = `${sumGst}`
-    const totalExpr  = `${sumTotal}`
+    const gstSum = has(cols,'gst_amount') ? `COALESCE(SUM(${clean('gst_amount')}),0)` : '0::numeric'
+    const totalSum = has(cols,'total_with_gst') ? `COALESCE(SUM(${clean('total_with_gst')}),0)` :
+                     (has(cols,'total_amount') ? `COALESCE(SUM(${clean('total_amount')}),0)` : '0::numeric')
+
+    // revenue ex-GST: first non-zero candidate of sums
+    const sumBefore = has(cols,'total_before_gst') ? `COALESCE(SUM(${clean('total_before_gst')}),0)` : '0::numeric'
+    const sumSubtotal = has(cols,'subtotal_ex_gst') ? `COALESCE(SUM(${clean('subtotal_ex_gst')}),0)` : '0::numeric'
+    const sumDerived = `GREATEST(${totalSum} - ${gstSum}, 0)`
 
     const sql = `
+      WITH base AS (
+        SELECT
+          ${qtyRow} AS qty_ml,
+          (${exGstRow}) AS ex_gst,
+          ${has(cols,'mrp_per_ml') ? clean('mrp_per_ml') : 'NULL'} AS price_ml
+        FROM public.invoices i
+        ${where.length?('WHERE '+where.join(' AND ')):''}
+      )
       SELECT
-        COUNT(*)::int AS count,
-        ${dosageExpr}      AS dosage_ml,
-        ${revExpr}         AS total_before_gst,
-        ${gstExpr}         AS gst_amount,
-        ${totalExpr}       AS total_with_gst
-      FROM public.invoices i
-      ${where.length?('WHERE '+where.join(' AND ')):''}
+        (SELECT COUNT(*)::int FROM public.invoices i ${where.length?('WHERE '+where.join(' AND ')):''}) AS count,
+        COALESCE(SUM(qty_ml),0) AS dosage_ml,
+        COALESCE(NULLIF(${sumBefore},0), NULLIF(${sumSubtotal},0), ${sumDerived}, 0::numeric) AS total_before_gst,
+        ${gstSum} AS gst_amount,
+        ${totalSum} AS total_with_gst
+      ;
     `
     const r=await client.query(sql, params)
     res.json(r.rows[0])
@@ -182,7 +202,7 @@ app.get('/api/summary', async (req,res)=>{
   } finally { client.release() }
 })
 
-// --- FULL invoice passthrough & create (unchanged minimal needed) ---
+// --- FULL invoice passthrough & create ---
 app.get(['/api/invoices/:id/full2','/invoices/:id/full2'], async (req,res)=>{
   const client=await pool.connect()
   try{
