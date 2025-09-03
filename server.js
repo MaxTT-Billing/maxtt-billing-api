@@ -1,6 +1,5 @@
 // server.js — MaxTT Billing API (ESM)
-// Summary v4: dosage fallback = per-row (exGST / mrp_per_ml) when qty fields are blank.
-// Also: robust numeric cleaning, CSV export, admin view helper, health, full2 passthrough, full create.
+// Summary v5: fix "qty_ml does not exist" by selecting FROM base; keep robust fallbacks & CSV fixes.
 import express from 'express'
 import pkg from 'pg'
 const { Pool } = pkg
@@ -150,50 +149,64 @@ app.get('/api/summary', async (req,res)=>{
     // numeric cleaner
     const clean = (col) => `NULLIF(regexp_replace(trim(i.${qid(col)}::text),'[^0-9.+-]','','g'),'')::numeric`
 
-    // per-row ex-GST
-    const exGstRow =
-      (has(cols,'total_before_gst') ? `COALESCE(${clean('total_before_gst')},` : 'COALESCE(') +
-      (has(cols,'subtotal_ex_gst')  ? ` ${clean('subtotal_ex_gst')},` : ' ') +
-      ` GREATEST(COALESCE(${has(cols,'total_with_gst')?clean('total_with_gst'):'NULL'},0) - COALESCE(${has(cols,'gst_amount')?clean('gst_amount'):'NULL'},0),0), 0)`
+    // per-row ex-GST (prefer explicit columns; else derived total-gst)
+    const exGstRow = `
+      COALESCE(
+        ${has(cols,'total_before_gst') ? clean('total_before_gst') : 'NULL'},
+        ${has(cols,'subtotal_ex_gst')  ? clean('subtotal_ex_gst')  : 'NULL'},
+        GREATEST(
+          COALESCE(${has(cols,'total_with_gst') ? clean('total_with_gst') : 'NULL'},0) -
+          COALESCE(${has(cols,'gst_amount')     ? clean('gst_amount')     : 'NULL'},0),
+          0
+        )
+      )`
 
-    // per-row qty
+    // per-row qty (qty fields → else derived exGST/price_per_ml)
     const qtyRow = `
       COALESCE(
         ${has(cols,'total_qty_ml') ? clean('total_qty_ml') : 'NULL'},
-        ${has(cols,'dosage_ml') ? clean('dosage_ml') : 'NULL'},
-        CASE
-          WHEN COALESCE(${has(cols,'mrp_per_ml') ? clean('mrp_per_ml') : 'NULL'},0) <> 0
-          THEN (${exGstRow}) / ${has(cols,'mrp_per_ml') ? clean('mrp_per_ml') : 'NULL'}
-          ELSE NULL
-        END,
-        0
+        ${has(cols,'dosage_ml')    ? clean('dosage_ml')    : 'NULL'},
+        CASE WHEN COALESCE(${has(cols,'mrp_per_ml') ? clean('mrp_per_ml') : 'NULL'},0) <> 0
+             THEN (${exGstRow}) / ${has(cols,'mrp_per_ml') ? clean('mrp_per_ml') : 'NULL'}
+             ELSE NULL
+        END
       )`
 
+    // Sums for other boxes (use same WHERE)
     const gstSum = has(cols,'gst_amount') ? `COALESCE(SUM(${clean('gst_amount')}),0)` : '0::numeric'
     const totalSum = has(cols,'total_with_gst') ? `COALESCE(SUM(${clean('total_with_gst')}),0)` :
                      (has(cols,'total_amount') ? `COALESCE(SUM(${clean('total_amount')}),0)` : '0::numeric')
+    const sumBefore   = has(cols,'total_before_gst') ? `COALESCE(SUM(${clean('total_before_gst')}),0)` : '0::numeric'
+    const sumSubtotal = has(cols,'subtotal_ex_gst')  ? `COALESCE(SUM(${clean('subtotal_ex_gst')}),0)`  : '0::numeric'
 
-    // revenue ex-GST: first non-zero candidate of sums
-    const sumBefore = has(cols,'total_before_gst') ? `COALESCE(SUM(${clean('total_before_gst')}),0)` : '0::numeric'
-    const sumSubtotal = has(cols,'subtotal_ex_gst') ? `COALESCE(SUM(${clean('subtotal_ex_gst')}),0)` : '0::numeric'
-    const sumDerived = `GREATEST(${totalSum} - ${gstSum}, 0)`
+    const whereSql = where.length ? 'WHERE '+where.join(' AND ') : ''
 
     const sql = `
       WITH base AS (
         SELECT
-          ${qtyRow} AS qty_ml,
-          (${exGstRow}) AS ex_gst,
-          ${has(cols,'mrp_per_ml') ? clean('mrp_per_ml') : 'NULL'} AS price_ml
+          ${qtyRow} AS qty_ml
         FROM public.invoices i
-        ${where.length?('WHERE '+where.join(' AND ')):''}
+        ${whereSql}
       )
       SELECT
-        (SELECT COUNT(*)::int FROM public.invoices i ${where.length?('WHERE '+where.join(' AND ')):''}) AS count,
+        /* count from source table with same filter */
+        (SELECT COUNT(*)::int FROM public.invoices i ${whereSql}) AS count,
+        /* dosage from base */
         COALESCE(SUM(qty_ml),0) AS dosage_ml,
-        COALESCE(NULLIF(${sumBefore},0), NULLIF(${sumSubtotal},0), ${sumDerived}, 0::numeric) AS total_before_gst,
-        ${gstSum} AS gst_amount,
-        ${totalSum} AS total_with_gst
-      ;
+        /* revenue ex-GST: first non-zero (explicit before, then subtotal), else derived (total - gst) */
+        COALESCE(
+          NULLIF((SELECT ${sumBefore} FROM public.invoices i ${whereSql}), 0),
+          NULLIF((SELECT ${sumSubtotal} FROM public.invoices i ${whereSql}), 0),
+          GREATEST(
+            (SELECT ${totalSum} FROM public.invoices i ${whereSql}) -
+            (SELECT ${gstSum}   FROM public.invoices i ${whereSql}),
+            0
+          )
+        ) AS total_before_gst,
+        /* gst and total direct sums */
+        (SELECT ${gstSum}   FROM public.invoices i ${whereSql}) AS gst_amount,
+        (SELECT ${totalSum} FROM public.invoices i ${whereSql}) AS total_with_gst
+      FROM base;
     `
     const r=await client.query(sql, params)
     res.json(r.rows[0])
