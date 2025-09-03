@@ -1,4 +1,5 @@
-// server.js — MaxTT Billing API (ESM) with Signatures + GPS + improved summary fallback
+// server.js — MaxTT Billing API (ESM)
+// Fixes: robust summary fallbacks, IST-aware date filtering, CSV header "MRP (₹/ml)"
 import express from 'express'
 import pkg from 'pg'
 const { Pool } = pkg
@@ -97,7 +98,7 @@ END $$;
   }
 })
 
-// --- Admin export VIEW helper (unchanged) ---
+// --- Admin export VIEW helper (adaptive) ---
 app.get('/api/admin/create-view-auto', async (_req, res) => {
   const client = await pool.connect()
   try {
@@ -155,7 +156,8 @@ app.get('/api/admin/create-view-auto', async (_req, res) => {
 // --- CSV export (invoices) ---
 function csvField(val){ if(val==null) return ''; const s=String(val); const must=s.includes('"')||s.includes(',')||s.includes('\n')||s.includes('\r')||s.includes(';'); const esc=s.split('"').join('""'); return must?`"${esc}"`:esc }
 function rowsToCsv(rows){
-  const headers=['Invoice ID','Invoice No','Timestamp (IST)','Franchisee Code','Admin Code','SuperAdmin Code','Customer Code','Referral Code','Vehicle No','Make/Model','Odometer','Tyre Size FL','Tyre Size FR','Tyre Size RL','Tyre Size RR','Qty (ml)','MRP (/ml ₹)','Installation Cost ₹','Discount ₹','Subtotal (ex-GST) ₹','GST Rate','GST Amount ₹','Total Amount ₹','Stock@Start (L)','GPS Lat','GPS Lng','Site Address','Min Tread Depth (mm)','Speed Rating','Created By UserId','Created By Role']
+  // NOTE: header fixed to "MRP (₹/ml)"
+  const headers=['Invoice ID','Invoice No','Timestamp (IST)','Franchisee Code','Admin Code','SuperAdmin Code','Customer Code','Referral Code','Vehicle No','Make/Model','Odometer','Tyre Size FL','Tyre Size FR','Tyre Size RL','Tyre Size RR','Qty (ml)','MRP (₹/ml)','Installation Cost ₹','Discount ₹','Subtotal (ex-GST) ₹','GST Rate','GST Amount ₹','Total Amount ₹','Stock@Start (L)','GPS Lat','GPS Lng','Site Address','Min Tread Depth (mm)','Speed Rating','Created By UserId','Created By Role']
   const lines=[headers.map(csvField).join(',')]
   for(const r of rows){
     const fields=[r.invoice_id,r.invoice_number,r.invoice_ts_ist,r.franchisee_code,r.admin_code,r.super_admin_code,r.customer_code,r.referral_code,r.vehicle_no,r.vehicle_make_model,r.odometer_reading,r.tyre_size_fl,r.tyre_size_fr,r.tyre_size_rl,r.tyre_size_rr,r.total_qty_ml,r.mrp_per_ml,r.installation_cost,r.discount_amount,r.subtotal_ex_gst,r.gst_rate,r.gst_amount,r.total_amount,r.stock_level_at_start_l,r.gps_lat,r.gps_lng,r.site_address_text,r.tread_depth_min_mm,r.speed_rating,r.created_by_user_id,r.role]
@@ -168,7 +170,7 @@ app.get('/api/exports/invoices', async (req,res)=>{
     const { from,to,franchisee,q } = req.query
     const where=[], params=[]; let i=1
     const fromSql='public.v_invoice_export'
-    if(from){ where.push(`invoice_ts_ist::date >= $${i++}`); params.push(from) }
+    if(from){ where.push(`invoice_ts_ist::date >= $${i++}`); params.push(from) } // IST-aware
     if(to){ where.push(`invoice_ts_ist::date <= $${i++}`); params.push(to) }
     if(franchisee){ where.push(`franchisee_code = $${i++}`); params.push(franchisee) }
     if(q){ const like=`%${String(q).split('%').join('')}%`; where.push(`(vehicle_no ILIKE $${i} OR customer_code ILIKE $${i})`); params.push(like); i++ }
@@ -186,35 +188,46 @@ app.get('/api/exports/invoices', async (req,res)=>{
   }catch(err){ res.status(500).json({ ok:false, error:'CSV export failed', message: err?.message || String(err) }) }
 })
 
-// --- Improved Summary (fallbacks) ---
+// --- Improved Summary (robust fallbacks + IST date filtering if available) ---
 app.get('/api/summary', async (req,res)=>{
   const client=await pool.connect()
   try{
     const cols=await getInvoiceCols(client)
     const where=[], params=[]; let i=1
-    const q=String(req.query.q||'')
-    if(q){ const like=`%${q.split('%').join('')}%`; const or=[]; if(has(cols,'vehicle_number')) or.push(`i."vehicle_number" ILIKE $${i}`); if(has(cols,'customer_name')) or.push(`i."customer_name" ILIKE $${i}`); if(or.length){ where.push(`(${or.join(' OR ')})`); params.push(like); i++ } }
-    const from=req.query.from, to=req.query.to
-    if(from && has(cols,'created_at')){ where.push(`i."created_at"::date >= $${i++}`); params.push(from) }
-    if(to && has(cols,'created_at')){ where.push(`i."created_at"::date <= $${i++}`); params.push(to) }
+
+    // date column preference: invoice_ts_ist (IST) → created_at (UTC)
+    const dateCol = has(cols,'invoice_ts_ist') ? 'invoice_ts_ist' :
+                    (has(cols,'created_at') ? 'created_at' : null)
+    if (dateCol && req.query.from) { where.push(`i.${qid(dateCol)}::date >= $${i++}`); params.push(req.query.from) }
+    if (dateCol && req.query.to)   { where.push(`i.${qid(dateCol)}::date <= $${i++}`); params.push(req.query.to) }
+
+    // optional text search
+    const q = String(req.query.q||'').trim()
+    if(q){
+      const like=`%${q.split('%').join('')}%`
+      const or=[]
+      if(has(cols,'vehicle_number')) or.push(`i."vehicle_number" ILIKE $${i}`)
+      if(has(cols,'customer_name'))  or.push(`i."customer_name" ILIKE $${i}`)
+      if(or.length){ where.push('(' + or.join(' OR ') + ')'); params.push(like); i++ }
+    }
 
     // dosage: prefer total_qty_ml, else dosage_ml, else 0
     const dosageExpr =
-      has(cols,'total_qty_ml') ? `COALESCE(SUM(i."total_qty_ml"::numeric),0)` :
-      (has(cols,'dosage_ml') ? `COALESCE(SUM(i."dosage_ml"::numeric),0)` : '0::numeric');
+      has(cols,'total_qty_ml') ? `COALESCE(SUM(NULLIF(i."total_qty_ml",'')::numeric),0)` :
+      (has(cols,'dosage_ml') ? `COALESCE(SUM(NULLIF(i."dosage_ml",'')::numeric),0)` : '0::numeric');
 
     // revenue ex-GST: prefer total_before_gst, else subtotal_ex_gst, else (total_with_gst - gst_amount)
     const revExpr =
-      has(cols,'total_before_gst') ? `COALESCE(SUM(i."total_before_gst"::numeric),0)` :
-      (has(cols,'subtotal_ex_gst') ? `COALESCE(SUM(i."subtotal_ex_gst"::numeric),0)` :
+      has(cols,'total_before_gst') ? `COALESCE(SUM(NULLIF(i."total_before_gst",'')::numeric),0)` :
+      (has(cols,'subtotal_ex_gst') ? `COALESCE(SUM(NULLIF(i."subtotal_ex_gst",'')::numeric),0)` :
         (has(cols,'total_with_gst') && has(cols,'gst_amount')
-          ? `COALESCE(SUM((i."total_with_gst"::numeric) - (i."gst_amount"::numeric)),0)`
+          ? `COALESCE(SUM((NULLIF(i."total_with_gst",'')::numeric) - (NULLIF(i."gst_amount",'')::numeric)),0)`
           : '0::numeric'));
 
-    const gstExpr = has(cols,'gst_amount') ? `COALESCE(SUM(i."gst_amount"::numeric),0)` : '0::numeric'
+    const gstExpr = has(cols,'gst_amount') ? `COALESCE(SUM(NULLIF(i."gst_amount",'')::numeric),0)` : '0::numeric'
     const totalExpr =
-      has(cols,'total_with_gst') ? `COALESCE(SUM(i."total_with_gst"::numeric),0)` :
-      (has(cols,'total_amount') ? `COALESCE(SUM(i."total_amount"::numeric),0)` : '0::numeric')
+      has(cols,'total_with_gst') ? `COALESCE(SUM(NULLIF(i."total_with_gst",'')::numeric),0)` :
+      (has(cols,'total_amount') ? `COALESCE(SUM(NULLIF(i."total_amount",'')::numeric),0)` : '0::numeric')
 
     const sql = `
       SELECT
@@ -232,7 +245,7 @@ app.get('/api/summary', async (req,res)=>{
   finally{ client.release() }
 })
 
-// --- Read FULL invoice ---
+// --- Read FULL invoice (no-store) ---
 app.get(['/api/invoices/:id/full2','/invoices/:id/full2'], async (req,res)=>{
   const client=await pool.connect()
   try{
