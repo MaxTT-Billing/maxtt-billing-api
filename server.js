@@ -1,5 +1,5 @@
 // server.js — MaxTT Billing API (ESM)
-// Fixes: robust summary fallbacks, IST-aware date filtering, CSV header "MRP (₹/ml)"
+// Summary fix: robust numeric parsing (strip non-digits), IST-aware CSV filtering, "MRP (₹/ml)" header.
 import express from 'express'
 import pkg from 'pg'
 const { Pool } = pkg
@@ -156,7 +156,6 @@ app.get('/api/admin/create-view-auto', async (_req, res) => {
 // --- CSV export (invoices) ---
 function csvField(val){ if(val==null) return ''; const s=String(val); const must=s.includes('"')||s.includes(',')||s.includes('\n')||s.includes('\r')||s.includes(';'); const esc=s.split('"').join('""'); return must?`"${esc}"`:esc }
 function rowsToCsv(rows){
-  // NOTE: header fixed to "MRP (₹/ml)"
   const headers=['Invoice ID','Invoice No','Timestamp (IST)','Franchisee Code','Admin Code','SuperAdmin Code','Customer Code','Referral Code','Vehicle No','Make/Model','Odometer','Tyre Size FL','Tyre Size FR','Tyre Size RL','Tyre Size RR','Qty (ml)','MRP (₹/ml)','Installation Cost ₹','Discount ₹','Subtotal (ex-GST) ₹','GST Rate','GST Amount ₹','Total Amount ₹','Stock@Start (L)','GPS Lat','GPS Lng','Site Address','Min Tread Depth (mm)','Speed Rating','Created By UserId','Created By Role']
   const lines=[headers.map(csvField).join(',')]
   for(const r of rows){
@@ -188,7 +187,7 @@ app.get('/api/exports/invoices', async (req,res)=>{
   }catch(err){ res.status(500).json({ ok:false, error:'CSV export failed', message: err?.message || String(err) }) }
 })
 
-// --- Improved Summary (robust fallbacks + IST date filtering if available) ---
+// --- Improved Summary (tolerant numeric parsing + IST date filtering) ---
 app.get('/api/summary', async (req,res)=>{
   const client=await pool.connect()
   try{
@@ -211,23 +210,32 @@ app.get('/api/summary', async (req,res)=>{
       if(or.length){ where.push('(' + or.join(' OR ') + ')'); params.push(like); i++ }
     }
 
+    // Helper to SUM a column as numeric safely:
+    // 1) cast to text
+    // 2) trim spaces
+    // 3) remove non-numeric (except + - .)
+    // 4) NULLIF empty
+    // 5) cast to numeric and SUM
+    const sumNum = (col) =>
+      `SUM( NULLIF(regexp_replace(trim(i.${qid(col)}::text), '[^0-9.+-]', '', 'g'), '')::numeric )`
+
     // dosage: prefer total_qty_ml, else dosage_ml, else 0
     const dosageExpr =
-      has(cols,'total_qty_ml') ? `COALESCE(SUM( (NULLIF(i."total_qty_ml",'') )::numeric ),0)` :
-      (has(cols,'dosage_ml') ? `COALESCE(SUM( (NULLIF(i."dosage_ml",'') )::numeric ),0)` : '0::numeric');
+      has(cols,'total_qty_ml') ? `COALESCE(${sumNum('total_qty_ml')},0)` :
+      (has(cols,'dosage_ml') ? `COALESCE(${sumNum('dosage_ml')},0)` : '0::numeric');
 
     // revenue ex-GST: prefer total_before_gst, else subtotal_ex_gst, else (total_with_gst - gst_amount)
     const revExpr =
-      has(cols,'total_before_gst') ? `COALESCE(SUM( (NULLIF(i."total_before_gst",'') )::numeric ),0)` :
-      (has(cols,'subtotal_ex_gst') ? `COALESCE(SUM( (NULLIF(i."subtotal_ex_gst",'') )::numeric ),0)` :
+      has(cols,'total_before_gst') ? `COALESCE(${sumNum('total_before_gst')},0)` :
+      (has(cols,'subtotal_ex_gst') ? `COALESCE(${sumNum('subtotal_ex_gst')},0)` :
         (has(cols,'total_with_gst') && has(cols,'gst_amount')
-          ? `COALESCE(SUM( (NULLIF(i."total_with_gst",'') )::numeric - (NULLIF(i."gst_amount",'') )::numeric ),0)`
+          ? `COALESCE( (${sumNum('total_with_gst')}) - (${sumNum('gst_amount')}), 0 )`
           : '0::numeric'));
 
-    const gstExpr = has(cols,'gst_amount') ? `COALESCE(SUM( (NULLIF(i."gst_amount",'') )::numeric ),0)` : '0::numeric'
+    const gstExpr = has(cols,'gst_amount') ? `COALESCE(${sumNum('gst_amount')},0)` : '0::numeric'
     const totalExpr =
-      has(cols,'total_with_gst') ? `COALESCE(SUM( (NULLIF(i."total_with_gst",'') )::numeric ),0)` :
-      (has(cols,'total_amount') ? `COALESCE(SUM( (NULLIF(i."total_amount",'') )::numeric ),0)` : '0::numeric')
+      has(cols,'total_with_gst') ? `COALESCE(${sumNum('total_with_gst')},0)` :
+      (has(cols,'total_amount') ? `COALESCE(${sumNum('total_amount')},0)` : '0::numeric')
 
     const sql = `
       SELECT
