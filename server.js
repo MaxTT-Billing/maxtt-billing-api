@@ -213,21 +213,21 @@ app.get('/api/summary', async (req,res)=>{
 
     // dosage: prefer total_qty_ml, else dosage_ml, else 0
     const dosageExpr =
-      has(cols,'total_qty_ml') ? `COALESCE(SUM(NULLIF(i."total_qty_ml",'')::numeric),0)` :
-      (has(cols,'dosage_ml') ? `COALESCE(SUM(NULLIF(i."dosage_ml",'')::numeric),0)` : '0::numeric');
+      has(cols,'total_qty_ml') ? `COALESCE(SUM( (NULLIF(i."total_qty_ml",'') )::numeric ),0)` :
+      (has(cols,'dosage_ml') ? `COALESCE(SUM( (NULLIF(i."dosage_ml",'') )::numeric ),0)` : '0::numeric');
 
     // revenue ex-GST: prefer total_before_gst, else subtotal_ex_gst, else (total_with_gst - gst_amount)
     const revExpr =
-      has(cols,'total_before_gst') ? `COALESCE(SUM(NULLIF(i."total_before_gst",'')::numeric),0)` :
-      (has(cols,'subtotal_ex_gst') ? `COALESCE(SUM(NULLIF(i."subtotal_ex_gst",'')::numeric),0)` :
+      has(cols,'total_before_gst') ? `COALESCE(SUM( (NULLIF(i."total_before_gst",'') )::numeric ),0)` :
+      (has(cols,'subtotal_ex_gst') ? `COALESCE(SUM( (NULLIF(i."subtotal_ex_gst",'') )::numeric ),0)` :
         (has(cols,'total_with_gst') && has(cols,'gst_amount')
-          ? `COALESCE(SUM((NULLIF(i."total_with_gst",'')::numeric) - (NULLIF(i."gst_amount",'')::numeric)),0)`
+          ? `COALESCE(SUM( (NULLIF(i."total_with_gst",'') )::numeric - (NULLIF(i."gst_amount",'') )::numeric ),0)`
           : '0::numeric'));
 
-    const gstExpr = has(cols,'gst_amount') ? `COALESCE(SUM(NULLIF(i."gst_amount",'')::numeric),0)` : '0::numeric'
+    const gstExpr = has(cols,'gst_amount') ? `COALESCE(SUM( (NULLIF(i."gst_amount",'') )::numeric ),0)` : '0::numeric'
     const totalExpr =
-      has(cols,'total_with_gst') ? `COALESCE(SUM(NULLIF(i."total_with_gst",'')::numeric),0)` :
-      (has(cols,'total_amount') ? `COALESCE(SUM(NULLIF(i."total_amount",'')::numeric),0)` : '0::numeric')
+      has(cols,'total_with_gst') ? `COALESCE(SUM( (NULLIF(i."total_with_gst",'') )::numeric ),0)` :
+      (has(cols,'total_amount') ? `COALESCE(SUM( (NULLIF(i."total_amount",'') )::numeric ),0)` : '0::numeric')
 
     const sql = `
       SELECT
