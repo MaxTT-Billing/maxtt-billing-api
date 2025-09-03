@@ -1,6 +1,5 @@
 // server.js — MaxTT Billing API (ESM)
-// Summary v6: dosage fallback now uses mrp_per_ml OR price_per_ml (first non-zero).
-// Keeps: robust numeric cleaning, IST-aware CSV filtering, CSV header "MRP (₹/ml)", admin view helper, health, full2, create.
+// Summary v7: dosage fallback uses exGST / (mrp_per_ml OR price_per_ml OR FALLBACK_MRP_PER_ML)
 import express from 'express'
 import pkg from 'pg'
 const { Pool } = pkg
@@ -137,7 +136,7 @@ app.get('/api/exports/invoices', async (req,res)=>{
   }catch(err){ res.status(500).json({ ok:false, error:'CSV export failed', message: err?.message || String(err) }) }
 })
 
-// --- SUMMARY (dosage fallback: qty fields → exGST/unitPrice where unitPrice = mrp_per_ml OR price_per_ml) ---
+// --- SUMMARY (dosage fallback enhanced) ---
 app.get('/api/summary', async (req,res)=>{
   const client=await pool.connect()
   try{
@@ -162,23 +161,21 @@ app.get('/api/summary', async (req,res)=>{
         )
       )`
 
-    // unit price per row: mrp_per_ml → price_per_ml (first non-zero)
+    // unit price per row: mrp_per_ml → price_per_ml → FALLBACK_MRP_PER_ML
+    const FALLBACK = Number(process.env.FALLBACK_MRP_PER_ML || 4.5)
     const unitPriceRow = `
       COALESCE(
         NULLIF(${has(cols,'mrp_per_ml')   ? clean('mrp_per_ml')   : 'NULL'},0),
-        NULLIF(${has(cols,'price_per_ml') ? clean('price_per_ml') : 'NULL'},0)
+        NULLIF(${has(cols,'price_per_ml') ? clean('price_per_ml') : 'NULL'},0),
+        ${FALLBACK.toFixed(6)}::numeric
       )`
 
-    // per-row qty: qty fields → derived using unit price
+    // per-row qty: qty fields → derived using unit price (which now always has a fallback)
     const qtyRow = `
       COALESCE(
         ${has(cols,'total_qty_ml') ? clean('total_qty_ml') : 'NULL'},
         ${has(cols,'dosage_ml')    ? clean('dosage_ml')    : 'NULL'},
-        CASE
-          WHEN (${unitPriceRow}) IS NOT NULL AND (${unitPriceRow}) <> 0
-          THEN (${exGstRow}) / (${unitPriceRow})
-          ELSE NULL
-        END
+        (${exGstRow}) / (${unitPriceRow})
       )`
 
     // Sums for other boxes (use same WHERE)
