@@ -1,5 +1,6 @@
 // server.js — MaxTT Billing API (ESM)
-// Summary v5: fix "qty_ml does not exist" by selecting FROM base; keep robust fallbacks & CSV fixes.
+// Summary v6: dosage fallback now uses mrp_per_ml OR price_per_ml (first non-zero).
+// Keeps: robust numeric cleaning, IST-aware CSV filtering, CSV header "MRP (₹/ml)", admin view helper, health, full2, create.
 import express from 'express'
 import pkg from 'pg'
 const { Pool } = pkg
@@ -136,7 +137,7 @@ app.get('/api/exports/invoices', async (req,res)=>{
   }catch(err){ res.status(500).json({ ok:false, error:'CSV export failed', message: err?.message || String(err) }) }
 })
 
-// --- SUMMARY (dosage fallback uses per-row exGST/mrp when qty blank) ---
+// --- SUMMARY (dosage fallback: qty fields → exGST/unitPrice where unitPrice = mrp_per_ml OR price_per_ml) ---
 app.get('/api/summary', async (req,res)=>{
   const client=await pool.connect()
   try{
@@ -161,14 +162,22 @@ app.get('/api/summary', async (req,res)=>{
         )
       )`
 
-    // per-row qty (qty fields → else derived exGST/price_per_ml)
+    // unit price per row: mrp_per_ml → price_per_ml (first non-zero)
+    const unitPriceRow = `
+      COALESCE(
+        NULLIF(${has(cols,'mrp_per_ml')   ? clean('mrp_per_ml')   : 'NULL'},0),
+        NULLIF(${has(cols,'price_per_ml') ? clean('price_per_ml') : 'NULL'},0)
+      )`
+
+    // per-row qty: qty fields → derived using unit price
     const qtyRow = `
       COALESCE(
         ${has(cols,'total_qty_ml') ? clean('total_qty_ml') : 'NULL'},
         ${has(cols,'dosage_ml')    ? clean('dosage_ml')    : 'NULL'},
-        CASE WHEN COALESCE(${has(cols,'mrp_per_ml') ? clean('mrp_per_ml') : 'NULL'},0) <> 0
-             THEN (${exGstRow}) / ${has(cols,'mrp_per_ml') ? clean('mrp_per_ml') : 'NULL'}
-             ELSE NULL
+        CASE
+          WHEN (${unitPriceRow}) IS NOT NULL AND (${unitPriceRow}) <> 0
+          THEN (${exGstRow}) / (${unitPriceRow})
+          ELSE NULL
         END
       )`
 
@@ -189,11 +198,8 @@ app.get('/api/summary', async (req,res)=>{
         ${whereSql}
       )
       SELECT
-        /* count from source table with same filter */
         (SELECT COUNT(*)::int FROM public.invoices i ${whereSql}) AS count,
-        /* dosage from base */
         COALESCE(SUM(qty_ml),0) AS dosage_ml,
-        /* revenue ex-GST: first non-zero (explicit before, then subtotal), else derived (total - gst) */
         COALESCE(
           NULLIF((SELECT ${sumBefore} FROM public.invoices i ${whereSql}), 0),
           NULLIF((SELECT ${sumSubtotal} FROM public.invoices i ${whereSql}), 0),
@@ -203,7 +209,6 @@ app.get('/api/summary', async (req,res)=>{
             0
           )
         ) AS total_before_gst,
-        /* gst and total direct sums */
         (SELECT ${gstSum}   FROM public.invoices i ${whereSql}) AS gst_amount,
         (SELECT ${totalSum} FROM public.invoices i ${whereSql}) AS total_with_gst
       FROM base;
@@ -239,7 +244,7 @@ app.post('/api/invoices/full', async (req,res)=>{
     const accepted = [
       'franchisee_id','franchisee_code','customer_name','customer_gstin','customer_address','vehicle_number','vehicle_type',
       'tyre_count','fitment_locations','installer_name',
-      'total_qty_ml','dosage_ml','mrp_per_ml','installation_cost','discount_amount',
+      'total_qty_ml','dosage_ml','mrp_per_ml','price_per_ml','installation_cost','discount_amount',
       'subtotal_ex_gst','total_before_gst','gst_rate','gst_amount','total_with_gst',
       'tyre_width_mm','aspect_ratio','rim_diameter_in','tread_depth_min_mm','speed_rating',
       'tread_fl_mm','tread_fr_mm','tread_rl_mm','tread_rr_mm',
