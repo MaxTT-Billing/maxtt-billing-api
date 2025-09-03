@@ -1,4 +1,4 @@
-// server.js — MaxTT Billing API (ESM) with Signatures + GPS + one-time SQL admin endpoint
+// server.js — MaxTT Billing API (ESM) with Signatures + GPS + improved summary fallback
 import express from 'express'
 import pkg from 'pg'
 const { Pool } = pkg
@@ -18,7 +18,6 @@ app.use((req, res, next) => {
   next()
 })
 
-// allow base64 signatures
 app.use(express.json({ limit: '15mb' }))
 
 // --- DB ---
@@ -48,75 +47,57 @@ function pickFirst(cols, cands) { return cands.find(c => has(cols, c)) || null }
 app.get('/', (_req, res) => res.send('MaxTT Billing API is running'))
 app.get('/api/health', (_req, res) => res.json({ ok: true }))
 
-// --- ONE-TIME ADMIN ENDPOINT: add signature/GPS columns safely ---
+// --- ONE-TIME ADMIN: add signature/GPS columns (guarded by ADMIN_MAINT_KEY) ---
 app.get('/api/admin/add-signature-columns', async (req, res) => {
   try {
-    const key = (req.query.key || '').toString()
+    const key = String(req.query.key || '')
     const expected = process.env.ADMIN_MAINT_KEY || ''
-    if (!expected || key !== expected) {
-      return res.status(401).json({ ok: false, error: 'unauthorized' })
-    }
+    if (!expected || key !== expected) return res.status(401).json({ ok: false, error: 'unauthorized' })
+
     const sql = `
 DO $$ BEGIN
-  IF NOT EXISTS (SELECT 1 FROM information_schema.columns
-    WHERE table_schema='public' AND table_name='invoices' AND column_name='customer_signature') THEN
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='invoices' AND column_name='customer_signature') THEN
     ALTER TABLE public.invoices ADD COLUMN customer_signature text;
   END IF;
 END $$;
-
 DO $$ BEGIN
-  IF NOT EXISTS (SELECT 1 FROM information_schema.columns
-    WHERE table_schema='public' AND table_name='invoices' AND column_name='signed_at') THEN
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='invoices' AND column_name='signed_at') THEN
     ALTER TABLE public.invoices ADD COLUMN signed_at timestamptz;
   END IF;
 END $$;
-
 DO $$ BEGIN
-  IF NOT EXISTS (SELECT 1 FROM information_schema.columns
-    WHERE table_schema='public' AND table_name='invoices' AND column_name='consent_signature') THEN
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='invoices' AND column_name='consent_signature') THEN
     ALTER TABLE public.invoices ADD COLUMN consent_signature text;
   END IF;
 END $$;
-
 DO $$ BEGIN
-  IF NOT EXISTS (SELECT 1 FROM information_schema.columns
-    WHERE table_schema='public' AND table_name='invoices' AND column_name='consent_signed_at') THEN
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='invoices' AND column_name='consent_signed_at') THEN
     ALTER TABLE public.invoices ADD COLUMN consent_signed_at timestamptz;
   END IF;
 END $$;
-
 DO $$ BEGIN
-  IF NOT EXISTS (SELECT 1 FROM information_schema.columns
-    WHERE table_schema='public' AND table_name='invoices' AND column_name='gps_lat') THEN
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='invoices' AND column_name='gps_lat') THEN
     ALTER TABLE public.invoices ADD COLUMN gps_lat double precision;
   END IF;
 END $$;
-
 DO $$ BEGIN
-  IF NOT EXISTS (SELECT 1 FROM information_schema.columns
-    WHERE table_schema='public' AND table_name='invoices' AND column_name='gps_lng') THEN
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='invoices' AND column_name='gps_lng') THEN
     ALTER TABLE public.invoices ADD COLUMN gps_lng double precision;
   END IF;
 END $$;
     `
     const client = await pool.connect()
-    try {
-      await client.query('BEGIN')
-      await client.query(sql)
-      await client.query('COMMIT')
-    } catch (e) {
-      await client.query('ROLLBACK')
-      throw e
-    } finally {
-      client.release()
-    }
-    return res.json({ ok: true, added: ['customer_signature','signed_at','consent_signature','consent_signed_at','gps_lat','gps_lng'] })
+    try { await client.query('BEGIN'); await client.query(sql); await client.query('COMMIT') }
+    catch (e) { await client.query('ROLLBACK'); throw e }
+    finally { client.release() }
+
+    res.json({ ok: true, added: ['customer_signature','signed_at','consent_signature','consent_signed_at','gps_lat','gps_lng'] })
   } catch (e) {
-    return res.status(500).json({ ok: false, error: String(e?.message || e) })
+    res.status(500).json({ ok:false, error:String(e?.message||e) })
   }
 })
 
-// --- Admin view helper (export view) ---
+// --- Admin export VIEW helper (unchanged) ---
 app.get('/api/admin/create-view-auto', async (_req, res) => {
   const client = await pool.connect()
   try {
@@ -168,12 +149,10 @@ app.get('/api/admin/create-view-auto', async (_req, res) => {
     res.json({ ok:true, created:'public.v_invoice_export', note:'adaptive' })
   } catch (err) {
     res.status(500).json({ ok:false, where:'create_view_auto', message: err?.message || String(err) })
-  } finally {
-    client.release()
-  }
+  } finally { client.release() }
 })
 
-// --- CSV export ---
+// --- CSV export (invoices) ---
 function csvField(val){ if(val==null) return ''; const s=String(val); const must=s.includes('"')||s.includes(',')||s.includes('\n')||s.includes('\r')||s.includes(';'); const esc=s.split('"').join('""'); return must?`"${esc}"`:esc }
 function rowsToCsv(rows){
   const headers=['Invoice ID','Invoice No','Timestamp (IST)','Franchisee Code','Admin Code','SuperAdmin Code','Customer Code','Referral Code','Vehicle No','Make/Model','Odometer','Tyre Size FL','Tyre Size FR','Tyre Size RL','Tyre Size RR','Qty (ml)','MRP (/ml ₹)','Installation Cost ₹','Discount ₹','Subtotal (ex-GST) ₹','GST Rate','GST Amount ₹','Total Amount ₹','Stock@Start (L)','GPS Lat','GPS Lng','Site Address','Min Tread Depth (mm)','Speed Rating','Created By UserId','Created By Role']
@@ -207,7 +186,7 @@ app.get('/api/exports/invoices', async (req,res)=>{
   }catch(err){ res.status(500).json({ ok:false, error:'CSV export failed', message: err?.message || String(err) }) }
 })
 
-// --- Summary ---
+// --- Improved Summary (fallbacks) ---
 app.get('/api/summary', async (req,res)=>{
   const client=await pool.connect()
   try{
@@ -218,13 +197,32 @@ app.get('/api/summary', async (req,res)=>{
     const from=req.query.from, to=req.query.to
     if(from && has(cols,'created_at')){ where.push(`i."created_at"::date >= $${i++}`); params.push(from) }
     if(to && has(cols,'created_at')){ where.push(`i."created_at"::date <= $${i++}`); params.push(to) }
-    const sql=`
+
+    // dosage: prefer total_qty_ml, else dosage_ml, else 0
+    const dosageExpr =
+      has(cols,'total_qty_ml') ? `COALESCE(SUM(i."total_qty_ml"::numeric),0)` :
+      (has(cols,'dosage_ml') ? `COALESCE(SUM(i."dosage_ml"::numeric),0)` : '0::numeric');
+
+    // revenue ex-GST: prefer total_before_gst, else subtotal_ex_gst, else (total_with_gst - gst_amount)
+    const revExpr =
+      has(cols,'total_before_gst') ? `COALESCE(SUM(i."total_before_gst"::numeric),0)` :
+      (has(cols,'subtotal_ex_gst') ? `COALESCE(SUM(i."subtotal_ex_gst"::numeric),0)` :
+        (has(cols,'total_with_gst') && has(cols,'gst_amount')
+          ? `COALESCE(SUM((i."total_with_gst"::numeric) - (i."gst_amount"::numeric)),0)`
+          : '0::numeric'));
+
+    const gstExpr = has(cols,'gst_amount') ? `COALESCE(SUM(i."gst_amount"::numeric),0)` : '0::numeric'
+    const totalExpr =
+      has(cols,'total_with_gst') ? `COALESCE(SUM(i."total_with_gst"::numeric),0)` :
+      (has(cols,'total_amount') ? `COALESCE(SUM(i."total_amount"::numeric),0)` : '0::numeric')
+
+    const sql = `
       SELECT
         COUNT(*)::int AS count,
-        ${has(cols,'dosage_ml') ? `COALESCE(SUM(i."dosage_ml"::numeric),0)` : (has(cols,'total_qty_ml') ? `COALESCE(SUM(i."total_qty_ml"::numeric),0)` : '0::numeric')} AS dosage_ml,
-        ${has(cols,'total_before_gst') ? `COALESCE(SUM(i."total_before_gst"::numeric),0)` : (has(cols,'subtotal_ex_gst') ? `COALESCE(SUM(i."subtotal_ex_gst"::numeric),0)` : '0::numeric')} AS total_before_gst,
-        ${has(cols,'gst_amount') ? `COALESCE(SUM(i."gst_amount"::numeric),0)` : '0::numeric'} AS gst_amount,
-        ${has(cols,'total_with_gst') ? `COALESCE(SUM(i."total_with_gst"::numeric),0)` : (has(cols,'total_amount') ? `COALESCE(SUM(i."total_amount"::numeric),0)` : '0::numeric')} AS total_with_gst
+        ${dosageExpr} AS dosage_ml,
+        ${revExpr} AS total_before_gst,
+        ${gstExpr} AS gst_amount,
+        ${totalExpr} AS total_with_gst
       FROM public.invoices i
       ${where.length?('WHERE '+where.join(' AND ')):''}
     `
@@ -234,7 +232,7 @@ app.get('/api/summary', async (req,res)=>{
   finally{ client.release() }
 })
 
-// --- FULL invoice read ---
+// --- Read FULL invoice ---
 app.get(['/api/invoices/:id/full2','/invoices/:id/full2'], async (req,res)=>{
   const client=await pool.connect()
   try{
@@ -251,7 +249,7 @@ app.get(['/api/invoices/:id/full2','/invoices/:id/full2'], async (req,res)=>{
   finally{ client.release() }
 })
 
-// --- FULL invoice create (writes only existing columns) ---
+// --- Create FULL invoice (writes only existing columns) ---
 app.post('/api/invoices/full', async (req,res)=>{
   const client=await pool.connect()
   try{
