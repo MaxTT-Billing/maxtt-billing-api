@@ -1,5 +1,6 @@
 // server.js — MaxTT Billing API (ESM)
-// Summary v7: dosage fallback uses exGST / (mrp_per_ml OR price_per_ml OR FALLBACK_MRP_PER_ML)
+// Summary v8: dosage fallback uses (exGST - installation + discount) / unitPrice.
+// unitPrice = mrp_per_ml OR price_per_ml OR FALLBACK_MRP_PER_ML (env, default 4.5).
 import express from 'express'
 import pkg from 'pg'
 const { Pool } = pkg
@@ -136,7 +137,7 @@ app.get('/api/exports/invoices', async (req,res)=>{
   }catch(err){ res.status(500).json({ ok:false, error:'CSV export failed', message: err?.message || String(err) }) }
 })
 
-// --- SUMMARY (dosage fallback enhanced) ---
+// --- SUMMARY (improved dosage fallback) ---
 app.get('/api/summary', async (req,res)=>{
   const client=await pool.connect()
   try{
@@ -149,19 +150,25 @@ app.get('/api/summary', async (req,res)=>{
     // numeric cleaner
     const clean = (col) => `NULLIF(regexp_replace(trim(i.${qid(col)}::text),'[^0-9.+-]','','g'),'')::numeric`
 
-    // per-row ex-GST (prefer explicit columns; else derived total-gst)
+    // per-row explicit ex-GST / GST / total
+    const rowTotalWithGst = has(cols,'total_with_gst') ? clean('total_with_gst') :
+                            (has(cols,'total_amount') ? clean('total_amount') : 'NULL')
+    const rowGst = has(cols,'gst_amount') ? clean('gst_amount') : 'NULL'
+
+    // ex-GST (row) = explicit before-gst OR subtotal OR (total - gst)
     const exGstRow = `
       COALESCE(
         ${has(cols,'total_before_gst') ? clean('total_before_gst') : 'NULL'},
         ${has(cols,'subtotal_ex_gst')  ? clean('subtotal_ex_gst')  : 'NULL'},
-        GREATEST(
-          COALESCE(${has(cols,'total_with_gst') ? clean('total_with_gst') : 'NULL'},0) -
-          COALESCE(${has(cols,'gst_amount')     ? clean('gst_amount')     : 'NULL'},0),
-          0
-        )
+        GREATEST(COALESCE(${rowTotalWithGst},0) - COALESCE(${rowGst},0), 0)
       )`
 
-    // unit price per row: mrp_per_ml → price_per_ml → FALLBACK_MRP_PER_ML
+    // adjust ex-GST to isolate product value (exclude installation, add back discount)
+    const rowInstall = has(cols,'installation_cost') ? clean('installation_cost') : '0::numeric'
+    const rowDiscount= has(cols,'discount_amount')   ? clean('discount_amount')   : '0::numeric'
+    const productExGstRow = `GREATEST( (${exGstRow}) - COALESCE(${rowInstall},0) + COALESCE(${rowDiscount},0), 0 )`
+
+    // unit price per row: mrp_per_ml → price_per_ml → FALLBACK
     const FALLBACK = Number(process.env.FALLBACK_MRP_PER_ML || 4.5)
     const unitPriceRow = `
       COALESCE(
@@ -170,27 +177,28 @@ app.get('/api/summary', async (req,res)=>{
         ${FALLBACK.toFixed(6)}::numeric
       )`
 
-    // per-row qty: qty fields → derived using unit price (which now always has a fallback)
+    // per-row qty: qty fields → derived from productExGst / unitPrice
     const qtyRow = `
       COALESCE(
         ${has(cols,'total_qty_ml') ? clean('total_qty_ml') : 'NULL'},
         ${has(cols,'dosage_ml')    ? clean('dosage_ml')    : 'NULL'},
-        (${exGstRow}) / (${unitPriceRow})
+        CASE WHEN (${unitPriceRow}) IS NOT NULL AND (${unitPriceRow}) <> 0
+             THEN (${productExGstRow}) / (${unitPriceRow})
+             ELSE NULL
+        END
       )`
 
-    // Sums for other boxes (use same WHERE)
+    // Sums (same filter)
     const gstSum = has(cols,'gst_amount') ? `COALESCE(SUM(${clean('gst_amount')}),0)` : '0::numeric'
     const totalSum = has(cols,'total_with_gst') ? `COALESCE(SUM(${clean('total_with_gst')}),0)` :
                      (has(cols,'total_amount') ? `COALESCE(SUM(${clean('total_amount')}),0)` : '0::numeric')
     const sumBefore   = has(cols,'total_before_gst') ? `COALESCE(SUM(${clean('total_before_gst')}),0)` : '0::numeric'
     const sumSubtotal = has(cols,'subtotal_ex_gst')  ? `COALESCE(SUM(${clean('subtotal_ex_gst')}),0)`  : '0::numeric'
-
     const whereSql = where.length ? 'WHERE '+where.join(' AND ') : ''
 
     const sql = `
       WITH base AS (
-        SELECT
-          ${qtyRow} AS qty_ml
+        SELECT ${qtyRow} AS qty_ml
         FROM public.invoices i
         ${whereSql}
       )
