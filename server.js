@@ -1,5 +1,5 @@
 // server.js — MaxTT Billing API (ESM)
-// Summary fix: robust numeric parsing (strip non-digits), IST-aware CSV filtering, "MRP (₹/ml)" header.
+// Summary fix v3: prefer first non-zero candidate; IST CSV filter; CSV header "MRP (₹/ml)"
 import express from 'express'
 import pkg from 'pg'
 const { Pool } = pkg
@@ -31,80 +31,29 @@ const pool = new Pool({
 let cachedCols = null
 async function getInvoiceCols(client) {
   if (cachedCols) return cachedCols
-  const q = `
+  const r = await client.query(`
     SELECT lower(column_name) AS name
     FROM information_schema.columns
     WHERE table_schema='public' AND table_name='invoices'
-  `
-  const r = await client.query(q)
+  `)
   cachedCols = new Set(r.rows.map(x => x.name))
   return cachedCols
 }
-function has(cols, name) { return cols.has(String(name).toLowerCase()) }
-function qid(name) { return `"${name}"` }
-function pickFirst(cols, cands) { return cands.find(c => has(cols, c)) || null }
+const has = (cols, n) => cols.has(String(n).toLowerCase())
+const qid = (n) => `"${n}"`
 
 // --- health ---
 app.get('/', (_req, res) => res.send('MaxTT Billing API is running'))
 app.get('/api/health', (_req, res) => res.json({ ok: true }))
 
-// --- ONE-TIME ADMIN: add signature/GPS columns (guarded by ADMIN_MAINT_KEY) ---
-app.get('/api/admin/add-signature-columns', async (req, res) => {
-  try {
-    const key = String(req.query.key || '')
-    const expected = process.env.ADMIN_MAINT_KEY || ''
-    if (!expected || key !== expected) return res.status(401).json({ ok: false, error: 'unauthorized' })
-
-    const sql = `
-DO $$ BEGIN
-  IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='invoices' AND column_name='customer_signature') THEN
-    ALTER TABLE public.invoices ADD COLUMN customer_signature text;
-  END IF;
-END $$;
-DO $$ BEGIN
-  IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='invoices' AND column_name='signed_at') THEN
-    ALTER TABLE public.invoices ADD COLUMN signed_at timestamptz;
-  END IF;
-END $$;
-DO $$ BEGIN
-  IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='invoices' AND column_name='consent_signature') THEN
-    ALTER TABLE public.invoices ADD COLUMN consent_signature text;
-  END IF;
-END $$;
-DO $$ BEGIN
-  IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='invoices' AND column_name='consent_signed_at') THEN
-    ALTER TABLE public.invoices ADD COLUMN consent_signed_at timestamptz;
-  END IF;
-END $$;
-DO $$ BEGIN
-  IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='invoices' AND column_name='gps_lat') THEN
-    ALTER TABLE public.invoices ADD COLUMN gps_lat double precision;
-  END IF;
-END $$;
-DO $$ BEGIN
-  IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='invoices' AND column_name='gps_lng') THEN
-    ALTER TABLE public.invoices ADD COLUMN gps_lng double precision;
-  END IF;
-END $$;
-    `
-    const client = await pool.connect()
-    try { await client.query('BEGIN'); await client.query(sql); await client.query('COMMIT') }
-    catch (e) { await client.query('ROLLBACK'); throw e }
-    finally { client.release() }
-
-    res.json({ ok: true, added: ['customer_signature','signed_at','consent_signature','consent_signed_at','gps_lat','gps_lng'] })
-  } catch (e) {
-    res.status(500).json({ ok:false, error:String(e?.message||e) })
-  }
-})
-
-// --- Admin export VIEW helper (adaptive) ---
+// --- Admin export VIEW helper (unchanged) ---
 app.get('/api/admin/create-view-auto', async (_req, res) => {
   const client = await pool.connect()
   try {
     const cols = await getInvoiceCols(client)
+    const pick = (...xs) => xs.find(x => has(cols, x))
     const expr = (alias, cands) => {
-      const f = pickFirst(cols, cands)
+      const f = pick(...cands)
       return f ? `i.${qid(f)}::text AS ${qid(alias)}` : `NULL::text AS ${qid(alias)}`
     }
     const selectParts = [
@@ -140,36 +89,35 @@ app.get('/api/admin/create-view-auto', async (_req, res) => {
       expr('created_by_user_id',['created_by_user_id','created_by','user_id']),
       'NULL::text AS "role"'
     ]
-    const createViewSql = `
+    await client.query(`
       CREATE OR REPLACE VIEW public.v_invoice_export AS
-      SELECT
-        ${selectParts.join(',\n        ')}
+      SELECT ${selectParts.join(', ')}
       FROM public.invoices i;
-    `
-    await client.query(createViewSql)
-    res.json({ ok:true, created:'public.v_invoice_export', note:'adaptive' })
-  } catch (err) {
-    res.status(500).json({ ok:false, where:'create_view_auto', message: err?.message || String(err) })
+    `)
+    res.json({ ok: true, created: 'public.v_invoice_export' })
+  } catch (e) {
+    res.status(500).json({ ok:false, where:'create_view_auto', message:e?.message||String(e) })
   } finally { client.release() }
 })
 
-// --- CSV export (invoices) ---
-function csvField(val){ if(val==null) return ''; const s=String(val); const must=s.includes('"')||s.includes(',')||s.includes('\n')||s.includes('\r')||s.includes(';'); const esc=s.split('"').join('""'); return must?`"${esc}"`:esc }
+// --- CSV export (kept) ---
+const csvField = v => v==null ? '' : (/["\n,\r;]/.test(String(v)) ? `"${String(v).replace(/"/g,'""')}"` : String(v))
 function rowsToCsv(rows){
   const headers=['Invoice ID','Invoice No','Timestamp (IST)','Franchisee Code','Admin Code','SuperAdmin Code','Customer Code','Referral Code','Vehicle No','Make/Model','Odometer','Tyre Size FL','Tyre Size FR','Tyre Size RL','Tyre Size RR','Qty (ml)','MRP (₹/ml)','Installation Cost ₹','Discount ₹','Subtotal (ex-GST) ₹','GST Rate','GST Amount ₹','Total Amount ₹','Stock@Start (L)','GPS Lat','GPS Lng','Site Address','Min Tread Depth (mm)','Speed Rating','Created By UserId','Created By Role']
-  const lines=[headers.map(csvField).join(',')]
+  const out=[headers.map(csvField).join(',')]
   for(const r of rows){
-    const fields=[r.invoice_id,r.invoice_number,r.invoice_ts_ist,r.franchisee_code,r.admin_code,r.super_admin_code,r.customer_code,r.referral_code,r.vehicle_no,r.vehicle_make_model,r.odometer_reading,r.tyre_size_fl,r.tyre_size_fr,r.tyre_size_rl,r.tyre_size_rr,r.total_qty_ml,r.mrp_per_ml,r.installation_cost,r.discount_amount,r.subtotal_ex_gst,r.gst_rate,r.gst_amount,r.total_amount,r.stock_level_at_start_l,r.gps_lat,r.gps_lng,r.site_address_text,r.tread_depth_min_mm,r.speed_rating,r.created_by_user_id,r.role]
-    lines.push(fields.map(csvField).join(','))
+    out.push([
+      r.invoice_id,r.invoice_number,r.invoice_ts_ist,r.franchisee_code,r.admin_code,r.super_admin_code,r.customer_code,r.referral_code,r.vehicle_no,r.vehicle_make_model,r.odometer_reading,r.tyre_size_fl,r.tyre_size_fr,r.tyre_size_rl,r.tyre_size_rr,r.total_qty_ml,r.mrp_per_ml,r.installation_cost,r.discount_amount,r.subtotal_ex_gst,r.gst_rate,r.gst_amount,r.total_amount,r.stock_level_at_start_l,r.gps_lat,r.gps_lng,r.site_address_text,r.tread_depth_min_mm,r.speed_rating,r.created_by_user_id,r.role
+    ].map(csvField).join(','))
   }
-  return lines.join('\r\n')+'\r\n'
+  return out.join('\r\n')+'\r\n'
 }
 app.get('/api/exports/invoices', async (req,res)=>{
   try{
     const { from,to,franchisee,q } = req.query
     const where=[], params=[]; let i=1
     const fromSql='public.v_invoice_export'
-    if(from){ where.push(`invoice_ts_ist::date >= $${i++}`); params.push(from) } // IST-aware
+    if(from){ where.push(`invoice_ts_ist::date >= $${i++}`); params.push(from) }
     if(to){ where.push(`invoice_ts_ist::date <= $${i++}`); params.push(to) }
     if(franchisee){ where.push(`franchisee_code = $${i++}`); params.push(franchisee) }
     if(q){ const like=`%${String(q).split('%').join('')}%`; where.push(`(vehicle_no ILIKE $${i} OR customer_code ILIKE $${i})`); params.push(like); i++ }
@@ -177,83 +125,64 @@ app.get('/api/exports/invoices', async (req,res)=>{
     const client=await pool.connect()
     try{
       const r=await client.query(sql, params)
-      const csv=rowsToCsv(r.rows); const bom='\uFEFF'
-      const now=new Date().toISOString().slice(0,19).replace(/[:T]/g,''); const wm=franchisee?`_${franchisee}`:''; const filename=`maxtt_invoices_${now}${wm}.csv`
+      const bom='\uFEFF'
+      const now=new Date().toISOString().slice(0,19).replace(/[:T]/g,'')
+      const wm=franchisee?`_${franchisee}`:''
       res.setHeader('Content-Type','text/csv; charset=utf-8')
-      res.setHeader('Content-Disposition',`attachment; filename="${filename}"`)
+      res.setHeader('Content-Disposition',`attachment; filename="maxtt_invoices_${now}${wm}.csv"`)
       res.setHeader('Cache-Control','no-store')
-      res.status(200).send(bom+csv)
+      res.status(200).send(bom + rowsToCsv(r.rows))
     } finally { client.release() }
   }catch(err){ res.status(500).json({ ok:false, error:'CSV export failed', message: err?.message || String(err) }) }
 })
 
-// --- Improved Summary (tolerant numeric parsing + IST date filtering) ---
+// --- SUMMARY (first non-zero candidate logic) ---
 app.get('/api/summary', async (req,res)=>{
   const client=await pool.connect()
   try{
     const cols=await getInvoiceCols(client)
     const where=[], params=[]; let i=1
-
-    // date column preference: invoice_ts_ist (IST) → created_at (UTC)
-    const dateCol = has(cols,'invoice_ts_ist') ? 'invoice_ts_ist' :
-                    (has(cols,'created_at') ? 'created_at' : null)
+    const dateCol = has(cols,'invoice_ts_ist') ? 'invoice_ts_ist' : (has(cols,'created_at') ? 'created_at' : null)
     if (dateCol && req.query.from) { where.push(`i.${qid(dateCol)}::date >= $${i++}`); params.push(req.query.from) }
     if (dateCol && req.query.to)   { where.push(`i.${qid(dateCol)}::date <= $${i++}`); params.push(req.query.to) }
 
-    // optional text search
-    const q = String(req.query.q||'').trim()
-    if(q){
-      const like=`%${q.split('%').join('')}%`
-      const or=[]
-      if(has(cols,'vehicle_number')) or.push(`i."vehicle_number" ILIKE $${i}`)
-      if(has(cols,'customer_name'))  or.push(`i."customer_name" ILIKE $${i}`)
-      if(or.length){ where.push('(' + or.join(' OR ') + ')'); params.push(like); i++ }
-    }
+    // numeric cleaner (text -> trim -> strip non-numeric -> NULLIF '' -> numeric)
+    const asNum = (col) => `NULLIF(regexp_replace(trim(i.${qid(col)}::text),'[^0-9.+-]','','g'),'')::numeric`
 
-    // Helper to SUM a column as numeric safely:
-    // 1) cast to text
-    // 2) trim spaces
-    // 3) remove non-numeric (except + - .)
-    // 4) NULLIF empty
-    // 5) cast to numeric and SUM
-    const sumNum = (col) =>
-      `SUM( NULLIF(regexp_replace(trim(i.${qid(col)}::text), '[^0-9.+-]', '', 'g'), '')::numeric )`
+    // candidates
+    const sumQtyTotal   = has(cols,'total_qty_ml')     ? `COALESCE(SUM(${asNum('total_qty_ml')}),0)`     : '0::numeric'
+    const sumQtyDosage  = has(cols,'dosage_ml')        ? `COALESCE(SUM(${asNum('dosage_ml')}),0)`        : '0::numeric'
 
-    // dosage: prefer total_qty_ml, else dosage_ml, else 0
-    const dosageExpr =
-      has(cols,'total_qty_ml') ? `COALESCE(${sumNum('total_qty_ml')},0)` :
-      (has(cols,'dosage_ml') ? `COALESCE(${sumNum('dosage_ml')},0)` : '0::numeric');
+    const sumBefore     = has(cols,'total_before_gst') ? `COALESCE(SUM(${asNum('total_before_gst')}),0)` : '0::numeric'
+    const sumSubtotal   = has(cols,'subtotal_ex_gst')  ? `COALESCE(SUM(${asNum('subtotal_ex_gst')}),0)`  : '0::numeric'
+    const sumTotal      = has(cols,'total_with_gst')   ? `COALESCE(SUM(${asNum('total_with_gst')}),0)`   : '0::numeric'
+    const sumGst        = has(cols,'gst_amount')       ? `COALESCE(SUM(${asNum('gst_amount')}),0)`       : '0::numeric'
+    const sumDerived    = `GREATEST(${sumTotal} - ${sumGst}, 0)`
 
-    // revenue ex-GST: prefer total_before_gst, else subtotal_ex_gst, else (total_with_gst - gst_amount)
-    const revExpr =
-      has(cols,'total_before_gst') ? `COALESCE(${sumNum('total_before_gst')},0)` :
-      (has(cols,'subtotal_ex_gst') ? `COALESCE(${sumNum('subtotal_ex_gst')},0)` :
-        (has(cols,'total_with_gst') && has(cols,'gst_amount')
-          ? `COALESCE( (${sumNum('total_with_gst')}) - (${sumNum('gst_amount')}), 0 )`
-          : '0::numeric'));
-
-    const gstExpr = has(cols,'gst_amount') ? `COALESCE(${sumNum('gst_amount')},0)` : '0::numeric'
-    const totalExpr =
-      has(cols,'total_with_gst') ? `COALESCE(${sumNum('total_with_gst')},0)` :
-      (has(cols,'total_amount') ? `COALESCE(${sumNum('total_amount')},0)` : '0::numeric')
+    // pick first non-zero
+    const dosageExpr = `COALESCE(NULLIF(${sumQtyTotal},0), NULLIF(${sumQtyDosage},0), 0::numeric)`
+    const revExpr    = `COALESCE(NULLIF(${sumBefore},0), NULLIF(${sumSubtotal},0), ${sumDerived}, 0::numeric)`
+    const gstExpr    = `${sumGst}`
+    const totalExpr  = `${sumTotal}`
 
     const sql = `
       SELECT
         COUNT(*)::int AS count,
-        ${dosageExpr} AS dosage_ml,
-        ${revExpr} AS total_before_gst,
-        ${gstExpr} AS gst_amount,
-        ${totalExpr} AS total_with_gst
+        ${dosageExpr}      AS dosage_ml,
+        ${revExpr}         AS total_before_gst,
+        ${gstExpr}         AS gst_amount,
+        ${totalExpr}       AS total_with_gst
       FROM public.invoices i
       ${where.length?('WHERE '+where.join(' AND ')):''}
     `
     const r=await client.query(sql, params)
     res.json(r.rows[0])
-  }catch(err){ res.status(500).json({ ok:false, where:'summary', message: err?.message || String(err) }) }
-  finally{ client.release() }
+  }catch(err){
+    res.status(500).json({ ok:false, where:'summary', message: err?.message || String(err) })
+  } finally { client.release() }
 })
 
-// --- Read FULL invoice (no-store) ---
+// --- FULL invoice passthrough & create (unchanged minimal needed) ---
 app.get(['/api/invoices/:id/full2','/invoices/:id/full2'], async (req,res)=>{
   const client=await pool.connect()
   try{
@@ -261,8 +190,7 @@ app.get(['/api/invoices/:id/full2','/invoices/:id/full2'], async (req,res)=>{
     if(!Number.isFinite(id) || id<=0) return res.status(400).json({ ok:false, error:'bad_id' })
     const cols=await getInvoiceCols(client)
     const idCol = cols.has('id') ? 'id' : 'invoice_id'
-    const sql = `SELECT * FROM public.invoices WHERE ${qid(idCol)} = $1 LIMIT 1`
-    const r = await client.query(sql, [id])
+    const r = await client.query(`SELECT * FROM public.invoices WHERE ${qid(idCol)}=$1 LIMIT 1`, [id])
     if(!r.rows.length) return res.status(404).json({ ok:false, error:'not_found' })
     res.setHeader('Cache-Control','no-store')
     res.json(r.rows[0])
@@ -270,13 +198,12 @@ app.get(['/api/invoices/:id/full2','/invoices/:id/full2'], async (req,res)=>{
   finally{ client.release() }
 })
 
-// --- Create FULL invoice (writes only existing columns) ---
 app.post('/api/invoices/full', async (req,res)=>{
   const client=await pool.connect()
   try{
     const payload = req.body || {}
     const cols = await getInvoiceCols(client)
-    const acceptedKeys = [
+    const accepted = [
       'franchisee_id','franchisee_code','customer_name','customer_gstin','customer_address','vehicle_number','vehicle_type',
       'tyre_count','fitment_locations','installer_name',
       'total_qty_ml','dosage_ml','mrp_per_ml','installation_cost','discount_amount',
@@ -284,23 +211,16 @@ app.post('/api/invoices/full', async (req,res)=>{
       'tyre_width_mm','aspect_ratio','rim_diameter_in','tread_depth_min_mm','speed_rating',
       'tread_fl_mm','tread_fr_mm','tread_rl_mm','tread_rr_mm',
       'stock_level_at_start_l','site_address_text','hsn_code',
-      'referral_code',
-      'customer_signature','signed_at','consent_signature','consent_signed_at','gps_lat','gps_lng',
+      'referral_code','customer_signature','signed_at','consent_signature','consent_signed_at','gps_lat','gps_lng',
     ]
-    const keys = acceptedKeys.filter(k => payload[k] !== undefined && has(cols, k))
+    const keys = accepted.filter(k => payload[k] !== undefined && has(cols,k))
     if(!keys.length) return res.status(400).json({ ok:false, error:'no_matching_columns' })
-    const colSql = keys.map(k => qid(k)).join(', ')
-    const valSql = keys.map((_,idx)=>`$${idx+1}`).join(', ')
-    const vals = keys.map(k => payload[k])
-    const sql = `INSERT INTO public.invoices (${colSql}) VALUES (${valSql}) RETURNING *`
-    const r = await client.query(sql, vals)
-    const created = r.rows[0]
-    res.status(201).json({ ok:true, id: created?.id || created?.invoice_id, invoice_number: created?.invoice_number || null, customer_code: created?.customer_code || null })
-  }catch(err){
-    const msg = err?.message || String(err)
-    const code = err?.code
-    res.status(400).json({ ok:false, error: msg, code })
-  }finally{ client.release() }
+    const sql = `INSERT INTO public.invoices (${keys.map(qid).join(', ')}) VALUES (${keys.map((_,i)=>`$${i+1}`).join(', ')}) RETURNING *`
+    const r = await client.query(sql, keys.map(k => payload[k]))
+    const row = r.rows[0]
+    res.status(201).json({ ok:true, id: row?.id || row?.invoice_id, invoice_number: row?.invoice_number || null, customer_code: row?.customer_code || null })
+  }catch(err){ res.status(400).json({ ok:false, error: err?.message || String(err) }) }
+  finally{ client.release() }
 })
 
 // --- 404 ---
