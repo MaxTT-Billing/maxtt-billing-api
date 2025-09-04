@@ -1,10 +1,4 @@
 // server.js — MaxTT Billing API (ESM) — tyre-first dosage + auto-compute totals + safe defaults
-// Defaults added:
-//   DEFAULT_QTY_ML (env, default 1200)
-//   FALLBACK_MRP_PER_ML (env, default 4.5)
-// If request lacks tyre & money fields, we still compute qty and totals.
-// All other behaviors remain as in the previous build.
-
 import express from 'express'
 import pkg from 'pg'
 const { Pool } = pkg
@@ -96,7 +90,7 @@ app.get('/api/admin/create-view-auto', async (_req, res) => {
       expr('subtotal_ex_gst', ['subtotal_ex_gst','total_before_gst','subtotal','amount_before_tax']),
       expr('gst_rate', ['gst_rate','tax_rate','gst_percent','gst']),
       expr('gst_amount', ['gst_amount','tax_amount','gst_value']),
-      expr('total_amount', ['total_with_gst','total_amount','grand_total','total','amount']),
+      expr('total_amount', ['total_with_gst','total_amount','grand_total','total']),
       expr('stock_level_at_start_l', ['stock_level_at_start_l','stock_before','stock_at_start_l','stock_start_liters']),
       expr('gps_lat', ['gps_lat','latitude','lat']),
       expr('gps_lng', ['gps_lng','longitude','lng','lon']),
@@ -511,21 +505,17 @@ app.post('/api/invoices/full', async (req, res) => {
       (beforeCol ? (asNum(payload[beforeCol]) ?? asNum(payload.total_before_gst) ?? asNum(payload.subtotal_ex_gst) ?? asNum(payload.subtotal) ?? asNum(payload.amount_before_tax))
                  : (asNum(payload.total_before_gst) ?? asNum(payload.subtotal_ex_gst) ?? asNum(payload.subtotal) ?? asNum(payload.amount_before_tax)))
 
-    // Money fallback (if we already have exBefore)
     if (computedQty == null && exBefore != null && unitPrice) computedQty = exBefore / unitPrice
 
-    // ABSOLUTE DEFAULTS if still missing
     if (computedQty == null) computedQty = envDefaultQty
     if (exBefore == null) exBefore = computedQty * unitPrice
 
-    // GST math (defaults)
     let gstRate = asNum(payload[gstRateCol || 'gst_rate']); if (gstRate == null) gstRate = 18
     let gstAmount = (asNum(payload[gstCol]) ?? asNum(payload.gst_amount) ?? asNum(payload.tax_amount) ?? asNum(payload.gst_value))
     if (gstAmount == null) gstAmount = (Number(exBefore) * Number(gstRate)) / 100
     let totalWithGst = (asNum(payload[totalCol]) ?? asNum(payload.total_with_gst) ?? asNum(payload.total_amount) ?? asNum(payload.grand_total) ?? asNum(payload.total))
     if (totalWithGst == null) totalWithGst = Number(exBefore) + Number(gstAmount)
 
-    // Build insert payload
     const accepted = [
       franchiseeCol || 'franchisee_id',
       invNoCol || 'invoice_number',
@@ -549,19 +539,15 @@ app.post('/api/invoices/full', async (req, res) => {
       if (has(cols, key) && payload[key] !== undefined) insertPayload[key] = payload[key]
     }
 
-    // Ensure franchisee id present
     if (franchiseeCol && !insertPayload[franchiseeCol]) insertPayload[franchiseeCol] = frId
     else if (!franchiseeCol && has(cols,'franchisee_id') && !insertPayload['franchisee_id']) insertPayload['franchisee_id'] = frId
 
-    // Generated numbers (only if columns exist)
     if (invNoCol && printedInvoiceNo) insertPayload[invNoCol] = printedInvoiceNo
     if (custCodeCol && printedCustomerCode) insertPayload[custCodeCol] = printedCustomerCode
 
-    // Save qty under first available qty column
     const qtyToSave = computedQty
     if (qtyToSave != null && qtyColInTable) insertPayload[qtyColInTable] = qtyToSave
 
-    // Save computed money fields into whichever columns exist
     const setIf = (col, val) => { if (col && val != null && has(cols, col) && insertPayload[col] == null) insertPayload[col] = Number(val) }
     setIf(beforeCol, exBefore)
     setIf(totalCol, totalWithGst)
@@ -572,9 +558,7 @@ app.post('/api/invoices/full', async (req, res) => {
     if (!gstCol)    for (const k of ['gst_amount','tax_amount','gst_value']) if (has(cols,k) && insertPayload[k]==null) insertPayload[k]=Number(gstAmount)
     if (!gstRateCol)for (const k of ['gst_rate','tax_rate','gst_percent','gst']) if (has(cols,k) && insertPayload[k]==null) insertPayload[k]=Number(gstRate)
 
-    // Default HSN
     if (has(cols,'hsn_code') && insertPayload['hsn_code'] == null) insertPayload['hsn_code'] = '35069999'
-    // Persist unit price if a column exists
     if (unitPriceCol && insertPayload[unitPriceCol] == null) insertPayload[unitPriceCol] = Number(unitPrice)
 
     const keys = Object.keys(insertPayload)
@@ -616,37 +600,6 @@ app.post('/__wire/referrals/test', async (req, res) => {
     return res.status(500).json({ ok:false, error: String(e?.message || e) })
   }
 })
-
-/* -------------------- ONE-TIME MIGRATION RUNNER -------------------- */
-/* Usage (after deploy): 
-   1) Set env var MIGRATION_TOKEN to any strong random string.
-   2) Open:
-      https://<your-api-host>/__admin/run-migration?token=YOUR_TOKEN
-   Optional: &file=2025-09-04_add_invoice_columns.sql
-*/
-app.get('/__admin/run-migration', async (req, res) => {
-  const token = String(req.query.token || '')
-  if (!token || token !== String(process.env.MIGRATION_TOKEN || '')) {
-    return res.status(403).send('Forbidden')
-  }
-  const fileName = String(req.query.file || '2025-09-04_add_invoice_columns.sql')
-  const sqlPath = path.join(__dirname, 'migrations', fileName)
-
-  const client = await pool.connect()
-  try {
-    const sql = await fs.readFile(sqlPath, 'utf8')
-    await client.query('BEGIN')
-    await client.query(sql)
-    await client.query('COMMIT')
-    return res.status(200).send(`Migration OK: ${fileName}`)
-  } catch (e) {
-    try { await client.query('ROLLBACK') } catch {}
-    return res.status(500).send(`Migration failed: ${e?.message || e}`)
-  } finally {
-    client.release()
-  }
-})
-/* ------------------ END ONE-TIME MIGRATION RUNNER ------------------ */
 
 // ------------------------------- 404 -----------------------------------
 app.use((_req, res) => res.status(404).json({ error: 'not_found' }))
