@@ -9,6 +9,13 @@ import express from 'express'
 import pkg from 'pg'
 const { Pool } = pkg
 
+import fs from 'fs/promises'
+import path from 'path'
+import { fileURLToPath } from 'url'
+
+const __filename = fileURLToPath(import.meta.url)
+const __dirname = path.dirname(__filename)
+
 const app = express()
 
 // ------------------------------- CORS ---------------------------------
@@ -609,6 +616,37 @@ app.post('/__wire/referrals/test', async (req, res) => {
     return res.status(500).json({ ok:false, error: String(e?.message || e) })
   }
 })
+
+/* -------------------- ONE-TIME MIGRATION RUNNER -------------------- */
+/* Usage (after deploy): 
+   1) Set env var MIGRATION_TOKEN to any strong random string.
+   2) Open:
+      https://<your-api-host>/__admin/run-migration?token=YOUR_TOKEN
+   Optional: &file=2025-09-04_add_invoice_columns.sql
+*/
+app.get('/__admin/run-migration', async (req, res) => {
+  const token = String(req.query.token || '')
+  if (!token || token !== String(process.env.MIGRATION_TOKEN || '')) {
+    return res.status(403).send('Forbidden')
+  }
+  const fileName = String(req.query.file || '2025-09-04_add_invoice_columns.sql')
+  const sqlPath = path.join(__dirname, 'migrations', fileName)
+
+  const client = await pool.connect()
+  try {
+    const sql = await fs.readFile(sqlPath, 'utf8')
+    await client.query('BEGIN')
+    await client.query(sql)
+    await client.query('COMMIT')
+    return res.status(200).send(`Migration OK: ${fileName}`)
+  } catch (e) {
+    try { await client.query('ROLLBACK') } catch {}
+    return res.status(500).send(`Migration failed: ${e?.message || e}`)
+  } finally {
+    client.release()
+  }
+})
+/* ------------------ END ONE-TIME MIGRATION RUNNER ------------------ */
 
 // ------------------------------- 404 -----------------------------------
 app.use((_req, res) => res.status(404).json({ error: 'not_found' }))
