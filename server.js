@@ -590,38 +590,12 @@ app.post('/__wire/referrals/test', async (req, res) => {
     try { const mod = await import('./referralsClient.js'); postReferralFn = mod.postReferral || mod.default } catch {}
     if (!postReferralFn) return res.status(500).json({ ok:false, error:'referrals_client_missing' })
 
-    const r = await postReferralFn(body, key)
+    const r = await postReferralFn(body)
     return res.status(r.ok ? 200 : 502).json(r)
   } catch (e) {
     return res.status(500).json({ ok:false, error: String(e?.message || e) })
   }
 })
-
-/* -------------------- ONE-TIME MIGRATION RUNNER -------------------- */
-app.get('/__admin/run-migration', async (req, res) => {
-  const token = String(req.query.token || '')
-  if (!token || token !== String(process.env.MIGRATION_TOKEN || '')) {
-    return res.status(403).send('Forbidden')
-  }
-  const fileName = String(req.query.file || '')
-  if (!fileName) return res.status(400).send('Missing file')
-  const sqlPath = path.join(__dirname, 'migrations', fileName)
-
-  const client = await pool.connect()
-  try {
-    const sql = await fs.readFile(sqlPath, 'utf8')
-    await client.query('BEGIN')
-    await client.query(sql)
-    await client.query('COMMIT')
-    return res.status(200).send(`Migration OK: ${fileName}`)
-  } catch (e) {
-    try { await client.query('ROLLBACK') } catch {}
-    return res.status(500).send(`Migration failed: ${e?.message || e}`)
-  } finally {
-    client.release()
-  }
-})
-/* ------------------ END ONE-TIME MIGRATION RUNNER ------------------ */
 
 // ------------------------------- 404 -----------------------------------
 app.use((_req, res) => res.status(404).json({ error: 'not_found' }))
