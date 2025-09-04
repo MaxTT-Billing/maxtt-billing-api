@@ -1,10 +1,14 @@
-// server.js — MaxTT Billing API (ESM) — tyre-first dosage + stable money fallback
-// - Printed invoice/customer code logic retained
-// - Dosage computed at CREATE:
-//     1) If tyre inputs exist → tyre geometry formula (per-tyre recommendation map)
-//     2) Else if qty provided → use it
-//     3) Else → exGST ÷ unitPrice  (no install/discount adjustments)
-// - IST-aware summary, adaptive CSV/view, schema-agnostic mapping, referrals passthrough
+// server.js — MaxTT Billing API (ESM) — tyre-first dosage + auto-compute totals
+// Frozen behaviors kept:
+// - Printed invoice no.: TS-SS-CCC-NNN/NNNN/MMYY
+// - Customer code: <Franchisee>-<SEQ>
+// - Dosage saved at CREATE (tyre formula if tyre data present; else qty; else exGST ÷ MRP)
+// NEW: If money fields are missing, auto-compute and SAVE:
+//    subtotal_ex_gst = qty * MRP
+//    gst_rate = (payload.gst_rate ?? 18)
+//    gst_amount = subtotal * gst_rate/100
+//    total_with_gst = subtotal + gst
+// IST-aware summary, adaptive CSV/view, schema-agnostic mapping, referrals passthrough
 
 import express from 'express'
 import pkg from 'pg'
@@ -448,20 +452,15 @@ function recommendPerTyreMl(widthMm = 195, rimIn = 15) {
   else if (w <= 215) base = 340
   else if (w <= 225) base = 360
   else base = 380
-  // rim tweak
   if (r >= 17) base += 30
   if (r >= 18) base += 30
   if (r >= 19) base += 20
   if (r >= 20) base += 20
-  // clamp
   base = Math.max(150, Math.min(base, 600))
-  // round to nearest 10
   return Math.round(base/10)*10
 }
 
 function computeTyreDosageMl(payload) {
-  // Accept either a single size set (tyre_width_mm, aspect_ratio, rim_diameter_in)
-  // or infer count from positions; aspect ratio is not used in table to keep behavior stable.
   const width = asNum(payload['tyre_width_mm'])
   const rim = asNum(payload['rim_diameter_in'])
   const count = inferTyreCountFromPayload(payload) || 4
@@ -482,9 +481,12 @@ app.post('/api/invoices/full', async (req, res) => {
     const qtyColInTable = findCol(cols, qtyCols)
 
     const unitPriceCol = findCol(cols,['mrp_per_ml','price_per_ml','rate_per_ml','mrp_ml']) || (has(cols,'mrp_per_ml') ? 'mrp_per_ml' : null)
+    const installCol = findCol(cols,['installation_cost','install_cost','labour','labour_cost'])
+    const discountCol = findCol(cols,['discount_amount','discount','disc'])
     const beforeCol = findCol(cols,['total_before_gst','subtotal_ex_gst','subtotal','amount_before_tax'])
     const totalCol = findCol(cols,['total_with_gst','total_amount','grand_total','total'])
     const gstCol = findCol(cols,['gst_amount','tax_amount','gst_value'])
+    const gstRateCol = findCol(cols,['gst_rate','tax_rate','gst_percent','gst'])
 
     const franchiseeCol = findCol(cols,['franchisee_id','franchisee_code','franchise_code','franchisee'])
     const invNoCol = findCol(cols, ['invoice_number','invoice_no','inv_no','bill_no','invoice'])
@@ -496,27 +498,43 @@ app.post('/api/invoices/full', async (req, res) => {
     const printedCustomerCode = custCodeCol ? `${frId}-${pad(customerSeq)}` : null
 
     // ----- DOSAGE: tyre → explicit qty → money (exGST ÷ unitPrice) -----
-    let computedQty = null
-
-    // 1) Tyre-based (preferred)
-    computedQty = computeTyreDosageMl(payload)
-
-    // 2) If explicit qty provided, use that
+    let computedQty = computeTyreDosageMl(payload)
     if (computedQty == null) {
       for (const k of qtyCols) if (payload[k] != null) { const v = asNum(payload[k]); if (v != null) { computedQty = v; break } }
     }
+    // money fallback
+    const unitPrice = unitPriceCol ? (asNum(payload[unitPriceCol]) ?? asNum(payload.mrp_per_ml) ?? asNum(payload.price_per_ml)) : (asNum(payload.mrp_per_ml) ?? asNum(payload.price_per_ml))
+    let exBefore = beforeCol ? (asNum(payload[beforeCol]) ?? asNum(payload.total_before_gst) ?? asNum(payload.subtotal_ex_gst) ?? asNum(payload.subtotal) ?? asNum(payload.amount_before_tax)) : (asNum(payload.total_before_gst) ?? asNum(payload.subtotal_ex_gst) ?? asNum(payload.subtotal) ?? asNum(payload.amount_before_tax))
+    if (computedQty == null && exBefore != null && unitPrice) computedQty = exBefore / unitPrice
+    if (computedQty == null && exBefore == null && unitPrice != null) {
+      // Still nothing provided: allow create with qty derived from totals to be computed in next block
+      // (we’ll compute totals from qty later; for now keep as null and compute below)
+    }
 
-    // 3) Money fallback: exGST ÷ unitPrice  (no install/discount adjustments)
-    if (computedQty == null) {
-      const unitPrice = unitPriceCol ? (asNum(payload[unitPriceCol]) ?? asNum(payload.mrp_per_ml) ?? asNum(payload.price_per_ml)) : (asNum(payload.mrp_per_ml) ?? asNum(payload.price_per_ml))
-      let exBefore = beforeCol ? (asNum(payload[beforeCol]) ?? asNum(payload.total_before_gst) ?? asNum(payload.subtotal_ex_gst) ?? asNum(payload.subtotal) ?? asNum(payload.amount_before_tax)) : (asNum(payload.total_before_gst) ?? asNum(payload.subtotal_ex_gst) ?? asNum(payload.subtotal) ?? asNum(payload.amount_before_tax))
-      if (exBefore == null) {
-        const totalWithGst = totalCol ? (asNum(payload[totalCol]) ?? asNum(payload.total_with_gst) ?? asNum(payload.total_amount) ?? asNum(payload.grand_total) ?? asNum(payload.total)) : (asNum(payload.total_with_gst) ?? asNum(payload.total_amount) ?? asNum(payload.grand_total) ?? asNum(payload.total))
-        const gst = gstCol ? (asNum(payload[gstCol]) ?? asNum(payload.gst_amount) ?? asNum(payload.tax_amount) ?? asNum(payload.gst_value)) : (asNum(payload.gst_amount) ?? asNum(payload.tax_amount) ?? asNum(payload.gst_value))
-        if (totalWithGst != null && gst != null) exBefore = Math.max(totalWithGst - gst, 0)
-      }
-      const fallbackUnit = unitPrice ?? Number(process.env.FALLBACK_MRP_PER_ML || 4.5)
-      if (exBefore != null && fallbackUnit) computedQty = exBefore / fallbackUnit
+    // ----- AUTO-COMPUTE MONEY FIELDS WHEN MISSING -----
+    // Goal: ensure Admin summary has ₹ numbers even if form didn’t send them.
+    let gstRate = asNum(payload[gstRateCol || 'gst_rate'])
+    if (gstRate == null) gstRate = 18 // default 18%
+
+    // If exBefore missing but we *do* have qty & unit price → compute
+    if ((exBefore == null || !Number.isFinite(Number(exBefore))) && computedQty != null && unitPrice != null) {
+      exBefore = computedQty * unitPrice
+    }
+
+    // If qty is still null but exBefore & unit price exist → derive qty
+    if (computedQty == null && exBefore != null && unitPrice != null) {
+      computedQty = exBefore / unitPrice
+    }
+
+    // Now compute gst & total if missing
+    let gstAmount = gstCol ? (asNum(payload[gstCol]) ?? asNum(payload.gst_amount) ?? asNum(payload.tax_amount) ?? asNum(payload.gst_value)) : (asNum(payload.gst_amount) ?? asNum(payload.tax_amount) ?? asNum(payload.gst_value))
+    if ((gstAmount == null || !Number.isFinite(Number(gstAmount))) && exBefore != null) {
+      gstAmount = (Number(exBefore) * Number(gstRate)) / 100
+    }
+
+    let totalWithGst = totalCol ? (asNum(payload[totalCol]) ?? asNum(payload.total_with_gst) ?? asNum(payload.total_amount) ?? asNum(payload.grand_total) ?? asNum(payload.total)) : (asNum(payload.total_with_gst) ?? asNum(payload.total_amount) ?? asNum(payload.grand_total) ?? asNum(payload.total))
+    if ((totalWithGst == null || !Number.isFinite(Number(totalWithGst))) && exBefore != null && gstAmount != null) {
+      totalWithGst = Number(exBefore) + Number(gstAmount)
     }
 
     // Build insert payload
@@ -551,10 +569,32 @@ app.post('/api/invoices/full', async (req, res) => {
     if (invNoCol && printedInvoiceNo) insertPayload[invNoCol] = printedInvoiceNo
     if (custCodeCol && printedCustomerCode) insertPayload[custCodeCol] = printedCustomerCode
 
-    // Save computed qty under first available qty column
+    // Save qty
     if (computedQty != null && qtyColInTable) insertPayload[qtyColInTable] = computedQty
 
-    // Default HSN if present & not provided
+    // Save computed money fields into whichever columns exist
+    const setIf = (col, val) => { if (col && val != null && has(cols, col) && insertPayload[col] == null) insertPayload[col] = Number(val) }
+    // before-exGST can map to several names; prefer whichever exists
+    setIf(beforeCol, exBefore)
+    setIf(totalCol, totalWithGst)
+    setIf(gstCol, gstAmount)
+    setIf(gstRateCol, gstRate)
+
+    // If table has alternate names and primary missing, try alternates:
+    if (!beforeCol) {
+      for (const k of ['subtotal_ex_gst','total_before_gst','subtotal','amount_before_tax']) if (has(cols,k) && exBefore != null && insertPayload[k]==null) insertPayload[k]=Number(exBefore)
+    }
+    if (!totalCol) {
+      for (const k of ['total_with_gst','total_amount','grand_total','total']) if (has(cols,k) && totalWithGst != null && insertPayload[k]==null) insertPayload[k]=Number(totalWithGst)
+    }
+    if (!gstCol) {
+      for (const k of ['gst_amount','tax_amount','gst_value']) if (has(cols,k) && gstAmount != null && insertPayload[k]==null) insertPayload[k]=Number(gstAmount)
+    }
+    if (!gstRateCol) {
+      for (const k of ['gst_rate','tax_rate','gst_percent','gst']) if (has(cols,k) && gstRate != null && insertPayload[k]==null) insertPayload[k]=Number(gstRate)
+    }
+
+    // Default HSN
     if (has(cols,'hsn_code') && insertPayload['hsn_code'] == null) insertPayload['hsn_code'] = '35069999'
 
     const keys = Object.keys(insertPayload)
