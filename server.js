@@ -1,11 +1,10 @@
-// server.js — MaxTT Billing API (ESM)
-// ✅ NEW: Dosage (ml) is computed at CREATE time (POST /api/invoices/full) and saved.
-//    - Computes from money fields (ex-GST, installation, discount, unit price).
-//    - Tyre-field formula can be added later, but this immediately fixes Admin tiles.
-// ✅ /api/summary now sums stored dosage columns; falls back to safe per-row math only if needed.
-// ✅ Robust column-name discovery across existing schemas (install_cost vs installation_cost etc.)
-// ✅ Keeps health, CSV export, list/get, full2 passthrough, simple auth/profile, referrals test.
-// ---------------------------------------------------------------------------------------------
+// server.js — MaxTT Billing API (ESM) — hardened & aligned with frozen behavior
+// - Strict printed invoice format: TS-SS-CCC-NNN/NNNN/MMYY
+// - Customer Code = <FranchiseeCode>-<SEQ> (zero-padded)
+// - Dosage (ml) computed & saved at CREATE time (money-path now; tyre formula can be added next)
+// - IST-aware date filtering for admin summary
+// - Schema-agnostic column discovery & mapping (works with existing table names)
+// - Keeps: health, CSV export, list/get, /:id/full2, /api/invoices/full, /api/summary, referrals test
 
 import express from 'express'
 import pkg from 'pg'
@@ -42,27 +41,35 @@ async function getInvoiceCols(client) {
   const r = await client.query(`
     SELECT lower(column_name) AS name
     FROM information_schema.columns
-    WHERE table_schema = 'public' AND table_name = 'invoices'
+    WHERE table_schema='public' AND table_name='invoices'
   `)
   cachedCols = new Set(r.rows.map(x => x.name))
   return cachedCols
 }
 const has = (cols, n) => cols.has(String(n).toLowerCase())
 const qid = (n) => `"${n}"`
-
 function findCol(cols, candidates) {
   for (const c of candidates) if (has(cols, c)) return c
   return null
 }
-function cleanNumeric(colSql) {
-  // strips currency symbols, spaces, commas; keeps digits . + -
-  return `NULLIF(regexp_replace(trim(${colSql}::text),'[^0-9.+-]','','g'),'')::numeric`
+function cleanNumericSql(expr) {
+  return `NULLIF(regexp_replace(trim(${expr}::text),'[^0-9.+-]','','g'),'')::numeric`
 }
+const pad = (n, w=4) => String(Math.max(0, Number(n)||0)).padStart(w, '0')
+const nowUtc = () => new Date()
 
-// For SELECT lists with graceful NULLs
-function sel(cols, alias, candidates, type = 'text') {
-  const found = findCol(cols, candidates)
-  return found ? `i.${qid(found)}::${type} AS ${qid(alias)}` : `NULL::${type} AS ${qid(alias)}`
+// IST date boundaries from given UTC date
+function istBoundsISO(d = nowUtc()) {
+  // IST = UTC+5:30. Make YYYY-MM-DD in IST and return ISO date strings for SQL::date compare
+  const tzOffsetMs = 5.5 * 60 * 60 * 1000
+  const istTime = new Date(d.getTime() + tzOffsetMs)
+  const y = istTime.getUTCFullYear()
+  const m = istTime.getUTCMonth()
+  const day = istTime.getUTCDate()
+  const startIST = new Date(Date.UTC(y, m, day, -5, -30, 0)) // convert back to UTC start of IST day
+  const endIST = new Date(startIST.getTime() + 24*60*60*1000 - 1)
+  const toISODate = (dt) => dt.toISOString().slice(0,10) // YYYY-MM-DD
+  return { startDate: toISODate(startIST), endDate: toISODate(endIST) }
 }
 
 // ------------------------------- Health --------------------------------
@@ -81,7 +88,7 @@ app.get('/api/admin/create-view-auto', async (_req, res) => {
     const selectParts = [
       expr('invoice_id', ['id','invoice_id']),
       expr('invoice_number', ['invoice_number','invoice_no','inv_no','bill_no','invoice']),
-      expr('invoice_ts_ist', ['invoice_ts_ist','created_at','invoice_date','createdon','created_on','date']),
+      expr('invoice_ts_ist', ['invoice_ts_ist','created_at','invoice_date','date','createdon','created_on']),
       expr('franchisee_code', ['franchisee_code','franchisee','franchise_code','franchisee_id']),
       expr('admin_code', ['admin_code','admin']),
       expr('super_admin_code', ['super_admin_code','superadmin_code','sa_code']),
@@ -199,13 +206,18 @@ app.get('/api/profile', (_req, res) => {
 })
 
 // ----------------------- Invoices list & get ---------------------------
+function sel(cols, alias, candidates, type='text') {
+  const f = findCol(cols, candidates)
+  return f ? `i.${qid(f)}::${type} AS ${qid(alias)}` : `NULL::${type} AS ${qid(alias)}`
+}
+
 app.get('/api/invoices', async (req, res) => {
   const client = await pool.connect()
   try {
     const cols = await getInvoiceCols(client)
     const selects = [
       sel(cols, 'id', ['id','invoice_id']),
-      sel(cols, 'created_at', ['created_at','invoice_ts_ist','invoice_date','date','createdon','created_on']),
+      sel(cols, 'created_at', ['invoice_ts_ist','created_at','invoice_date','date','createdon','created_on']),
       sel(cols, 'customer_name', ['customer_name','customer']),
       sel(cols, 'vehicle_number', ['vehicle_number','vehicle_no','registration_no','reg_no']),
       sel(cols, 'vehicle_type', ['vehicle_type','category']),
@@ -225,14 +237,16 @@ app.get('/api/invoices', async (req, res) => {
     const where = []; const params = []; let i = 1
     if (req.query.q) {
       const like = `%${String(req.query.q).split('%').join('')}%`
+      const vcol = findCol(cols,['vehicle_number','vehicle_no','registration_no','reg_no'])
+      const ccol = findCol(cols,['customer_name','customer'])
       const or = []
-      if (findCol(cols,['vehicle_number','vehicle_no','registration_no','reg_no'])) or.push(`i.${qid(findCol(cols,['vehicle_number','vehicle_no','registration_no','reg_no']))} ILIKE $${i}`)
-      if (findCol(cols,['customer_name','customer']))  or.push(`i.${qid(findCol(cols,['customer_name','customer']))} ILIKE $${i}`)
+      if (vcol) or.push(`i.${qid(vcol)} ILIKE $${i}`)
+      if (ccol) or.push(`i.${qid(ccol)} ILIKE $${i}`)
       if (or.length) { where.push(`(${or.join(' OR ')})`); params.push(like); i++ }
     }
-    const dateCol = findCol(cols,['invoice_ts_ist','created_at','invoice_date','date','createdon','created_on'])
-    if (req.query.from && dateCol) { where.push(`i.${qid(dateCol)}::date >= $${i++}`); params.push(req.query.from) }
-    if (req.query.to   && dateCol) { where.push(`i.${qid(dateCol)}::date <= $${i++}`); params.push(req.query.to) }
+    const dcol = findCol(cols,['invoice_ts_ist','created_at','invoice_date','date','createdon','created_on'])
+    if (req.query.from && dcol) { where.push(`(i.${qid(dcol)} AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata')::date >= $${i++}`); params.push(req.query.from) }
+    if (req.query.to   && dcol) { where.push(`(i.${qid(dcol)} AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata')::date <= $${i++}`); params.push(req.query.to) }
 
     const limit = Math.min(Number(req.query.limit || 500), 5000)
     const sql = `
@@ -255,7 +269,7 @@ app.get('/api/invoices/:id', async (req, res) => {
     const cols = await getInvoiceCols(client)
     const selects = [
       sel(cols,'id',['id','invoice_id']),
-      sel(cols,'created_at',['created_at','invoice_ts_ist','invoice_date','date','createdon','created_on']),
+      sel(cols,'created_at',['invoice_ts_ist','created_at','invoice_date','date','createdon','created_on']),
       sel(cols,'customer_name',['customer_name','customer']),
       sel(cols,'mobile_number',['mobile_number','mobile','phone']),
       sel(cols,'vehicle_number',['vehicle_number','vehicle_no','registration_no','reg_no']),
@@ -303,7 +317,7 @@ app.get(['/api/invoices/:id/full2', '/invoices/:id/full2'], async (req, res) => 
     if (!Number.isFinite(id) || id <= 0) return res.status(400).json({ ok:false, error:'bad_id' })
     const cols = await getInvoiceCols(client)
     const idCol = findCol(cols,['id','invoice_id']) || 'id'
-    const r = await client.query(`SELECT * FROM public.invoices WHERE ${qid(idCol)} = $1 LIMIT 1`, [id])
+    const r = await client.query(`SELECT * FROM public.invoices WHERE ${qid(idCol)}=$1 LIMIT 1`, [id])
     if (!r.rows.length) return res.status(404).json({ ok:false, error:'not_found' })
     res.setHeader('Cache-Control','no-store')
     res.json(r.rows[0])
@@ -312,114 +326,42 @@ app.get(['/api/invoices/:id/full2', '/invoices/:id/full2'], async (req, res) => 
   } finally { client.release() }
 })
 
-// ---------------------- BASIC create / update (legacy) -----------------
-app.post('/api/invoices', async (req, res) => {
-  const client = await pool.connect()
-  try {
-    const cols = await getInvoiceCols(client)
-    const payload = req.body || {}
-    const keys = Object.keys(payload).filter(k => has(cols, k))
-    if (!keys.length) return res.status(400).json({ ok:false, error:'no_matching_columns' })
-
-    const sql = `INSERT INTO public.invoices (${keys.map(qid).join(', ')}) VALUES (${keys.map((_,i)=>`$${i+1}`).join(', ')}) RETURNING *`
-    const r = await client.query(sql, keys.map(k => payload[k]))
-    res.status(201).json(r.rows[0])
-  } catch (err) {
-    res.status(500).json({ ok:false, where:'create_invoice', message: err?.message || String(err) })
-  } finally { client.release() }
-})
-
-app.put('/api/invoices/:id', async (req, res) => {
-  const client = await pool.connect()
-  try {
-    const cols = await getInvoiceCols(client)
-    const payload = req.body || {}
-    const keys = Object.keys(payload).filter(k => has(cols, k))
-    if (!keys.length) return res.status(400).json({ ok:false, error:'no_matching_columns' })
-
-    const sets = keys.map((k,idx) => `${qid(k)} = $${idx+1}`).join(', ')
-    const idCol = findCol(cols,['id','invoice_id']) || 'id'
-    const sql = `UPDATE public.invoices SET ${sets} WHERE ${qid(idCol)} = $${keys.length+1} RETURNING *`
-    const r = await client.query(sql, [...keys.map(k => payload[k]), req.params.id])
-    if (!r.rows.length) return res.status(404).json({ ok:false, error:'not_found' })
-    res.json(r.rows[0])
-  } catch (err) {
-    res.status(500).json({ ok:false, where:'update_invoice', message: err?.message || String(err) })
-  } finally { client.release() }
-})
-
 // ----------------------------- SUMMARY ---------------------------------
-// Sums saved dosage. Only falls back to derived math if dosage columns are null.
+// Sums saved dosage; IST-aware date bounds. No back-calculation in the tile.
 app.get('/api/summary', async (req, res) => {
   const client = await pool.connect()
   try {
     const cols = await getInvoiceCols(client)
-    const where = []; const params = []; let i = 1
-
-    const dateCol = findCol(cols,['invoice_ts_ist','created_at','invoice_date','date','createdon','created_on'])
-    if (dateCol && req.query.from) { where.push(`i.${qid(dateCol)}::date >= $${i++}`); params.push(req.query.from) }
-    if (dateCol && req.query.to)   { where.push(`i.${qid(dateCol)}::date <= $${i++}`); params.push(req.query.to) }
-    const whereSql = where.length ? 'WHERE '+where.join(' AND ') : ''
-
     const qtyCol = findCol(cols,['total_qty_ml','dosage_ml','qty_ml','total_ml','quantity_ml','qty'])
-    const unitPriceCol = findCol(cols,['mrp_per_ml','price_per_ml','rate_per_ml','mrp_ml'])
-    const installCol = findCol(cols,['installation_cost','install_cost','labour','labour_cost'])
-    const discountCol = findCol(cols,['discount_amount','discount','disc'])
-    const exBeforeCol = findCol(cols,['total_before_gst','subtotal_ex_gst','subtotal','amount_before_tax'])
-    const totalWithGstCol = findCol(cols,['total_with_gst','total_amount','grand_total','total'])
+    const beforeCol = findCol(cols,['total_before_gst','subtotal_ex_gst','subtotal','amount_before_tax'])
+    const totalCol = findCol(cols,['total_with_gst','total_amount','grand_total','total'])
     const gstCol = findCol(cols,['gst_amount','tax_amount','gst_value'])
+    const dateCol = findCol(cols,['invoice_ts_ist','created_at','invoice_date','date','createdon','created_on']) || 'created_at'
 
-    const FALLBACK_MRP = Number(process.env.FALLBACK_MRP_PER_ML || 4.5).toFixed(6)
+    const where = []
+    const params = []
+    let i = 1
 
-    const qtyExpr = qtyCol
-      ? `NULLIF(${cleanNumeric(`i.${qid(qtyCol)}`)},0)`
-      : `NULL` // no saved qty => fallback later in SQL
+    if (req.query.from) { where.push(`(i.${qid(dateCol)} AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata')::date >= $${i++}`); params.push(req.query.from) }
+    if (req.query.to)   { where.push(`(i.${qid(dateCol)} AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata')::date <= $${i++}`); params.push(req.query.to) }
 
-    const unitExpr = unitPriceCol
-      ? `NULLIF(${cleanNumeric(`i.${qid(unitPriceCol)}`)},0)`
-      : `${FALLBACK_MRP}::numeric`
+    const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : ''
 
-    const exExpr = exBeforeCol
-      ? `${cleanNumeric(`i.${qid(exBeforeCol)}`)}`
-      : `GREATEST(COALESCE(${totalWithGstCol ? cleanNumeric(`i.${qid(totalWithGstCol)}`) : 'NULL'},0) - COALESCE(${gstCol ? cleanNumeric(`i.${qid(gstCol)}`) : 'NULL'},0), 0)`
-
-    const installExpr = installCol ? `COALESCE(${cleanNumeric(`i.${qid(installCol)}`)},0)` : '0::numeric'
-    const discountExpr = discountCol ? `COALESCE(${cleanNumeric(`i.${qid(discountCol)}`)},0)` : '0::numeric'
-    const productExExpr = `GREATEST( (${exExpr}) - (${installExpr}) + (${discountExpr}), 0 )`
-
-    const derivedQty = `CASE WHEN ${qtyExpr} IS NOT NULL THEN ${qtyExpr}
-                         WHEN (${unitExpr}) IS NOT NULL AND (${unitExpr}) <> 0
-                           THEN (${productExExpr}) / (${unitExpr})
-                         ELSE 0::numeric END`
-
-    const gstSum = gstCol ? `COALESCE(SUM(${cleanNumeric(`i.${qid(gstCol)}`)}),0)` : '0::numeric'
-    const totalSum = totalWithGstCol ? `COALESCE(SUM(${cleanNumeric(`i.${qid(totalWithGstCol)}`)}),0)` : '0::numeric'
-    const beforeSum = exBeforeCol ? `COALESCE(SUM(${cleanNumeric(`i.${qid(exBeforeCol)}`)}),0)` : '0::numeric'
-    const subtotalSum = (exBeforeCol ? null : findCol(cols,['subtotal_ex_gst','subtotal','amount_before_tax']))
-      ? `COALESCE(SUM(${cleanNumeric(`i.${qid(findCol(cols,['subtotal_ex_gst','subtotal','amount_before_tax']))}`)}),0)`
-      : '0::numeric'
+    const qtySum = qtyCol ? `COALESCE(SUM(${cleanNumericSql(`i.${qid(qtyCol)}`)}),0)` : '0::numeric'
+    const beforeSum = beforeCol ? `COALESCE(SUM(${cleanNumericSql(`i.${qid(beforeCol)}`)}),0)` : '0::numeric'
+    const gstSum = gstCol ? `COALESCE(SUM(${cleanNumericSql(`i.${qid(gstCol)}`)}),0)` : '0::numeric'
+    const totalSum = totalCol ? `COALESCE(SUM(${cleanNumericSql(`i.${qid(totalCol)}`)}),0)` : '0::numeric'
 
     const sql = `
-      WITH base AS (
-        SELECT ${derivedQty} AS qty_ml
-        FROM public.invoices i
-        ${whereSql}
-      )
       SELECT
-        (SELECT COUNT(*)::int FROM public.invoices i ${whereSql}) AS count,
-        COALESCE(SUM(qty_ml),0) AS dosage_ml,
-        COALESCE(
-          NULLIF((SELECT ${beforeSum} FROM public.invoices i ${whereSql}), 0),
-          NULLIF((SELECT ${subtotalSum} FROM public.invoices i ${whereSql}), 0),
-          GREATEST(
-            (SELECT ${totalSum} FROM public.invoices i ${whereSql}) -
-            (SELECT ${gstSum}   FROM public.invoices i ${whereSql}),
-            0
-          )
-        ) AS total_before_gst,
-        (SELECT ${gstSum}   FROM public.invoices i ${whereSql}) AS gst_amount,
-        (SELECT ${totalSum} FROM public.invoices i ${whereSql}) AS total_with_gst
-      FROM base;
+        COUNT(*)::int AS count,
+        ${qtySum} AS dosage_ml,
+        CASE WHEN (${beforeSum}) > 0 THEN (${beforeSum})
+             ELSE GREATEST((${totalSum}) - (${gstSum}), 0) END AS total_before_gst,
+        ${gstSum} AS gst_amount,
+        ${totalSum} AS total_with_gst
+      FROM public.invoices i
+      ${whereSql}
     `
     const r = await client.query(sql, params)
     res.json(r.rows[0])
@@ -428,25 +370,95 @@ app.get('/api/summary', async (req, res) => {
   } finally { client.release() }
 })
 
+// ---------------------- Numbering helpers (DB-scan) --------------------
+// NOTE: Uses existing data to determine next sequence.
+// Monthly invoice seq resets each MMYY per franchisee for printed number.
+// Customer code seq is global per franchisee (continues).
+async function computeNextNumbers(client, cols, franchiseeId) {
+  const invNoCol = findCol(cols, ['invoice_number','invoice_no','inv_no','bill_no','invoice'])
+  const custCodeCol = findCol(cols, ['customer_code','customer_id','customer','cust_code'])
+  const dateCol = findCol(cols,['invoice_ts_ist','created_at','invoice_date','date','createdon','created_on']) || 'created_at'
+
+  const today = nowUtc()
+  const mm = String(today.getUTCMonth()+1).padStart(2,'0')
+  const yy = String(today.getUTCFullYear()).slice(-2)
+  const mmyy = `${mm}${yy}`
+
+  // Invoice monthly seq for this franchisee & month
+  let nextMonthly = 1
+  if (invNoCol) {
+    const sql = `
+      SELECT ${qid(invNoCol)} AS inv
+      FROM public.invoices
+      WHERE ${qid(invNoCol)} IS NOT NULL
+        AND ${qid(invNoCol)} ILIKE $1
+        AND ( ${qid(dateCol)} AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata')::text LIKE $2
+      ORDER BY 1 DESC
+      LIMIT 200
+    `
+    const likePrefix = `${franchiseeId}/%/${mmyy}%` // e.g., TS-DL-DEL-001/____/0925
+    const likeMonth = `%${mmyy}%`
+    const r = await client.query(sql, [likePrefix, likeMonth])
+    // Parse "TS-DL-DEL-001/0001/MMYY"
+    for (const row of r.rows) {
+      const s = String(row.inv||'')
+      const m = s.match(/^[A-Z-0-9]+\/(\d{4})\/(\d{4})$/i)
+      if (m) {
+        const seq = Number(m[1]||'0')
+        if (Number.isFinite(seq) && seq >= nextMonthly) nextMonthly = seq + 1
+      }
+    }
+  }
+
+  // Customer code overall seq for this franchisee
+  let nextCust = 1
+  if (custCodeCol) {
+    const sql = `
+      SELECT ${qid(custCodeCol)} AS cc
+      FROM public.invoices
+      WHERE ${qid(custCodeCol)} IS NOT NULL
+        AND ${qid(custCodeCol)} ILIKE $1
+      ORDER BY 1 DESC
+      LIMIT 200
+    `
+    const like = `${franchiseeId}-%`
+    const r = await client.query(sql, [like])
+    for (const row of r.rows) {
+      const s = String(row.cc||'')
+      const m = s.match(/^[A-Z-0-9-]+-(\d{4,})$/i)
+      if (m) {
+        const seq = Number(m[1]||'0')
+        if (Number.isFinite(seq) && seq >= nextCust) nextCust = seq + 1
+      }
+    }
+  }
+  return { invoiceMonthlySeq: nextMonthly, customerSeq: nextCust, mmyy }
+}
+
 // ------------------------ CREATE (authoritative) -----------------------
-// Calculates dosage from money fields and saves into total_qty_ml (and dosage_ml if exists).
+// Saves pricing fields, computes dosage, generates invoice no & customer code.
 app.post('/api/invoices/full', async (req, res) => {
   const client = await pool.connect()
   try {
     const payload = req.body || {}
     const cols = await getInvoiceCols(client)
 
-    // Discover column names present
+    // Column discovery / mapping
     const qtyCols = ['total_qty_ml','dosage_ml','qty_ml','total_ml','quantity_ml','qty']
     const qtyColInTable = findCol(cols, qtyCols)
-    const unitPriceCol = findCol(cols,['mrp_per_ml','price_per_ml','rate_per_ml','mrp_ml']) || 'mrp_per_ml'
-    const installCol = findCol(cols,['installation_cost','install_cost','labour','labour_cost']) || 'installation_cost'
-    const discountCol = findCol(cols,['discount_amount','discount','disc']) || 'discount_amount'
-    const exBeforeCol = findCol(cols,['total_before_gst','subtotal_ex_gst','subtotal','amount_before_tax'])
-    const totalWithGstCol = findCol(cols,['total_with_gst','total_amount','grand_total','total'])
+
+    const unitPriceCol = findCol(cols,['mrp_per_ml','price_per_ml','rate_per_ml','mrp_ml']) || (has(cols,'mrp_per_ml') ? 'mrp_per_ml' : null)
+    const installCol = findCol(cols,['installation_cost','install_cost','labour','labour_cost'])
+    const discountCol = findCol(cols,['discount_amount','discount','disc'])
+    const beforeCol = findCol(cols,['total_before_gst','subtotal_ex_gst','subtotal','amount_before_tax'])
+    const totalCol = findCol(cols,['total_with_gst','total_amount','grand_total','total'])
     const gstCol = findCol(cols,['gst_amount','tax_amount','gst_value'])
 
-    // Pull numbers from payload, with cleaning
+    const franchiseeCol = findCol(cols,['franchisee_id','franchisee_code','franchise_code','franchisee'])
+    const invNoCol = findCol(cols, ['invoice_number','invoice_no','inv_no','bill_no','invoice'])
+    const custCodeCol = findCol(cols, ['customer_code','customer_id','customer','cust_code'])
+
+    // Helpers
     const asNum = (v) => {
       if (v === null || v === undefined) return null
       const s = String(v).trim().replace(/[^0-9.+-]/g,'')
@@ -454,57 +466,84 @@ app.post('/api/invoices/full', async (req, res) => {
       const n = Number(s)
       return Number.isFinite(n) ? n : null
     }
+    const frId = String(payload[franchiseeCol || 'franchisee_id'] || payload.franchisee_id || '').trim() || 'TS-DL-DEL-001'
 
-    const unitPrice = asNum(payload[unitPriceCol]) ?? Number(process.env.FALLBACK_MRP_PER_ML || 4.5)
-    const install = asNum(payload[installCol]) ?? 0
-    const discount = asNum(payload[discountCol]) ?? 0
+    // Numbers: compute next invoice seq (per MMYY) + customer code seq (overall)
+    const { invoiceMonthlySeq, customerSeq, mmyy } = await computeNextNumbers(client, cols, frId)
+    const printedInvoiceNo = invNoCol ? `${frId}/${pad(invoiceMonthlySeq)}/${mmyy}` : null
+    const printedCustomerCode = custCodeCol ? `${frId}-${pad(customerSeq)}` : null
 
-    let exBefore = asNum(payload[exBeforeCol])
+    // Pricing inputs
+    const unitPrice = unitPriceCol ? (asNum(payload[unitPriceCol]) ?? asNum(payload.mrp_per_ml) ?? asNum(payload.price_per_ml)) : (asNum(payload.mrp_per_ml) ?? asNum(payload.price_per_ml))
+    const install = installCol ? (asNum(payload[installCol]) ?? asNum(payload.installation_cost) ?? asNum(payload.install_cost) ?? asNum(payload.labour)) : (asNum(payload.installation_cost) ?? asNum(payload.install_cost) ?? asNum(payload.labour))
+    const discount = discountCol ? (asNum(payload[discountCol]) ?? asNum(payload.discount_amount) ?? asNum(payload.discount) ?? asNum(payload.disc)) : (asNum(payload.discount_amount) ?? asNum(payload.discount) ?? asNum(payload.disc))
+
+    let exBefore = beforeCol ? (asNum(payload[beforeCol]) ?? asNum(payload.total_before_gst) ?? asNum(payload.subtotal_ex_gst) ?? asNum(payload.subtotal) ?? asNum(payload.amount_before_tax)) : (asNum(payload.total_before_gst) ?? asNum(payload.subtotal_ex_gst) ?? asNum(payload.subtotal) ?? asNum(payload.amount_before_tax))
     if (exBefore == null) {
-      const totalWithGst = asNum(payload[totalWithGstCol])
-      const gst = asNum(payload[gstCol])
+      const totalWithGst = totalCol ? (asNum(payload[totalCol]) ?? asNum(payload.total_with_gst) ?? asNum(payload.total_amount) ?? asNum(payload.grand_total) ?? asNum(payload.total)) : (asNum(payload.total_with_gst) ?? asNum(payload.total_amount) ?? asNum(payload.grand_total) ?? asNum(payload.total))
+      const gst = gstCol ? (asNum(payload[gstCol]) ?? asNum(payload.gst_amount) ?? asNum(payload.tax_amount) ?? asNum(payload.gst_value)) : (asNum(payload.gst_amount) ?? asNum(payload.tax_amount) ?? asNum(payload.gst_value))
       if (totalWithGst != null && gst != null) exBefore = Math.max(totalWithGst - gst, 0)
     }
 
-    // If qty provided explicitly, keep it; else compute from product value
-    let qtyProvided = null
-    for (const k of qtyCols) if (payload[k] != null) { qtyProvided = asNum(payload[k]); break }
-
-    let computedQty = qtyProvided
-    if (computedQty == null && exBefore != null && unitPrice) {
+    // Qty preference: if any qty provided, keep it; else compute from (ex - install + discount) / unitPrice
+    let providedQty = null
+    for (const k of qtyCols) if (payload[k] != null) { providedQty = asNum(payload[k]); if (providedQty != null) break }
+    const fallbackUnit = unitPrice ?? Number(process.env.FALLBACK_MRP_PER_ML || 4.5)
+    let computedQty = providedQty
+    if (computedQty == null && exBefore != null) {
       const productEx = Math.max(exBefore - (install || 0) + (discount || 0), 0)
-      computedQty = unitPrice ? (productEx / unitPrice) : null
+      computedQty = fallbackUnit ? (productEx / fallbackUnit) : null
     }
 
-    // Prepare insert payload — include computed qty under the first available qty column
+    // Build insert payload: map known fields, add generated numbers & dosage
     const accepted = [
-      'franchisee_id','franchisee_code','customer_name','customer_gstin','customer_address','vehicle_number','vehicle_type',
+      // identity
+      franchiseeCol || 'franchisee_id',
+      invNoCol || 'invoice_number',
+      custCodeCol || 'customer_code',
+
+      // customer/vehicle
+      'customer_name','customer_gstin','customer_address','vehicle_number','vehicle_no','vehicle','vehicle_type',
       'tyre_count','fitment_locations','installer_name',
-      // qty columns
+
+      // qty candidates
       ...qtyCols,
-      // price/tax
+
+      // pricing
       'mrp_per_ml','price_per_ml','rate_per_ml','mrp_ml',
       'installation_cost','install_cost','labour','labour_cost',
       'discount_amount','discount','disc',
-      'subtotal_ex_gst','total_before_gst','gst_rate','gst_amount','total_with_gst',
+      'subtotal_ex_gst','total_before_gst','gst_rate','gst_amount','total_with_gst','total_amount','grand_total','total',
+
       // tyre / misc
       'tyre_width_mm','aspect_ratio','rim_diameter_in','tread_depth_min_mm','speed_rating',
       'tread_fl_mm','tread_fr_mm','tread_rl_mm','tread_rr_mm',
       'stock_level_at_start_l','site_address_text','hsn_code',
       'referral_code','customer_signature','signed_at','consent_signature','consent_signed_at','gps_lat','gps_lng',
     ]
-    const insertPayload = {}
-    for (const k of accepted) if (payload[k] !== undefined && has(cols,k)) insertPayload[k] = payload[k]
 
-    if (computedQty != null) {
-      if (qtyColInTable) {
-        insertPayload[qtyColInTable] = computedQty
-      } else if (has(cols,'total_qty_ml')) {
-        insertPayload['total_qty_ml'] = computedQty
-      } else if (has(cols,'dosage_ml')) {
-        insertPayload['dosage_ml'] = computedQty
-      }
+    const insertPayload = {}
+
+    // Copy through provided fields if they exist in DB
+    const colsArr = Array.from(cols)
+    for (const key of accepted) {
+      if (!key) continue
+      if (has(cols, key) && payload[key] !== undefined) insertPayload[key] = payload[key]
     }
+
+    // Ensure franchisee id present
+    if (franchiseeCol && !insertPayload[franchiseeCol]) insertPayload[franchiseeCol] = frId
+    else if (!franchiseeCol && has(cols,'franchisee_id') && !insertPayload['franchisee_id']) insertPayload['franchisee_id'] = frId
+
+    // Generated numbers
+    if (invNoCol && printedInvoiceNo) insertPayload[invNoCol] = printedInvoiceNo
+    if (custCodeCol && printedCustomerCode) insertPayload[custCodeCol] = printedCustomerCode
+
+    // Save computed qty under first available qty column
+    if (computedQty != null && qtyColInTable) insertPayload[qtyColInTable] = computedQty
+
+    // Default HSN if present & not provided
+    if (has(cols,'hsn_code') && insertPayload['hsn_code'] == null) insertPayload['hsn_code'] = '35069999'
 
     const keys = Object.keys(insertPayload)
     if (!keys.length) return res.status(400).json({ ok:false, error:'no_matching_columns' })
@@ -512,12 +551,13 @@ app.post('/api/invoices/full', async (req, res) => {
     const sql = `INSERT INTO public.invoices (${keys.map(qid).join(', ')}) VALUES (${keys.map((_,i)=>`$${i+1}`).join(', ')}) RETURNING *`
     const r = await client.query(sql, keys.map(k => insertPayload[k]))
     const row = r.rows[0]
+
     res.status(201).json({
       ok: true,
       id: row?.id ?? row?.invoice_id ?? null,
-      invoice_number: row?.invoice_number ?? null,
-      customer_code: row?.customer_code ?? null,
-      qty_ml_saved: computedQty ?? qtyProvided ?? null
+      invoice_number: row?.[invNoCol || 'invoice_number'] ?? null,
+      customer_code: row?.[custCodeCol || 'customer_code'] ?? null,
+      qty_ml_saved: computedQty ?? providedQty ?? null
     })
   } catch (err) {
     res.status(400).json({ ok:false, error: err?.message || String(err) })
@@ -529,18 +569,13 @@ app.post('/__wire/referrals/test', async (req, res) => {
   try {
     const key = req.get('X-REF-API-KEY') || process.env.REF_API_WRITER_KEY
     const body = req.body || {}
-
     const required = ['referrer_customer_code','referred_invoice_code','franchisee_code','invoice_amount_inr','invoice_date']
     const miss = required.filter(k => !body[k])
     if (miss.length) return res.status(400).json({ ok:false, error:'missing', fields: miss })
     if (!key) return res.status(401).json({ ok:false, error:'unauthorized' })
 
-    // Lazy import to avoid ESM export shape issues
     let postReferralFn = null
-    try {
-      const mod = await import('./referralsClient.js')
-      postReferralFn = mod.postReferral || mod.default
-    } catch (_) {}
+    try { const mod = await import('./referralsClient.js'); postReferralFn = mod.postReferral || mod.default } catch {}
     if (!postReferralFn) return res.status(500).json({ ok:false, error:'referrals_client_missing' })
 
     const r = await postReferralFn(body, key)
