@@ -468,7 +468,6 @@ app.post('/api/invoices/full', async (req, res) => {
     const payload = req.body || {}
     const cols = await getInvoiceCols(client)
 
-    // Column discovery / mapping
     const qtyCols = ['total_qty_ml','dosage_ml','qty_ml','total_ml','quantity_ml','qty']
     const qtyColInTable = findCol(cols, qtyCols)
 
@@ -487,9 +486,7 @@ app.post('/api/invoices/full', async (req, res) => {
     const printedInvoiceNo = invNoCol ? `${frId}/${pad(invoiceMonthlySeq)}/${mmyy}` : null
     const printedCustomerCode = custCodeCol ? `${frId}-${pad(customerSeq)}` : null
 
-    // ----- DOSAGE: tyre → explicit qty → money → DEFAULTS -----
     let computedQty = computeTyreDosageMl(payload)
-
     if (computedQty == null) {
       for (const k of qtyCols) if (payload[k] != null) { const v = asNum(payload[k]); if (v != null) { computedQty = v; break } }
     }
@@ -506,7 +503,6 @@ app.post('/api/invoices/full', async (req, res) => {
                  : (asNum(payload.total_before_gst) ?? asNum(payload.subtotal_ex_gst) ?? asNum(payload.subtotal) ?? asNum(payload.amount_before_tax)))
 
     if (computedQty == null && exBefore != null && unitPrice) computedQty = exBefore / unitPrice
-
     if (computedQty == null) computedQty = envDefaultQty
     if (exBefore == null) exBefore = computedQty * unitPrice
 
@@ -600,6 +596,32 @@ app.post('/__wire/referrals/test', async (req, res) => {
     return res.status(500).json({ ok:false, error: String(e?.message || e) })
   }
 })
+
+/* -------------------- ONE-TIME MIGRATION RUNNER -------------------- */
+app.get('/__admin/run-migration', async (req, res) => {
+  const token = String(req.query.token || '')
+  if (!token || token !== String(process.env.MIGRATION_TOKEN || '')) {
+    return res.status(403).send('Forbidden')
+  }
+  const fileName = String(req.query.file || '')
+  if (!fileName) return res.status(400).send('Missing file')
+  const sqlPath = path.join(__dirname, 'migrations', fileName)
+
+  const client = await pool.connect()
+  try {
+    const sql = await fs.readFile(sqlPath, 'utf8')
+    await client.query('BEGIN')
+    await client.query(sql)
+    await client.query('COMMIT')
+    return res.status(200).send(`Migration OK: ${fileName}`)
+  } catch (e) {
+    try { await client.query('ROLLBACK') } catch {}
+    return res.status(500).send(`Migration failed: ${e?.message || e}`)
+  } finally {
+    client.release()
+  }
+})
+/* ------------------ END ONE-TIME MIGRATION RUNNER ------------------ */
 
 // ------------------------------- 404 -----------------------------------
 app.use((_req, res) => res.status(404).json({ error: 'not_found' }))
