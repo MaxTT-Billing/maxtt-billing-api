@@ -1,10 +1,10 @@
-// server.js — MaxTT Billing API (ESM) — hardened & aligned with frozen behavior
-// - Strict printed invoice format: TS-SS-CCC-NNN/NNNN/MMYY
-// - Customer Code = <FranchiseeCode>-<SEQ> (zero-padded)
-// - Dosage (ml) computed & saved at CREATE time (money-path now; tyre formula can be added next)
-// - IST-aware date filtering for admin summary
-// - Schema-agnostic column discovery & mapping (works with existing table names)
-// - Keeps: health, CSV export, list/get, /:id/full2, /api/invoices/full, /api/summary, referrals test
+// server.js — MaxTT Billing API (ESM) — tyre-first dosage + stable money fallback
+// - Printed invoice/customer code logic retained
+// - Dosage computed at CREATE:
+//     1) If tyre inputs exist → tyre geometry formula (per-tyre recommendation map)
+//     2) Else if qty provided → use it
+//     3) Else → exGST ÷ unitPrice  (no install/discount adjustments)
+// - IST-aware summary, adaptive CSV/view, schema-agnostic mapping, referrals passthrough
 
 import express from 'express'
 import pkg from 'pg'
@@ -56,21 +56,6 @@ function cleanNumericSql(expr) {
   return `NULLIF(regexp_replace(trim(${expr}::text),'[^0-9.+-]','','g'),'')::numeric`
 }
 const pad = (n, w=4) => String(Math.max(0, Number(n)||0)).padStart(w, '0')
-const nowUtc = () => new Date()
-
-// IST date boundaries from given UTC date
-function istBoundsISO(d = nowUtc()) {
-  // IST = UTC+5:30. Make YYYY-MM-DD in IST and return ISO date strings for SQL::date compare
-  const tzOffsetMs = 5.5 * 60 * 60 * 1000
-  const istTime = new Date(d.getTime() + tzOffsetMs)
-  const y = istTime.getUTCFullYear()
-  const m = istTime.getUTCMonth()
-  const day = istTime.getUTCDate()
-  const startIST = new Date(Date.UTC(y, m, day, -5, -30, 0)) // convert back to UTC start of IST day
-  const endIST = new Date(startIST.getTime() + 24*60*60*1000 - 1)
-  const toISODate = (dt) => dt.toISOString().slice(0,10) // YYYY-MM-DD
-  return { startDate: toISODate(startIST), endDate: toISODate(endIST) }
-}
 
 // ------------------------------- Health --------------------------------
 app.get('/', (_req, res) => res.send('MaxTT Billing API is running'))
@@ -327,7 +312,6 @@ app.get(['/api/invoices/:id/full2', '/invoices/:id/full2'], async (req, res) => 
 })
 
 // ----------------------------- SUMMARY ---------------------------------
-// Sums saved dosage; IST-aware date bounds. No back-calculation in the tile.
 app.get('/api/summary', async (req, res) => {
   const client = await pool.connect()
   try {
@@ -371,15 +355,12 @@ app.get('/api/summary', async (req, res) => {
 })
 
 // ---------------------- Numbering helpers (DB-scan) --------------------
-// NOTE: Uses existing data to determine next sequence.
-// Monthly invoice seq resets each MMYY per franchisee for printed number.
-// Customer code seq is global per franchisee (continues).
 async function computeNextNumbers(client, cols, franchiseeId) {
   const invNoCol = findCol(cols, ['invoice_number','invoice_no','inv_no','bill_no','invoice'])
   const custCodeCol = findCol(cols, ['customer_code','customer_id','customer','cust_code'])
   const dateCol = findCol(cols,['invoice_ts_ist','created_at','invoice_date','date','createdon','created_on']) || 'created_at'
 
-  const today = nowUtc()
+  const today = new Date()
   const mm = String(today.getUTCMonth()+1).padStart(2,'0')
   const yy = String(today.getUTCFullYear()).slice(-2)
   const mmyy = `${mm}${yy}`
@@ -396,10 +377,9 @@ async function computeNextNumbers(client, cols, franchiseeId) {
       ORDER BY 1 DESC
       LIMIT 200
     `
-    const likePrefix = `${franchiseeId}/%/${mmyy}%` // e.g., TS-DL-DEL-001/____/0925
+    const likePrefix = `${franchiseeId}/%/${mmyy}%`
     const likeMonth = `%${mmyy}%`
     const r = await client.query(sql, [likePrefix, likeMonth])
-    // Parse "TS-DL-DEL-001/0001/MMYY"
     for (const row of r.rows) {
       const s = String(row.inv||'')
       const m = s.match(/^[A-Z-0-9]+\/(\d{4})\/(\d{4})$/i)
@@ -435,8 +415,62 @@ async function computeNextNumbers(client, cols, franchiseeId) {
   return { invoiceMonthlySeq: nextMonthly, customerSeq: nextCust, mmyy }
 }
 
+// ---------------------- Tyre dosage (preferred) -----------------------
+function asNum(v) {
+  if (v === null || v === undefined) return null
+  const s = String(v).trim().replace(/[^0-9.+-]/g,'')
+  if (s === '') return null
+  const n = Number(s)
+  return Number.isFinite(n) ? n : null
+}
+
+function inferTyreCountFromPayload(p) {
+  let count = 0
+  const have = (k) => p[k] != null && String(p[k]).trim() !== ''
+  const slots = ['fl','fr','rl','rr']
+  for (const pos of slots) {
+    if (have(`tyre_size_${pos}`) || (have(`tread_${pos}_mm`) && (have('tyre_width_mm')||have('aspect_ratio')||have('rim_diameter_in')))) count++
+  }
+  if (count === 0) count = asNum(p['tyre_count']) || asNum(p['no_of_tyres']) || asNum(p['number_of_tyres']) || null
+  return count
+}
+
+// Simple, stable recommendation table (per tyre, in ml)
+function recommendPerTyreMl(widthMm = 195, rimIn = 15) {
+  const w = Number(widthMm)||195
+  const r = Number(rimIn)||15
+  let base = 260
+  if (w <= 165) base = 220
+  else if (w <= 175) base = 240
+  else if (w <= 185) base = 260
+  else if (w <= 195) base = 300
+  else if (w <= 205) base = 320
+  else if (w <= 215) base = 340
+  else if (w <= 225) base = 360
+  else base = 380
+  // rim tweak
+  if (r >= 17) base += 30
+  if (r >= 18) base += 30
+  if (r >= 19) base += 20
+  if (r >= 20) base += 20
+  // clamp
+  base = Math.max(150, Math.min(base, 600))
+  // round to nearest 10
+  return Math.round(base/10)*10
+}
+
+function computeTyreDosageMl(payload) {
+  // Accept either a single size set (tyre_width_mm, aspect_ratio, rim_diameter_in)
+  // or infer count from positions; aspect ratio is not used in table to keep behavior stable.
+  const width = asNum(payload['tyre_width_mm'])
+  const rim = asNum(payload['rim_diameter_in'])
+  const count = inferTyreCountFromPayload(payload) || 4
+  if (!width && !rim) return null
+  const perTyre = recommendPerTyreMl(width||195, rim||15)
+  return perTyre * count
+}
+
 // ------------------------ CREATE (authoritative) -----------------------
-// Saves pricing fields, computes dosage, generates invoice no & customer code.
 app.post('/api/invoices/full', async (req, res) => {
   const client = await pool.connect()
   try {
@@ -448,8 +482,6 @@ app.post('/api/invoices/full', async (req, res) => {
     const qtyColInTable = findCol(cols, qtyCols)
 
     const unitPriceCol = findCol(cols,['mrp_per_ml','price_per_ml','rate_per_ml','mrp_ml']) || (has(cols,'mrp_per_ml') ? 'mrp_per_ml' : null)
-    const installCol = findCol(cols,['installation_cost','install_cost','labour','labour_cost'])
-    const discountCol = findCol(cols,['discount_amount','discount','disc'])
     const beforeCol = findCol(cols,['total_before_gst','subtotal_ex_gst','subtotal','amount_before_tax'])
     const totalCol = findCol(cols,['total_with_gst','total_amount','grand_total','total'])
     const gstCol = findCol(cols,['gst_amount','tax_amount','gst_value'])
@@ -458,74 +490,54 @@ app.post('/api/invoices/full', async (req, res) => {
     const invNoCol = findCol(cols, ['invoice_number','invoice_no','inv_no','bill_no','invoice'])
     const custCodeCol = findCol(cols, ['customer_code','customer_id','customer','cust_code'])
 
-    // Helpers
-    const asNum = (v) => {
-      if (v === null || v === undefined) return null
-      const s = String(v).trim().replace(/[^0-9.+-]/g,'')
-      if (s === '') return null
-      const n = Number(s)
-      return Number.isFinite(n) ? n : null
-    }
     const frId = String(payload[franchiseeCol || 'franchisee_id'] || payload.franchisee_id || '').trim() || 'TS-DL-DEL-001'
-
-    // Numbers: compute next invoice seq (per MMYY) + customer code seq (overall)
     const { invoiceMonthlySeq, customerSeq, mmyy } = await computeNextNumbers(client, cols, frId)
     const printedInvoiceNo = invNoCol ? `${frId}/${pad(invoiceMonthlySeq)}/${mmyy}` : null
     const printedCustomerCode = custCodeCol ? `${frId}-${pad(customerSeq)}` : null
 
-    // Pricing inputs
-    const unitPrice = unitPriceCol ? (asNum(payload[unitPriceCol]) ?? asNum(payload.mrp_per_ml) ?? asNum(payload.price_per_ml)) : (asNum(payload.mrp_per_ml) ?? asNum(payload.price_per_ml))
-    const install = installCol ? (asNum(payload[installCol]) ?? asNum(payload.installation_cost) ?? asNum(payload.install_cost) ?? asNum(payload.labour)) : (asNum(payload.installation_cost) ?? asNum(payload.install_cost) ?? asNum(payload.labour))
-    const discount = discountCol ? (asNum(payload[discountCol]) ?? asNum(payload.discount_amount) ?? asNum(payload.discount) ?? asNum(payload.disc)) : (asNum(payload.discount_amount) ?? asNum(payload.discount) ?? asNum(payload.disc))
+    // ----- DOSAGE: tyre → explicit qty → money (exGST ÷ unitPrice) -----
+    let computedQty = null
 
-    let exBefore = beforeCol ? (asNum(payload[beforeCol]) ?? asNum(payload.total_before_gst) ?? asNum(payload.subtotal_ex_gst) ?? asNum(payload.subtotal) ?? asNum(payload.amount_before_tax)) : (asNum(payload.total_before_gst) ?? asNum(payload.subtotal_ex_gst) ?? asNum(payload.subtotal) ?? asNum(payload.amount_before_tax))
-    if (exBefore == null) {
-      const totalWithGst = totalCol ? (asNum(payload[totalCol]) ?? asNum(payload.total_with_gst) ?? asNum(payload.total_amount) ?? asNum(payload.grand_total) ?? asNum(payload.total)) : (asNum(payload.total_with_gst) ?? asNum(payload.total_amount) ?? asNum(payload.grand_total) ?? asNum(payload.total))
-      const gst = gstCol ? (asNum(payload[gstCol]) ?? asNum(payload.gst_amount) ?? asNum(payload.tax_amount) ?? asNum(payload.gst_value)) : (asNum(payload.gst_amount) ?? asNum(payload.tax_amount) ?? asNum(payload.gst_value))
-      if (totalWithGst != null && gst != null) exBefore = Math.max(totalWithGst - gst, 0)
+    // 1) Tyre-based (preferred)
+    computedQty = computeTyreDosageMl(payload)
+
+    // 2) If explicit qty provided, use that
+    if (computedQty == null) {
+      for (const k of qtyCols) if (payload[k] != null) { const v = asNum(payload[k]); if (v != null) { computedQty = v; break } }
     }
 
-    // Qty preference: if any qty provided, keep it; else compute from (ex - install + discount) / unitPrice
-    let providedQty = null
-    for (const k of qtyCols) if (payload[k] != null) { providedQty = asNum(payload[k]); if (providedQty != null) break }
-    const fallbackUnit = unitPrice ?? Number(process.env.FALLBACK_MRP_PER_ML || 4.5)
-    let computedQty = providedQty
-    if (computedQty == null && exBefore != null) {
-      const productEx = Math.max(exBefore - (install || 0) + (discount || 0), 0)
-      computedQty = fallbackUnit ? (productEx / fallbackUnit) : null
+    // 3) Money fallback: exGST ÷ unitPrice  (no install/discount adjustments)
+    if (computedQty == null) {
+      const unitPrice = unitPriceCol ? (asNum(payload[unitPriceCol]) ?? asNum(payload.mrp_per_ml) ?? asNum(payload.price_per_ml)) : (asNum(payload.mrp_per_ml) ?? asNum(payload.price_per_ml))
+      let exBefore = beforeCol ? (asNum(payload[beforeCol]) ?? asNum(payload.total_before_gst) ?? asNum(payload.subtotal_ex_gst) ?? asNum(payload.subtotal) ?? asNum(payload.amount_before_tax)) : (asNum(payload.total_before_gst) ?? asNum(payload.subtotal_ex_gst) ?? asNum(payload.subtotal) ?? asNum(payload.amount_before_tax))
+      if (exBefore == null) {
+        const totalWithGst = totalCol ? (asNum(payload[totalCol]) ?? asNum(payload.total_with_gst) ?? asNum(payload.total_amount) ?? asNum(payload.grand_total) ?? asNum(payload.total)) : (asNum(payload.total_with_gst) ?? asNum(payload.total_amount) ?? asNum(payload.grand_total) ?? asNum(payload.total))
+        const gst = gstCol ? (asNum(payload[gstCol]) ?? asNum(payload.gst_amount) ?? asNum(payload.tax_amount) ?? asNum(payload.gst_value)) : (asNum(payload.gst_amount) ?? asNum(payload.tax_amount) ?? asNum(payload.gst_value))
+        if (totalWithGst != null && gst != null) exBefore = Math.max(totalWithGst - gst, 0)
+      }
+      const fallbackUnit = unitPrice ?? Number(process.env.FALLBACK_MRP_PER_ML || 4.5)
+      if (exBefore != null && fallbackUnit) computedQty = exBefore / fallbackUnit
     }
 
-    // Build insert payload: map known fields, add generated numbers & dosage
+    // Build insert payload
     const accepted = [
-      // identity
       franchiseeCol || 'franchisee_id',
       invNoCol || 'invoice_number',
       custCodeCol || 'customer_code',
 
-      // customer/vehicle
       'customer_name','customer_gstin','customer_address','vehicle_number','vehicle_no','vehicle','vehicle_type',
       'tyre_count','fitment_locations','installer_name',
-
-      // qty candidates
       ...qtyCols,
-
-      // pricing
       'mrp_per_ml','price_per_ml','rate_per_ml','mrp_ml',
       'installation_cost','install_cost','labour','labour_cost',
       'discount_amount','discount','disc',
       'subtotal_ex_gst','total_before_gst','gst_rate','gst_amount','total_with_gst','total_amount','grand_total','total',
-
-      // tyre / misc
       'tyre_width_mm','aspect_ratio','rim_diameter_in','tread_depth_min_mm','speed_rating',
       'tread_fl_mm','tread_fr_mm','tread_rl_mm','tread_rr_mm',
       'stock_level_at_start_l','site_address_text','hsn_code',
       'referral_code','customer_signature','signed_at','consent_signature','consent_signed_at','gps_lat','gps_lng',
     ]
-
     const insertPayload = {}
-
-    // Copy through provided fields if they exist in DB
-    const colsArr = Array.from(cols)
     for (const key of accepted) {
       if (!key) continue
       if (has(cols, key) && payload[key] !== undefined) insertPayload[key] = payload[key]
@@ -557,7 +569,7 @@ app.post('/api/invoices/full', async (req, res) => {
       id: row?.id ?? row?.invoice_id ?? null,
       invoice_number: row?.[invNoCol || 'invoice_number'] ?? null,
       customer_code: row?.[custCodeCol || 'customer_code'] ?? null,
-      qty_ml_saved: computedQty ?? providedQty ?? null
+      qty_ml_saved: computedQty ?? null
     })
   } catch (err) {
     res.status(400).json({ ok:false, error: err?.message || String(err) })
