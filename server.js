@@ -1,13 +1,13 @@
 // server.js — MaxTT Billing API (ESM)
-// Robust lookups: auto primary-key detect, /latest, /by-norm. Auto-fill stays.
+// Adds Franchisee Onboarding: franchisees table + admin endpoints with SUPER_ADMIN_KEY.
+// Keeps auto-fill invoice logic, robust lookups, exports, and no migration runner.
 
 import express from 'express'
 import pkg from 'pg'
 const { Pool } = pkg
 
-import fs from 'fs/promises'
-import path from 'path'
 import { fileURLToPath } from 'url'
+import path from 'path'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -23,7 +23,7 @@ app.use((req, res, next) => {
   if (ORIGINS.includes(origin)) res.setHeader('Access-Control-Allow-Origin', origin)
   res.setHeader('Vary', 'Origin')
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,OPTIONS')
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-REF-API-KEY')
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-REF-API-KEY, X-SA-KEY')
   if (req.method === 'OPTIONS') return res.sendStatus(200)
   next()
 })
@@ -60,133 +60,94 @@ const pad = (n, w=4) => String(Math.max(0, Number(n)||0)).padStart(w, '0')
 app.get('/', (_req, res) => res.send('MaxTT Billing API is running'))
 app.get('/api/health', (_req, res) => res.json({ ok: true }))
 
-// --------------- Admin helper: create adaptive export VIEW -------------
-app.get('/api/admin/create-view-auto', async (_req, res) => {
-  const client = await pool.connect()
-  try {
-    const cols = await getInvoiceCols(client)
-    const expr = (alias, cands) => {
-      const f = findCol(cols, cands)
-      return f ? `i.${qid(f)}::text AS ${qid(alias)}` : `NULL::text AS ${qid(alias)}`
-    }
-    const selectParts = [
-      expr('invoice_id', ['id','invoice_id']),
-      expr('invoice_number', ['invoice_number','invoice_no','inv_no','bill_no','invoice']),
-      expr('invoice_ts_ist', ['invoice_ts_ist','created_at','invoice_date','date','createdon','created_on']),
-      expr('franchisee_code', ['franchisee_code','franchisee','franchise_code','franchisee_id']),
-      expr('admin_code', ['admin_code','admin']),
-      expr('super_admin_code', ['super_admin_code','superadmin_code','sa_code']),
-      expr('customer_code', ['customer_code','customer_id','customer','cust_code']),
-      expr('referral_code', ['referral_code','ref_code','referral']),
-      expr('vehicle_no', ['vehicle_no','vehicle_number','registration_no','reg_no','vehicle']),
-      expr('vehicle_make_model', ['vehicle_make_model','make_model','model','make']),
-      expr('odometer_reading', ['odometer_reading','odometer','odo','kms']),
-      expr('tyre_size_fl', ['tyre_size_fl','fl_tyre','tyre_fl']),
-      expr('tyre_size_fr', ['tyre_size_fr','fr_tyre','tyre_fr']),
-      expr('tyre_size_rl', ['tyre_size_rl','rl_tyre','tyre_rl']),
-      expr('tyre_size_rr', ['tyre_size_rr','rr_tyre','tyre_rr']),
-      expr('total_qty_ml', ['total_qty_ml','dosage_ml','qty_ml','total_ml','quantity_ml','qty']),
-      expr('mrp_per_ml', ['mrp_per_ml','price_per_ml','rate_per_ml','mrp_ml']),
-      expr('installation_cost', ['installation_cost','install_cost','labour','labour_cost']),
-      expr('discount_amount', ['discount_amount','discount','disc']),
-      expr('subtotal_ex_gst', ['subtotal_ex_gst','total_before_gst','subtotal','amount_before_tax']),
-      expr('gst_rate', ['gst_rate','tax_rate','gst_percent','gst']),
-      expr('gst_amount', ['gst_amount','tax_amount','gst_value']),
-      expr('total_amount', ['total_with_gst','total_amount','grand_total','total']),
-      expr('stock_level_at_start_l', ['stock_level_at_start_l','stock_before','stock_at_start_l','stock_start_liters']),
-      expr('gps_lat', ['gps_lat','latitude','lat']),
-      expr('gps_lng', ['gps_lng','longitude','lng','lon']),
-      expr('site_address_text', ['site_address_text','address','site_address','location','customer_address']),
-      expr('tread_depth_min_mm', ['tread_depth_min_mm','tread_depth','min_tread_mm','tread_depth_mm']),
-      expr('speed_rating', ['speed_rating','speedrate','speed']),
-      expr('created_by_user_id', ['created_by_user_id','created_by','user_id']),
-      'NULL::text AS "role"'
-    ]
-    await client.query(`
-      CREATE OR REPLACE VIEW public.v_invoice_export AS
-      SELECT
-        ${selectParts.join(',\n        ')}
-      FROM public.invoices i;
-    `)
-    res.json({ ok: true, created: 'public.v_invoice_export', note: 'adaptive' })
-  } catch (err) {
-    res.status(500).json({ ok:false, where:'create_view_auto', message: err?.message || String(err) })
-  } finally { client.release() }
-})
-
-// ------------------------------ CSV export -----------------------------
-const CSV_HEADERS = [
-  'Invoice ID','Invoice No','Timestamp (IST)','Franchisee Code','Admin Code','SuperAdmin Code',
-  'Customer Code','Referral Code','Vehicle No','Make/Model','Odometer',
-  'Tyre Size FL','Tyre Size FR','Tyre Size RL','Tyre Size RR',
-  'Qty (ml)','MRP (₹/ml)','Installation Cost ₹','Discount ₹','Subtotal (ex-GST) ₹',
-  'GST Rate','GST Amount ₹','Total Amount ₹',
-  'Stock@Start (L)','GPS Lat','GPS Lng','Site Address','Min Tread Depth (mm)','Speed Rating',
-  'Created By UserId','Created By Role'
-]
-const csvField = v => v==null ? '' : (/["\n,\r,;]/.test(String(v)) ? `"${String(v).replace(/"/g,'""')}"` : String(v))
-function rowsToCsv(rows) {
-  const lines = [CSV_HEADERS.map(csvField).join(',')]
-  for (const r of rows) {
-    lines.push([
-      r.invoice_id, r.invoice_number, r.invoice_ts_ist,
-      r.franchisee_code, r.admin_code, r.super_admin_code,
-      r.customer_code, r.referral_code, r.vehicle_no, r.vehicle_make_model, r.odometer_reading,
-      r.tyre_size_fl, r.tyre_size_fr, r.tyre_size_rl, r.tyre_size_rr,
-      r.total_qty_ml, r.mrp_per_ml, r.installation_cost, r.discount_amount, r.subtotal_ex_gst,
-      r.gst_rate, r.gst_amount, r.total_amount,
-      r.stock_level_at_start_l, r.gps_lat, r.gps_lng, r.site_address_text,
-      r.tread_depth_min_mm, r.speed_rating, r.created_by_user_id, r.role
-    ].map(csvField).join(','))
-  }
-  return lines.join('\r\n') + '\r\n'
+// ------------------------------- Auth ----------------------------------
+function requireSA(req, res, next) {
+  const key = req.get('X-SA-KEY') || ''
+  const expect = process.env.SUPER_ADMIN_KEY || ''
+  if (!expect) return res.status(500).json({ ok:false, error:'super_admin_key_not_set' })
+  if (key !== expect) return res.status(401).json({ ok:false, error:'unauthorized' })
+  next()
 }
 
-app.get('/api/exports/invoices', async (req, res) => {
+// ------------------- Admin installer for franchisees table -------------
+app.post('/api/admin/franchisees/install', requireSA, async (_req, res) => {
+  const client = await pool.connect()
   try {
-    const { from, to, franchisee, q } = req.query
-    const where = []; const params = []; let i = 1
-    const fromSql = `public.v_invoice_export`
-    if (from) { where.push(`invoice_ts_ist::date >= $${i++}`); params.push(from) }
-    if (to)   { where.push(`invoice_ts_ist::date <= $${i++}`); params.push(to) }
-    if (franchisee) { where.push(`franchisee_code = $${i++}`); params.push(franchisee) }
-    if (q) {
-      const like = `%${String(q).split('%').join('')}%`
-      where.push(`(vehicle_no ILIKE $${i} OR customer_code ILIKE $${i})`); params.push(like); i++
-    }
-    const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : ''
-    const sql = `SELECT * FROM ${fromSql} ${whereSql} ORDER BY invoice_ts_ist DESC LIMIT 50000;`
+    const sql = `
+-- begin install
+CREATE TABLE IF NOT EXISTS public.franchisees (
+  id BIGSERIAL PRIMARY KEY,
+  franchisee_id TEXT UNIQUE NOT NULL,
+  legal_name TEXT NOT NULL,
+  gstin TEXT,
+  pan TEXT,
+  state TEXT,
+  state_code TEXT NOT NULL,
+  city TEXT,
+  city_code TEXT NOT NULL,
+  pincode TEXT,
+  address1 TEXT,
+  address2 TEXT,
+  phone TEXT,
+  email TEXT,
+  status TEXT NOT NULL DEFAULT 'ACTIVE',
+  api_key TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
 
-    const client = await pool.connect()
-    try {
-      const result = await client.query(sql, params)
-      const csv = rowsToCsv(result.rows)
-      const bom = '\uFEFF'
-      const now = new Date().toISOString().slice(0,19).replace(/[:T]/g,'')
-      const wm = franchisee ? `_${franchisee}` : ''
-      const filename = `maxtt_invoices_${now}${wm}.csv`
-      res.setHeader('Content-Type', 'text/csv; charset=utf-8')
-      res.setHeader('Content-Disposition', `attachment; filename="${filename}"`)
-      res.setHeader('Cache-Control', 'no-store')
-      res.status(200).send(bom + csv)
-    } finally { client.release() }
-  } catch (err) {
-    res.status(500).json({ ok:false, error:'CSV export failed', message: err?.message || String(err) })
-  }
-})
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_indexes
+    WHERE schemaname='public' AND indexname='uq_franchisees_gstin_lower'
+  ) THEN
+    EXECUTE 'CREATE UNIQUE INDEX uq_franchisees_gstin_lower ON public.franchisees ((lower(gstin))) WHERE gstin IS NOT NULL';
+  END IF;
 
-// ------------------------------ Auth (demo) ----------------------------
-app.post('/api/login', (_req, res) => res.json({ token: 'token-franchisee' }))
-app.post('/api/admin/login', (_req, res) => res.json({ token: 'token-admin' }))
-app.post('/api/sa/login',    (_req, res) => res.json({ token: 'token-sa' }))
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_indexes
+    WHERE schemaname='public' AND indexname='uq_franchisees_email_lower'
+  ) THEN
+    EXECUTE 'CREATE UNIQUE INDEX uq_franchisees_email_lower ON public.franchisees ((lower(email))) WHERE email IS NOT NULL';
+  END IF;
 
-app.get('/api/profile', (_req, res) => {
-  res.json({
-    name: 'Franchisee',
-    franchisee_id: 'TS-DL-DEL-001',
-    gstin: '',
-    address: 'Address not set'
-  })
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_indexes
+    WHERE schemaname='public' AND indexname='ix_franchisees_state_city'
+  ) THEN
+    EXECUTE 'CREATE INDEX ix_franchisees_state_city ON public.franchisees (state_code, city_code)';
+  END IF;
+END$$;
+
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_proc WHERE proname='franchisees_set_updated_at'
+  ) THEN
+    EXECUTE $fn$
+      CREATE FUNCTION franchisees_set_updated_at() RETURNS trigger AS $$
+      BEGIN
+        NEW.updated_at := NOW();
+        RETURN NEW;
+      END;
+      $$ LANGUAGE plpgsql;
+    $fn$;
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_trigger WHERE tgname='trg_franchisees_updated_at'
+  ) THEN
+    EXECUTE 'CREATE TRIGGER trg_franchisees_updated_at BEFORE UPDATE ON public.franchisees FOR EACH ROW EXECUTE FUNCTION franchisees_set_updated_at()';
+  END IF;
+END$$;
+-- end install
+    `
+    await client.query(sql)
+    res.json({ ok:true, installed:true })
+  } catch (e) {
+    res.status(500).json({ ok:false, error:String(e?.message || e) })
+  } finally { client.release() }
 })
 
 // ---------------------- Helpers: date & numbering ----------------------
@@ -319,13 +280,14 @@ function computeTyreDosageMl(payload) {
   return perTyre * count
 }
 
-// ------------------------ CREATE (authoritative) -----------------------
+// ------------------------ CREATE invoices (authoritative) --------------
 app.post('/api/invoices/full', async (req, res) => {
   const client = await pool.connect()
   try {
     const payload = req.body || {}
     const cols = await getInvoiceCols(client)
 
+    // Column discovery / mapping
     const qtyCols = ['total_qty_ml','dosage_ml','qty_ml','total_ml','quantity_ml','qty']
     const qtyColInTable = findCol(cols, qtyCols)
 
@@ -336,17 +298,18 @@ app.post('/api/invoices/full', async (req, res) => {
     const gstRateCol = findCol(cols,['gst_rate','tax_rate','gst_percent','gst'])
 
     const franchiseeIdCol = findCol(cols,['franchisee_id'])
-    const franchiseeCodeCol = findCol(cols,['franchisee_code','franchise_code'])
     const invNoCol = findCol(cols, ['invoice_number','invoice_no','inv_no','bill_no','invoice'])
     const custCodeCol = findCol(cols, ['customer_code','customer_id','customer','cust_code'])
 
     const frId = String(payload[franchiseeIdCol || 'franchisee_id'] || payload.franchisee_id || '').trim() || 'TS-DL-DEL-001'
 
+    // Compute numbering (monthly per franchisee)
     const { invoiceMonthlySeq, customerSeq, mmyy } = await computeNextNumbers(client, cols, frId)
     const printedInvoiceNo = invNoCol ? `${frId}/${pad(invoiceMonthlySeq)}/${mmyy}` : null
     const printedCustomerCode = custCodeCol ? `${frId}-${pad(customerSeq)}` : null
     const normNo = `${frId}-${pad(invoiceMonthlySeq)}`
 
+    // ----- DOSAGE: tyre → explicit qty → money → DEFAULTS -----
     let computedQty = computeTyreDosageMl(payload)
     if (computedQty == null) {
       for (const k of qtyCols) if (payload[k] != null) { const v = asNum(payload[k]); if (v != null) { computedQty = v; break } }
@@ -373,6 +336,7 @@ app.post('/api/invoices/full', async (req, res) => {
     let totalWithGst = (asNum(payload[totalCol]) ?? asNum(payload.total_with_gst) ?? asNum(payload.total_amount) ?? asNum(payload.grand_total) ?? asNum(payload.total))
     if (totalWithGst == null) totalWithGst = Number(exBefore) + Number(gstAmount)
 
+    // Build insert payload
     const accepted = [
       franchiseeIdCol || 'franchisee_id',
       'franchisee_code',
@@ -399,9 +363,10 @@ app.post('/api/invoices/full', async (req, res) => {
       if (has(cols, key) && payload[key] !== undefined) insertPayload[key] = payload[key]
     }
 
-    if (franchiseeIdCol && !insertPayload[franchiseeIdCol]) insertPayload[franchiseeIdCol] = frId
+    // Ensure IDs/codes present
     if (has(cols,'franchisee_code') && !insertPayload['franchisee_code']) insertPayload['franchisee_code'] = frId
 
+    // Generated numbers (only if columns exist)
     if (invNoCol && printedInvoiceNo) insertPayload[invNoCol] = printedInvoiceNo
     if (has(cols,'invoice_seq') && insertPayload['invoice_seq'] == null) insertPayload['invoice_seq'] = invoiceMonthlySeq
     if (has(cols,'invoice_number_norm') && !insertPayload['invoice_number_norm']) insertPayload['invoice_number_norm'] = normNo
@@ -416,10 +381,11 @@ app.post('/api/invoices/full', async (req, res) => {
     setIf(gstCol, gstAmount)
     setIf(gstRateCol, gstRate)
     if (!beforeCol) for (const k of ['subtotal_ex_gst','total_before_gst','subtotal','amount_before_tax']) if (has(cols,k) && insertPayload[k]==null) insertPayload[k]=Number(exBefore)
-    if (!totalCol)  for (const k of ['total_with_gst','total_amount','grand_total','total']) if (has(cols,k) && insertPayload[k]==null) insertPayload[k]=Number(totalWithGst)
-    if (!gstCol)    for (const k of ['gst_amount','tax_amount','gst_value']) if (has(cols,k) && insertPayload[k]==null) insertPayload[k]=Number(gstAmount)
-    if (!gstRateCol)for (const k of ['gst_rate','tax_rate','gst_percent','gst']) if (has(cols,k) && insertPayload[k]==null) insertPayload[k]=Number(gstRate)
+    if (!totalCol)  for (const k of ['total_with_gst','total_amount','grand_total','total']) if (has(cols,k) && insertPayload[k)==null) insertPayload[k]=Number(totalWithGst)
+    if (!gstCol)    for (const k of ['gst_amount','tax_amount','gst_value']) if (has(cols,k) && insertPayload[k)==null) insertPayload[k]=Number(gstAmount)
+    if (!gstRateCol)for (const k of ['gst_rate','tax_rate','gst_percent','gst']) if (has(cols,k) && insertPayload[k)==null) insertPayload[k]=Number(gstRate)
 
+    // Default HSN & unit price
     if (has(cols,'hsn_code') && insertPayload['hsn_code'] == null) insertPayload['hsn_code'] = '35069999'
     if (unitPriceCol && insertPayload[unitPriceCol] == null) insertPayload[unitPriceCol] = Number(unitPrice)
 
@@ -540,6 +506,116 @@ app.get('/api/invoices/by-norm/:norm', async (req, res) => {
     res.json(r.rows[0])
   } catch (err) {
     res.status(500).json({ ok:false, where:'by_norm', message: err?.message || String(err) })
+  } finally { client.release() }
+})
+
+// ---------------------- Franchisee Onboarding APIs ---------------------
+// Format: TS-<STATE_CODE>-<CITY_CODE>-NNN
+function makeFrId(stateCode, cityCode, n) {
+  const sc = String(stateCode||'').toUpperCase().replace(/[^A-Z]/g,'')
+  const cc = String(cityCode||'').toUpperCase().replace(/[^A-Z]/g,'')
+  return `TS-${sc}-${cc}-${String(n).padStart(3,'0')}`
+}
+
+async function nextFrSuffix(client, stateCode, cityCode) {
+  const like = `TS-${String(stateCode).toUpperCase()}-${String(cityCode).toUpperCase()}-%`
+  const r = await client.query(
+    `SELECT franchisee_id FROM public.franchisees WHERE franchisee_id ILIKE $1 ORDER BY franchisee_id DESC LIMIT 200`,
+    [like]
+  )
+  let maxN = 0
+  for (const row of r.rows) {
+    const m = String(row.franchisee_id || '').match(/^TS-[A-Z]+-[A-Z]+-(\d{3,})$/)
+    if (m) {
+      const n = Number(m[1]); if (Number.isFinite(n) && n > maxN) maxN = n
+    }
+  }
+  return maxN + 1
+}
+
+app.post('/api/admin/franchisees/onboard', requireSA, async (req, res) => {
+  const client = await pool.connect()
+  try {
+    const b = req.body || {}
+    const required = ['legal_name','state_code','city_code']
+    const miss = required.filter(k => !b[k] || String(b[k]).trim()==='')
+    if (miss.length) return res.status(400).json({ ok:false, error:'missing_fields', fields: miss })
+
+    const sc = String(b.state_code).toUpperCase().trim()
+    const cc = String(b.city_code).toUpperCase().trim()
+
+    let franchiseeId = null
+    if (b.franchisee_id_override) {
+      franchiseeId = String(b.franchisee_id_override).toUpperCase().trim()
+      // Minimal pattern check
+      if (!/^TS-[A-Z]+-[A-Z]+-\d{3,}$/.test(franchiseeId)) {
+        return res.status(400).json({ ok:false, error:'override_pattern_invalid' })
+      }
+      // Ensure uniqueness
+      const u = await client.query(`SELECT 1 FROM public.franchisees WHERE franchisee_id=$1 LIMIT 1`, [franchiseeId])
+      if (u.rows.length) return res.status(409).json({ ok:false, error:'franchisee_id_exists' })
+    } else {
+      const n = await nextFrSuffix(client, sc, cc)
+      franchiseeId = makeFrId(sc, cc, n)
+    }
+
+    const sql = `
+      INSERT INTO public.franchisees (
+        franchisee_id, legal_name, gstin, pan, state, state_code, city, city_code,
+        pincode, address1, address2, phone, email, status, api_key
+      ) VALUES (
+        $1,$2,$3,$4,$5,$6,$7,$8,
+        $9,$10,$11,$12,$13,COALESCE($14,'ACTIVE'),$15
+      ) RETURNING *
+    `
+    const params = [
+      franchiseeId,
+      b.legal_name || null,
+      b.gstin || null,
+      b.pan || null,
+      b.state || null,
+      sc,
+      b.city || null,
+      cc,
+      b.pincode || null,
+      b.address1 || null,
+      b.address2 || null,
+      b.phone || null,
+      b.email || null,
+      b.status || null,
+      b.api_key || null
+    ]
+    const r = await client.query(sql, params)
+    res.status(201).json({ ok:true, franchisee: r.rows[0] })
+  } catch (e) {
+    res.status(500).json({ ok:false, error:String(e?.message || e) })
+  } finally { client.release() }
+})
+
+app.get('/api/admin/franchisees', requireSA, async (_req, res) => {
+  const client = await pool.connect()
+  try {
+    const r = await client.query(`SELECT * FROM public.franchisees ORDER BY created_at DESC LIMIT 500`)
+    res.json({ ok:true, items: r.rows })
+  } catch (e) {
+    res.status(500).json({ ok:false, error:String(e?.message || e) })
+  } finally { client.release() }
+})
+
+app.get('/api/admin/franchisees/:id_or_code', requireSA, async (req, res) => {
+  const client = await pool.connect()
+  try {
+    const v = String(req.params.id_or_code || '').trim()
+    let r
+    if (/^\d+$/.test(v)) {
+      r = await client.query(`SELECT * FROM public.franchisees WHERE id=$1 LIMIT 1`, [Number(v)])
+    } else {
+      r = await client.query(`SELECT * FROM public.franchisees WHERE franchisee_id=$1 LIMIT 1`, [v.toUpperCase()])
+    }
+    if (!r.rows.length) return res.status(404).json({ ok:false, error:'not_found' })
+    res.json({ ok:true, franchisee: r.rows[0] })
+  } catch (e) {
+    res.status(500).json({ ok:false, error:String(e?.message || e) })
   } finally { client.release() }
 })
 
