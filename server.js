@@ -1,8 +1,9 @@
 // server.js — MaxTT Billing API (ESM)
-// Franchisee Onboarding v2:
+// Franchisee Onboarding v2.1 (password legacy-safe):
 // - Admin creates (PENDING_APPROVAL) using X-ADMIN-KEY
 // - Super Admin approves (ACTIVE) using X-SA-KEY
-// - Self-healing DB (incl. legacy `code` column), audit/payment fields
+// - Self-healing DB incl. legacy `code` and `password` columns
+// - Backfills password and sets during onboard if column exists
 // - Existing invoice endpoints preserved
 
 import express from 'express'
@@ -95,6 +96,7 @@ app.post('/api/admin/franchisees/install', requireSA, async (_req, res) => {
 
     await add('franchisee_id', 'TEXT')
     await add('code', 'TEXT') // legacy support
+    await add('password', 'TEXT') // legacy support (newly handled)
     await add('legal_name', 'TEXT')
     await add('gstin', 'TEXT')
     await add('pan', 'TEXT')
@@ -107,7 +109,7 @@ app.post('/api/admin/franchisees/install', requireSA, async (_req, res) => {
     await add('address2', 'TEXT')
     await add('phone', 'TEXT')
     await add('email', 'TEXT')
-    await add('status', 'TEXT') // 'PENDING_APPROVAL' or 'ACTIVE'
+    await add('status', 'TEXT') // will be 'PENDING_APPROVAL' or 'ACTIVE'
     await add('api_key', 'TEXT')
     await add('created_at', 'TIMESTAMPTZ DEFAULT NOW()')
     await add('updated_at', 'TIMESTAMPTZ DEFAULT NOW()')
@@ -123,21 +125,22 @@ app.post('/api/admin/franchisees/install', requireSA, async (_req, res) => {
     await add('payment_ref', 'TEXT')
     await add('remarks', 'TEXT')
 
-    // Relax NOT NULL (legacy)
+    // Relax NOT NULL (legacy DBs), ignore failure
     try { await client.query(`ALTER TABLE public.franchisees ALTER COLUMN code DROP NOT NULL;`) } catch {}
+    try { await client.query(`ALTER TABLE public.franchisees ALTER COLUMN password DROP NOT NULL;`) } catch {}
     try { await client.query(`ALTER TABLE public.franchisees ALTER COLUMN legal_name DROP NOT NULL;`) } catch {}
 
-    // 2) franchisee_id NOT NULL + unique
+    // 2) Make franchisee_id NOT NULL + unique safely
     await client.query(`UPDATE public.franchisees SET franchisee_id = CONCAT('TS-UNK-UNK-', LPAD(id::text,3,'0')) WHERE franchisee_id IS NULL;`)
     await client.query(`ALTER TABLE public.franchisees ALTER COLUMN franchisee_id SET NOT NULL;`)
     await client.query(`CREATE UNIQUE INDEX IF NOT EXISTS uq_franchisees_id ON public.franchisees (franchisee_id);`)
 
-    // 3) Helpful unique & indexes
+    // 3) Helpful uniques / indexes (idempotent)
     await client.query(`CREATE UNIQUE INDEX IF NOT EXISTS uq_franchisees_gstin_lower ON public.franchisees ((lower(gstin))) WHERE gstin IS NOT NULL;`)
     await client.query(`CREATE UNIQUE INDEX IF NOT EXISTS uq_franchisees_email_lower ON public.franchisees ((lower(email))) WHERE email IS NOT NULL;`)
     await client.query(`CREATE INDEX IF NOT EXISTS ix_franchisees_state_city ON public.franchisees (state_code, city_code);`)
 
-    // 4) updated_at trigger
+    // 4) updated_at trigger function + trigger
     await client.query(`
       CREATE OR REPLACE FUNCTION franchisees_set_updated_at() RETURNS trigger AS $$
       BEGIN
@@ -153,8 +156,9 @@ app.post('/api/admin/franchisees/install', requireSA, async (_req, res) => {
       FOR EACH ROW EXECUTE FUNCTION franchisees_set_updated_at();
     `)
 
-    // 5) Backfill legacy "code"
+    // 5) Backfill legacy "code" and "password"
     await client.query(`UPDATE public.franchisees SET code = franchisee_id WHERE code IS NULL;`)
+    await client.query(`UPDATE public.franchisees SET password = COALESCE(api_key, franchisee_id) WHERE password IS NULL;`)
 
     await client.query('COMMIT')
     res.json({ ok:true, installed:true })
@@ -253,7 +257,6 @@ function asNum(v) {
   const n = Number(s)
   return Number.isFinite(n) ? n : null
 }
-
 function inferTyreCountFromPayload(p) {
   let count = 0
   const have = (k) => p[k] != null && String(p[k]).trim() !== ''
@@ -562,27 +565,35 @@ app.post('/api/admin/franchisees/onboard', requireAdmin, async (req, res) => {
       franchiseeId = makeFrId(sc, cc, n)
     }
 
-    // Does table have legacy `code` column?
-    const hasCodeCol = await client.query(`
-      SELECT 1 FROM information_schema.columns
-      WHERE table_schema='public' AND table_name='franchisees' AND column_name='code' LIMIT 1
+    // Does table have legacy `code`/`password` columns?
+    const meta = await client.query(`
+      SELECT column_name
+      FROM information_schema.columns
+      WHERE table_schema='public' AND table_name='franchisees' AND column_name IN ('code','password')
     `)
-    const includeCode = hasCodeCol.rowCount > 0
+    const names = new Set(meta.rows.map(r => r.column_name))
+    const includeCode = names.has('code')
+    const includePassword = names.has('password')
 
     const onboardedBy = (req.get('X-ADMIN-USER') || b.onboarded_by || 'admin').trim() || 'admin'
     const nowIso = new Date().toISOString()
+    const passwordVal = b.password || b.api_key || franchiseeId
 
-    // --- FIXED: Placeholder count now matches columns (remarks included) ---
+    // Build dynamic columns & placeholders for legacy safety
+    const cols = [
+      includeCode ? 'code' : null,
+      'franchisee_id','legal_name','gstin','pan','state','state_code','city','city_code',
+      'pincode','address1','address2','phone','email','status','api_key',
+      'onboarded_by','onboarded_at','onboard_fee_amount','advance_amount','payment_mode','payment_ref','remarks',
+      includePassword ? 'password' : null
+    ].filter(Boolean)
+
+    const placeholders = cols.map((_,i)=>`$${i+1}`)
+
     const sql = `
-      INSERT INTO public.franchisees (
-        ${includeCode ? 'code,' : ''} franchisee_id, legal_name, gstin, pan, state, state_code, city, city_code,
-        pincode, address1, address2, phone, email, status, api_key,
-        onboarded_by, onboarded_at, onboard_fee_amount, advance_amount, payment_mode, payment_ref, remarks
-      ) VALUES (
-        ${includeCode ? '$1,' : ''} $${includeCode?2:1},$${includeCode?3:2},$${includeCode?4:3},$${includeCode?5:4},$${includeCode?6:5},$${includeCode?7:6},$${includeCode?8:7},
-        $${includeCode?9:8},$${includeCode?10:9},$${includeCode?11:10},$${includeCode?12:11},$${includeCode?13:12},'PENDING_APPROVAL',$${includeCode?14:13},
-        $${includeCode?15:14},$${includeCode?16:15},$${includeCode?17:16},$${includeCode?18:17},$${includeCode?19:18},$${includeCode?20:19},$${includeCode?21:20},$${includeCode?22:21}
-      ) RETURNING *
+      INSERT INTO public.franchisees (${cols.map(qid).join(',')})
+      VALUES (${placeholders.join(',')})
+      RETURNING *
     `
     const params = [
       ...(includeCode ? [franchiseeId] : []),
@@ -599,6 +610,7 @@ app.post('/api/admin/franchisees/onboard', requireAdmin, async (req, res) => {
       b.address2 || null,
       b.phone || null,
       b.email || null,
+      'PENDING_APPROVAL',
       b.api_key || null,
       onboardedBy,
       nowIso,
@@ -607,7 +619,9 @@ app.post('/api/admin/franchisees/onboard', requireAdmin, async (req, res) => {
       b.payment_mode ?? null,
       b.payment_ref ?? null,
       b.remarks ?? null,
+      ...(includePassword ? [passwordVal] : [])
     ]
+
     const r = await client.query(sql, params)
     res.status(201).json({ ok:true, franchisee: r.rows[0] })
   } catch (e) {
