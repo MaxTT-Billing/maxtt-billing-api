@@ -51,9 +51,6 @@ async function getInvoiceCols(client) {
 const has = (cols, n) => cols.has(String(n).toLowerCase())
 const qid = (n) => `"${n}"`
 function findCol(cols, candidates) { for (const c of candidates) if (has(cols, c)) return c; return null }
-function cleanNumericSql(expr) {
-  return `NULLIF(regexp_replace(trim(${expr}::text),'[^0-9.+-]','','g'),'')::numeric`
-}
 const pad = (n, w=4) => String(Math.max(0, Number(n)||0)).padStart(w, '0')
 
 // ------------------------------- Health --------------------------------
@@ -74,7 +71,6 @@ app.post('/api/admin/franchisees/install', requireSA, async (_req, res) => {
   const client = await pool.connect()
   try {
     const sql = `
--- begin install
 CREATE TABLE IF NOT EXISTS public.franchisees (
   id BIGSERIAL PRIMARY KEY,
   franchisee_id TEXT UNIQUE NOT NULL,
@@ -141,7 +137,6 @@ BEGIN
     EXECUTE 'CREATE TRIGGER trg_franchisees_updated_at BEFORE UPDATE ON public.franchisees FOR EACH ROW EXECUTE FUNCTION franchisees_set_updated_at()';
   END IF;
 END$$;
--- end install
     `
     await client.query(sql)
     res.json({ ok:true, installed:true })
@@ -287,7 +282,6 @@ app.post('/api/invoices/full', async (req, res) => {
     const payload = req.body || {}
     const cols = await getInvoiceCols(client)
 
-    // Column discovery / mapping
     const qtyCols = ['total_qty_ml','dosage_ml','qty_ml','total_ml','quantity_ml','qty']
     const qtyColInTable = findCol(cols, qtyCols)
 
@@ -303,16 +297,19 @@ app.post('/api/invoices/full', async (req, res) => {
 
     const frId = String(payload[franchiseeIdCol || 'franchisee_id'] || payload.franchisee_id || '').trim() || 'TS-DL-DEL-001'
 
-    // Compute numbering (monthly per franchisee)
     const { invoiceMonthlySeq, customerSeq, mmyy } = await computeNextNumbers(client, cols, frId)
     const printedInvoiceNo = invNoCol ? `${frId}/${pad(invoiceMonthlySeq)}/${mmyy}` : null
     const printedCustomerCode = custCodeCol ? `${frId}-${pad(customerSeq)}` : null
     const normNo = `${frId}-${pad(invoiceMonthlySeq)}`
 
-    // ----- DOSAGE: tyre → explicit qty → money → DEFAULTS -----
     let computedQty = computeTyreDosageMl(payload)
     if (computedQty == null) {
-      for (const k of qtyCols) if (payload[k] != null) { const v = asNum(payload[k]); if (v != null) { computedQty = v; break } }
+      for (const k of qtyCols) {
+        if (payload[k] != null) {
+          const v = asNum(payload[k])
+          if (v != null) { computedQty = v; break }
+        }
+      }
     }
 
     const envDefaultQty = Number(process.env.DEFAULT_QTY_ML || 1200)
@@ -336,7 +333,6 @@ app.post('/api/invoices/full', async (req, res) => {
     let totalWithGst = (asNum(payload[totalCol]) ?? asNum(payload.total_with_gst) ?? asNum(payload.total_amount) ?? asNum(payload.grand_total) ?? asNum(payload.total))
     if (totalWithGst == null) totalWithGst = Number(exBefore) + Number(gstAmount)
 
-    // Build insert payload
     const accepted = [
       franchiseeIdCol || 'franchisee_id',
       'franchisee_code',
@@ -363,10 +359,8 @@ app.post('/api/invoices/full', async (req, res) => {
       if (has(cols, key) && payload[key] !== undefined) insertPayload[key] = payload[key]
     }
 
-    // Ensure IDs/codes present
     if (has(cols,'franchisee_code') && !insertPayload['franchisee_code']) insertPayload['franchisee_code'] = frId
 
-    // Generated numbers (only if columns exist)
     if (invNoCol && printedInvoiceNo) insertPayload[invNoCol] = printedInvoiceNo
     if (has(cols,'invoice_seq') && insertPayload['invoice_seq'] == null) insertPayload['invoice_seq'] = invoiceMonthlySeq
     if (has(cols,'invoice_number_norm') && !insertPayload['invoice_number_norm']) insertPayload['invoice_number_norm'] = normNo
@@ -380,12 +374,28 @@ app.post('/api/invoices/full', async (req, res) => {
     setIf(totalCol, totalWithGst)
     setIf(gstCol, gstAmount)
     setIf(gstRateCol, gstRate)
-    if (!beforeCol) for (const k of ['subtotal_ex_gst','total_before_gst','subtotal','amount_before_tax']) if (has(cols,k) && insertPayload[k]==null) insertPayload[k]=Number(exBefore)
-    if (!totalCol)  for (const k of ['total_with_gst','total_amount','grand_total','total']) if (has(cols,k) && insertPayload[k)==null) insertPayload[k]=Number(totalWithGst)
-    if (!gstCol)    for (const k of ['gst_amount','tax_amount','gst_value']) if (has(cols,k) && insertPayload[k)==null) insertPayload[k]=Number(gstAmount)
-    if (!gstRateCol)for (const k of ['gst_rate','tax_rate','gst_percent','gst']) if (has(cols,k) && insertPayload[k)==null) insertPayload[k]=Number(gstRate)
 
-    // Default HSN & unit price
+    if (!beforeCol) {
+      for (const k of ['subtotal_ex_gst','total_before_gst','subtotal','amount_before_tax']) {
+        if (has(cols,k) && insertPayload[k] == null) insertPayload[k] = Number(exBefore)
+      }
+    }
+    if (!totalCol) {
+      for (const k of ['total_with_gst','total_amount','grand_total','total']) {
+        if (has(cols,k) && insertPayload[k] == null) insertPayload[k] = Number(totalWithGst)
+      }
+    }
+    if (!gstCol) {
+      for (const k of ['gst_amount','tax_amount','gst_value']) {
+        if (has(cols,k) && insertPayload[k] == null) insertPayload[k] = Number(gstAmount)
+      }
+    }
+    if (!gstRateCol) {
+      for (const k of ['gst_rate','tax_rate','gst_percent','gst']) {
+        if (has(cols,k) && insertPayload[k] == null) insertPayload[k] = Number(gstRate)
+      }
+    }
+
     if (has(cols,'hsn_code') && insertPayload['hsn_code'] == null) insertPayload['hsn_code'] = '35069999'
     if (unitPriceCol && insertPayload[unitPriceCol] == null) insertPayload[unitPriceCol] = Number(unitPrice)
 
@@ -510,7 +520,6 @@ app.get('/api/invoices/by-norm/:norm', async (req, res) => {
 })
 
 // ---------------------- Franchisee Onboarding APIs ---------------------
-// Format: TS-<STATE_CODE>-<CITY_CODE>-NNN
 function makeFrId(stateCode, cityCode, n) {
   const sc = String(stateCode||'').toUpperCase().replace(/[^A-Z]/g,'')
   const cc = String(cityCode||'').toUpperCase().replace(/[^A-Z]/g,'')
@@ -547,11 +556,9 @@ app.post('/api/admin/franchisees/onboard', requireSA, async (req, res) => {
     let franchiseeId = null
     if (b.franchisee_id_override) {
       franchiseeId = String(b.franchisee_id_override).toUpperCase().trim()
-      // Minimal pattern check
       if (!/^TS-[A-Z]+-[A-Z]+-\d{3,}$/.test(franchiseeId)) {
         return res.status(400).json({ ok:false, error:'override_pattern_invalid' })
       }
-      // Ensure uniqueness
       const u = await client.query(`SELECT 1 FROM public.franchisees WHERE franchisee_id=$1 LIMIT 1`, [franchiseeId])
       if (u.rows.length) return res.status(409).json({ ok:false, error:'franchisee_id_exists' })
     } else {
