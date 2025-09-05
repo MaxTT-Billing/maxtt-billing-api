@@ -1,6 +1,6 @@
 // server.js — MaxTT Billing API (ESM)
-// Adds Franchisee Onboarding: franchisees table + admin endpoints with SUPER_ADMIN_KEY.
-// Keeps auto-fill invoice logic, robust lookups, exports, and no migration runner.
+// Franchisee Onboarding (no DO $$ blocks). Admin endpoints gated by SUPER_ADMIN_KEY.
+// Keeps invoice auto-fill, robust lookups, exports.
 
 import express from 'express'
 import pkg from 'pg'
@@ -70,77 +70,59 @@ function requireSA(req, res, next) {
 app.post('/api/admin/franchisees/install', requireSA, async (_req, res) => {
   const client = await pool.connect()
   try {
-    const sql = `
-CREATE TABLE IF NOT EXISTS public.franchisees (
-  id BIGSERIAL PRIMARY KEY,
-  franchisee_id TEXT UNIQUE NOT NULL,
-  legal_name TEXT NOT NULL,
-  gstin TEXT,
-  pan TEXT,
-  state TEXT,
-  state_code TEXT NOT NULL,
-  city TEXT,
-  city_code TEXT NOT NULL,
-  pincode TEXT,
-  address1 TEXT,
-  address2 TEXT,
-  phone TEXT,
-  email TEXT,
-  status TEXT NOT NULL DEFAULT 'ACTIVE',
-  api_key TEXT,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
+    await client.query('BEGIN')
 
-DO $$
-BEGIN
-  IF NOT EXISTS (
-    SELECT 1 FROM pg_indexes
-    WHERE schemaname='public' AND indexname='uq_franchisees_gstin_lower'
-  ) THEN
-    EXECUTE 'CREATE UNIQUE INDEX uq_franchisees_gstin_lower ON public.franchisees ((lower(gstin))) WHERE gstin IS NOT NULL';
-  END IF;
+    // 1) Table
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS public.franchisees (
+        id BIGSERIAL PRIMARY KEY,
+        franchisee_id TEXT UNIQUE NOT NULL,
+        legal_name TEXT NOT NULL,
+        gstin TEXT,
+        pan TEXT,
+        state TEXT,
+        state_code TEXT NOT NULL,
+        city TEXT,
+        city_code TEXT NOT NULL,
+        pincode TEXT,
+        address1 TEXT,
+        address2 TEXT,
+        phone TEXT,
+        email TEXT,
+        status TEXT NOT NULL DEFAULT 'ACTIVE',
+        api_key TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+    `)
 
-  IF NOT EXISTS (
-    SELECT 1 FROM pg_indexes
-    WHERE schemaname='public' AND indexname='uq_franchisees_email_lower'
-  ) THEN
-    EXECUTE 'CREATE UNIQUE INDEX uq_franchisees_email_lower ON public.franchisees ((lower(email))) WHERE email IS NOT NULL';
-  END IF;
+    // 2) Indexes (idempotent)
+    await client.query(`CREATE INDEX IF NOT EXISTS ix_franchisees_state_city ON public.franchisees (state_code, city_code);`)
+    await client.query(`CREATE UNIQUE INDEX IF NOT EXISTS uq_franchisees_gstin_lower ON public.franchisees ((lower(gstin))) WHERE gstin IS NOT NULL;`)
+    await client.query(`CREATE UNIQUE INDEX IF NOT EXISTS uq_franchisees_email_lower ON public.franchisees ((lower(email))) WHERE email IS NOT NULL;`)
 
-  IF NOT EXISTS (
-    SELECT 1 FROM pg_indexes
-    WHERE schemaname='public' AND indexname='ix_franchisees_state_city'
-  ) THEN
-    EXECUTE 'CREATE INDEX ix_franchisees_state_city ON public.franchisees (state_code, city_code)';
-  END IF;
-END$$;
-
-DO $$
-BEGIN
-  IF NOT EXISTS (
-    SELECT 1 FROM pg_proc WHERE proname='franchisees_set_updated_at'
-  ) THEN
-    EXECUTE $fn$
-      CREATE FUNCTION franchisees_set_updated_at() RETURNS trigger AS $$
+    // 3) updated_at function (idempotent)
+    await client.query(`
+      CREATE OR REPLACE FUNCTION franchisees_set_updated_at() RETURNS trigger AS $$
       BEGIN
         NEW.updated_at := NOW();
         RETURN NEW;
       END;
       $$ LANGUAGE plpgsql;
-    $fn$;
-  END IF;
+    `)
 
-  IF NOT EXISTS (
-    SELECT 1 FROM pg_trigger WHERE tgname='trg_franchisees_updated_at'
-  ) THEN
-    EXECUTE 'CREATE TRIGGER trg_franchisees_updated_at BEFORE UPDATE ON public.franchisees FOR EACH ROW EXECUTE FUNCTION franchisees_set_updated_at()';
-  END IF;
-END$$;
-    `
-    await client.query(sql)
+    // 4) Trigger: drop-if-exists then create (idempotent)
+    await client.query(`DROP TRIGGER IF EXISTS trg_franchisees_updated_at ON public.franchisees;`)
+    await client.query(`
+      CREATE TRIGGER trg_franchisees_updated_at
+      BEFORE UPDATE ON public.franchisees
+      FOR EACH ROW EXECUTE FUNCTION franchisees_set_updated_at();
+    `)
+
+    await client.query('COMMIT')
     res.json({ ok:true, installed:true })
   } catch (e) {
+    try { await pool.query('ROLLBACK') } catch {}
     res.status(500).json({ ok:false, error:String(e?.message || e) })
   } finally { client.release() }
 })
@@ -422,7 +404,8 @@ app.post('/api/invoices/full', async (req, res) => {
 // ---------------------- READ: list, latest, get, by-norm ---------------
 function sel(cols, alias, candidates, type='text') {
   const f = findCol(cols, candidates)
-  return f ? `i.${qid(f)}::${type} AS ${qid(alias)}` : `NULL::${type} AS ${qid(alias)}`
+  return f ? `i.${qid(f)}::${type} AS ${qid(alias)}`
+           : `NULL::${type} AS ${qid(alias)}`
 }
 
 app.get('/api/invoices', async (req, res) => {
@@ -515,7 +498,7 @@ app.get('/api/invoices/by-norm/:norm', async (req, res) => {
     if (!r.rows.length) return res.status(404).json({ ok:false, error:'not_found' })
     res.json(r.rows[0])
   } catch (err) {
-    res.status(500).json({ ok:false, where:'by_norm', message: err?.message || String(err) })
+    res.status(500).json({ ok:false, where:'by_norm', message: err?.message || err })
   } finally { client.release() }
 })
 
