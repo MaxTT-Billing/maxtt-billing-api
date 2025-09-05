@@ -107,12 +107,12 @@ app.post('/api/admin/franchisees/install', requireSA, async (_req, res) => {
     await add('address2', 'TEXT')
     await add('phone', 'TEXT')
     await add('email', 'TEXT')
-    await add('status', 'TEXT') // will be 'PENDING_APPROVAL' or 'ACTIVE'
+    await add('status', 'TEXT') // 'PENDING_APPROVAL' or 'ACTIVE'
     await add('api_key', 'TEXT')
     await add('created_at', 'TIMESTAMPTZ DEFAULT NOW()')
     await add('updated_at', 'TIMESTAMPTZ DEFAULT NOW()')
 
-    // Audit / Payment fields for onboarding:
+    // Audit / Payment fields:
     await add('onboarded_by', 'TEXT')
     await add('onboarded_at', 'TIMESTAMPTZ')
     await add('approval_by', 'TEXT')
@@ -123,21 +123,21 @@ app.post('/api/admin/franchisees/install', requireSA, async (_req, res) => {
     await add('payment_ref', 'TEXT')
     await add('remarks', 'TEXT')
 
-    // Relax NOT NULL (legacy DBs), ignore failure
+    // Relax NOT NULL (legacy)
     try { await client.query(`ALTER TABLE public.franchisees ALTER COLUMN code DROP NOT NULL;`) } catch {}
     try { await client.query(`ALTER TABLE public.franchisees ALTER COLUMN legal_name DROP NOT NULL;`) } catch {}
 
-    // 2) Make franchisee_id NOT NULL + unique safely
+    // 2) franchisee_id NOT NULL + unique
     await client.query(`UPDATE public.franchisees SET franchisee_id = CONCAT('TS-UNK-UNK-', LPAD(id::text,3,'0')) WHERE franchisee_id IS NULL;`)
     await client.query(`ALTER TABLE public.franchisees ALTER COLUMN franchisee_id SET NOT NULL;`)
     await client.query(`CREATE UNIQUE INDEX IF NOT EXISTS uq_franchisees_id ON public.franchisees (franchisee_id);`)
 
-    // 3) Helpful unique & indexes (idempotent)
+    // 3) Helpful unique & indexes
     await client.query(`CREATE UNIQUE INDEX IF NOT EXISTS uq_franchisees_gstin_lower ON public.franchisees ((lower(gstin))) WHERE gstin IS NOT NULL;`)
     await client.query(`CREATE UNIQUE INDEX IF NOT EXISTS uq_franchisees_email_lower ON public.franchisees ((lower(email))) WHERE email IS NOT NULL;`)
     await client.query(`CREATE INDEX IF NOT EXISTS ix_franchisees_state_city ON public.franchisees (state_code, city_code);`)
 
-    // 4) updated_at trigger function + trigger
+    // 4) updated_at trigger
     await client.query(`
       CREATE OR REPLACE FUNCTION franchisees_set_updated_at() RETURNS trigger AS $$
       BEGIN
@@ -153,7 +153,7 @@ app.post('/api/admin/franchisees/install', requireSA, async (_req, res) => {
       FOR EACH ROW EXECUTE FUNCTION franchisees_set_updated_at();
     `)
 
-    // 5) Backfill legacy "code" to equal franchisee_id when null
+    // 5) Backfill legacy "code"
     await client.query(`UPDATE public.franchisees SET code = franchisee_id WHERE code IS NULL;`)
 
     await client.query('COMMIT')
@@ -392,26 +392,10 @@ app.post('/api/invoices/full', async (req, res) => {
     setIf(gstCol, gstAmount)
     setIf(gstRateCol, gstRate)
 
-    if (!beforeCol) {
-      for (const k of ['subtotal_ex_gst','total_before_gst','subtotal','amount_before_tax']) {
-        if (has(cols,k) && insertPayload[k] == null) insertPayload[k] = Number(exBefore)
-      }
-    }
-    if (!totalCol) {
-      for (const k of ['total_with_gst','total_amount','grand_total','total']) {
-        if (has(cols,k) && insertPayload[k] == null) insertPayload[k] = Number(totalWithGst)
-      }
-    }
-    if (!gstCol) {
-      for (const k of ['gst_amount','tax_amount','gst_value']) {
-        if (has(cols,k) && insertPayload[k] == null) insertPayload[k] = Number(gstAmount)
-      }
-    }
-    if (!gstRateCol) {
-      for (const k of ['gst_rate','tax_rate','gst_percent','gst']) {
-        if (has(cols,k) && insertPayload[k] == null) insertPayload[k] = Number(gstRate)
-      }
-    }
+    if (!beforeCol) for (const k of ['subtotal_ex_gst','total_before_gst','subtotal','amount_before_tax']) if (has(cols,k) && insertPayload[k]==null) insertPayload[k]=Number(exBefore)
+    if (!totalCol)  for (const k of ['total_with_gst','total_amount','grand_total','total']) if (has(cols,k) && insertPayload[k]==null) insertPayload[k]=Number(totalWithGst)
+    if (!gstCol)    for (const k of ['gst_amount','tax_amount','gst_value']) if (has(cols,k) && insertPayload[k]==null) insertPayload[k]=Number(gstAmount)
+    if (!gstRateCol)for (const k of ['gst_rate','tax_rate','gst_percent','gst']) if (has(cols,k) && insertPayload[k]==null) insertPayload[k]=Number(gstRate)
 
     if (has(cols,'hsn_code') && insertPayload['hsn_code'] == null) insertPayload['hsn_code'] = '35069999'
     if (unitPriceCol && insertPayload[unitPriceCol] == null) insertPayload[unitPriceCol] = Number(unitPrice)
@@ -588,6 +572,7 @@ app.post('/api/admin/franchisees/onboard', requireAdmin, async (req, res) => {
     const onboardedBy = (req.get('X-ADMIN-USER') || b.onboarded_by || 'admin').trim() || 'admin'
     const nowIso = new Date().toISOString()
 
+    // --- FIXED: Placeholder count now matches columns (remarks included) ---
     const sql = `
       INSERT INTO public.franchisees (
         ${includeCode ? 'code,' : ''} franchisee_id, legal_name, gstin, pan, state, state_code, city, city_code,
@@ -596,7 +581,7 @@ app.post('/api/admin/franchisees/onboard', requireAdmin, async (req, res) => {
       ) VALUES (
         ${includeCode ? '$1,' : ''} $${includeCode?2:1},$${includeCode?3:2},$${includeCode?4:3},$${includeCode?5:4},$${includeCode?6:5},$${includeCode?7:6},$${includeCode?8:7},
         $${includeCode?9:8},$${includeCode?10:9},$${includeCode?11:10},$${includeCode?12:11},$${includeCode?13:12},'PENDING_APPROVAL',$${includeCode?14:13},
-        $${includeCode?15:14},$${includeCode?16:15},$${includeCode?17:16},$${includeCode?18:17},$${includeCode?19:18},$${includeCode?20:19},$${includeCode?21:20}
+        $${includeCode?15:14},$${includeCode?16:15},$${includeCode?17:16},$${includeCode?18:17},$${includeCode?19:18},$${includeCode?20:19},$${includeCode?21:20},$${includeCode?22:21}
       ) RETURNING *
     `
     const params = [
