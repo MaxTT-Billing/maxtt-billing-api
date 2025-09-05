@@ -1,6 +1,6 @@
 // server.js — MaxTT Billing API (ESM)
-// Franchisee Onboarding (no DO $$ blocks). Admin endpoints gated by SUPER_ADMIN_KEY.
-// Keeps invoice auto-fill, robust lookups, exports.
+// Franchisee Onboarding with self-healing installer (ALTER COLUMN IF NOT EXISTS).
+// Admin endpoints gated by SUPER_ADMIN_KEY. Keeps invoice auto-fill & lookups.
 
 import express from 'express'
 import pkg from 'pg'
@@ -72,36 +72,46 @@ app.post('/api/admin/franchisees/install', requireSA, async (_req, res) => {
   try {
     await client.query('BEGIN')
 
-    // 1) Table
+    // 0) Create table if missing (minimal)
     await client.query(`
       CREATE TABLE IF NOT EXISTS public.franchisees (
-        id BIGSERIAL PRIMARY KEY,
-        franchisee_id TEXT UNIQUE NOT NULL,
-        legal_name TEXT NOT NULL,
-        gstin TEXT,
-        pan TEXT,
-        state TEXT,
-        state_code TEXT NOT NULL,
-        city TEXT,
-        city_code TEXT NOT NULL,
-        pincode TEXT,
-        address1 TEXT,
-        address2 TEXT,
-        phone TEXT,
-        email TEXT,
-        status TEXT NOT NULL DEFAULT 'ACTIVE',
-        api_key TEXT,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        id BIGSERIAL PRIMARY KEY
       );
     `)
 
-    // 2) Indexes (idempotent)
-    await client.query(`CREATE INDEX IF NOT EXISTS ix_franchisees_state_city ON public.franchisees (state_code, city_code);`)
+    // 1) Ensure ALL required columns exist (nullable to be safe)
+    const add = async (name, type, extra='') =>
+      client.query(`ALTER TABLE public.franchisees ADD COLUMN IF NOT EXISTS ${name} ${type} ${extra};`)
+
+    await add('franchisee_id', 'TEXT')
+    await add('legal_name', 'TEXT')
+    await add('gstin', 'TEXT')
+    await add('pan', 'TEXT')
+    await add('state', 'TEXT')
+    await add('state_code', 'TEXT')
+    await add('city', 'TEXT')
+    await add('city_code', 'TEXT')
+    await add('pincode', 'TEXT')
+    await add('address1', 'TEXT')
+    await add('address2', 'TEXT')
+    await add('phone', 'TEXT')
+    await add('email', 'TEXT')
+    await add('status', 'TEXT')
+    await add('api_key', 'TEXT')
+    await add('created_at', 'TIMESTAMPTZ DEFAULT NOW()')
+    await add('updated_at', 'TIMESTAMPTZ DEFAULT NOW()')
+
+    // 2) Make franchisee_id NOT NULL + unique safely
+    await client.query(`UPDATE public.franchisees SET franchisee_id = CONCAT('TS-UNK-UNK-', LPAD(id::text,3,'0')) WHERE franchisee_id IS NULL;`)
+    await client.query(`ALTER TABLE public.franchisees ALTER COLUMN franchisee_id SET NOT NULL;`)
+    await client.query(`CREATE UNIQUE INDEX IF NOT EXISTS uq_franchisees_id ON public.franchisees (franchisee_id);`)
+
+    // 3) Helpful uniques / indexes (idempotent)
     await client.query(`CREATE UNIQUE INDEX IF NOT EXISTS uq_franchisees_gstin_lower ON public.franchisees ((lower(gstin))) WHERE gstin IS NOT NULL;`)
     await client.query(`CREATE UNIQUE INDEX IF NOT EXISTS uq_franchisees_email_lower ON public.franchisees ((lower(email))) WHERE email IS NOT NULL;`)
+    await client.query(`CREATE INDEX IF NOT EXISTS ix_franchisees_state_city ON public.franchisees (state_code, city_code);`)
 
-    // 3) updated_at function (idempotent)
+    // 4) updated_at trigger function + trigger
     await client.query(`
       CREATE OR REPLACE FUNCTION franchisees_set_updated_at() RETURNS trigger AS $$
       BEGIN
@@ -110,8 +120,6 @@ app.post('/api/admin/franchisees/install', requireSA, async (_req, res) => {
       END;
       $$ LANGUAGE plpgsql;
     `)
-
-    // 4) Trigger: drop-if-exists then create (idempotent)
     await client.query(`DROP TRIGGER IF EXISTS trg_franchisees_updated_at ON public.franchisees;`)
     await client.query(`
       CREATE TRIGGER trg_franchisees_updated_at
@@ -122,7 +130,7 @@ app.post('/api/admin/franchisees/install', requireSA, async (_req, res) => {
     await client.query('COMMIT')
     res.json({ ok:true, installed:true })
   } catch (e) {
-    try { await pool.query('ROLLBACK') } catch {}
+    try { await client.query('ROLLBACK') } catch {}
     res.status(500).json({ ok:false, error:String(e?.message || e) })
   } finally { client.release() }
 })
