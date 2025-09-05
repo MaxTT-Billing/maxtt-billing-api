@@ -405,7 +405,7 @@ app.post('/api/invoices/full', async (req, res) => {
     if (!beforeCol) for (const k of ['subtotal_ex_gst','total_before_gst','subtotal','amount_before_tax']) if (has(cols,k) && insertPayload[k]==null) insertPayload[k]=Number(exBefore)
     if (!totalCol)  for (const k of ['total_with_gst','total_amount','grand_total','total']) if (has(cols,k) && insertPayload[k]==null) insertPayload[k]=Number(totalWithGst)
     if (!gstCol)    for (const k of ['gst_amount','tax_amount','gst_value']) if (has(cols,k) && insertPayload[k]==null) insertPayload[k]=Number(gstAmount)
-    if (!gstRateCol)for (const k of ['gst_rate','tax_rate','gst_percent','gst']) if (has(cols,k) && insertPayload[k]==null) insertPayload[k]=Number(gstRate)
+    if (!gstRateCol)for (const k of ['gst_rate','tax_rate','gst_percent','gst']) if (has(cols,k) && insertPayload[k)==null) insertPayload[k]=Number(gstRate)
 
     if (has(cols,'hsn_code') && insertPayload['hsn_code'] == null) insertPayload['hsn_code'] = '35069999'
     if (unitPriceCol && insertPayload[unitPriceCol] == null) insertPayload[unitPriceCol] = Number(unitPrice)
@@ -550,6 +550,22 @@ async function nextFrSuffix(client, stateCode, cityCode) {
   return maxN + 1
 }
 
+// Admin: list rejected (helper) — placed BEFORE :id_or_code route
+app.get('/api/admin/franchisees/rejected', requireAdmin, async (_req,res)=>{
+  const c = await pool.connect()
+  try {
+    const r = await c.query(
+      `SELECT * FROM public.franchisees
+       WHERE status='REJECTED'
+       ORDER BY updated_at DESC
+       LIMIT 500`
+    )
+    res.json({ ok:true, items: r.rows })
+  } catch (e) {
+    res.status(500).json({ ok:false, error:String(e?.message||e) })
+  } finally { c.release() }
+})
+
 // Admin: create (PENDING_APPROVAL)
 app.post('/api/admin/franchisees/onboard', requireAdmin, async (req, res) => {
   const client = await pool.connect()
@@ -642,17 +658,6 @@ app.get('/api/admin/franchisees/:id_or_code', requireAdmin, async (req, res) => 
     else r = await client.query(`SELECT * FROM public.franchisees WHERE franchisee_id=$1 OR code=$1 LIMIT 1`, [v.toUpperCase()])
     if (!r.rows.length) return res.status(404).json({ ok:false, error:'not_found' })
     res.json({ ok:true, franchisee: r.rows[0] })
-  } catch (e) {
-    res.status(500).json({ ok:false, error:String(e?.message || e) })
-  } finally { client.release() }
-})
-
-// Admin: list rejected (helper)
-app.get('/api/admin/franchisees/rejected', requireAdmin, async (_req, res) => {
-  const client = await pool.connect()
-  try {
-    const r = await client.query(`SELECT * FROM public.franchisees WHERE status='REJECTED' ORDER BY updated_at DESC LIMIT 500`)
-    res.json({ ok:true, items: r.rows })
   } catch (e) {
     res.status(500).json({ ok:false, error:String(e?.message || e) })
   } finally { client.release() }
