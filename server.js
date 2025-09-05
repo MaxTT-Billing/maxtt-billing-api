@@ -1,6 +1,9 @@
 // server.js — MaxTT Billing API (ESM)
-// Franchisee Onboarding with self-healing installer (ALTER COLUMN IF NOT EXISTS).
-// Admin endpoints gated by SUPER_ADMIN_KEY. Keeps invoice auto-fill & lookups.
+// Franchisee Onboarding v2:
+// - Admin creates (PENDING_APPROVAL) using X-ADMIN-KEY
+// - Super Admin approves (ACTIVE) using X-SA-KEY
+// - Self-healing DB (incl. legacy `code` column), audit/payment fields
+// - Existing invoice endpoints preserved
 
 import express from 'express'
 import pkg from 'pg'
@@ -23,7 +26,7 @@ app.use((req, res, next) => {
   if (ORIGINS.includes(origin)) res.setHeader('Access-Control-Allow-Origin', origin)
   res.setHeader('Vary', 'Origin')
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,OPTIONS')
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-REF-API-KEY, X-SA-KEY')
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-REF-API-KEY, X-SA-KEY, X-ADMIN-KEY, X-SA-USER, X-ADMIN-USER')
   if (req.method === 'OPTIONS') return res.sendStatus(200)
   next()
 })
@@ -36,7 +39,7 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false },
 })
 
-// --------------------------- Column helpers ---------------------------
+// --------------------------- Helpers (invoices) ------------------------
 let cachedCols = null
 async function getInvoiceCols(client) {
   if (cachedCols) return cachedCols
@@ -65,14 +68,21 @@ function requireSA(req, res, next) {
   if (key !== expect) return res.status(401).json({ ok:false, error:'unauthorized' })
   next()
 }
+function requireAdmin(req, res, next) {
+  const key = req.get('X-ADMIN-KEY') || ''
+  const expect = process.env.ADMIN_KEY || ''
+  if (!expect) return res.status(500).json({ ok:false, error:'admin_key_not_set' })
+  if (key !== expect) return res.status(401).json({ ok:false, error:'unauthorized' })
+  next()
+}
 
-// ------------------- Admin installer for franchisees table -------------
+// ------------------- Franchisees: installer (self-healing) -------------
 app.post('/api/admin/franchisees/install', requireSA, async (_req, res) => {
   const client = await pool.connect()
   try {
     await client.query('BEGIN')
 
-    // 0) Create table if missing (minimal)
+    // 0) Ensure table exists (minimal)
     await client.query(`
       CREATE TABLE IF NOT EXISTS public.franchisees (
         id BIGSERIAL PRIMARY KEY
@@ -84,6 +94,7 @@ app.post('/api/admin/franchisees/install', requireSA, async (_req, res) => {
       client.query(`ALTER TABLE public.franchisees ADD COLUMN IF NOT EXISTS ${name} ${type} ${extra};`)
 
     await add('franchisee_id', 'TEXT')
+    await add('code', 'TEXT') // legacy support
     await add('legal_name', 'TEXT')
     await add('gstin', 'TEXT')
     await add('pan', 'TEXT')
@@ -96,17 +107,32 @@ app.post('/api/admin/franchisees/install', requireSA, async (_req, res) => {
     await add('address2', 'TEXT')
     await add('phone', 'TEXT')
     await add('email', 'TEXT')
-    await add('status', 'TEXT')
+    await add('status', 'TEXT') // will be 'PENDING_APPROVAL' or 'ACTIVE'
     await add('api_key', 'TEXT')
     await add('created_at', 'TIMESTAMPTZ DEFAULT NOW()')
     await add('updated_at', 'TIMESTAMPTZ DEFAULT NOW()')
+
+    // Audit / Payment fields for onboarding:
+    await add('onboarded_by', 'TEXT')
+    await add('onboarded_at', 'TIMESTAMPTZ')
+    await add('approval_by', 'TEXT')
+    await add('approval_at', 'TIMESTAMPTZ')
+    await add('onboard_fee_amount', 'NUMERIC(12,2)')
+    await add('advance_amount', 'NUMERIC(12,2)')
+    await add('payment_mode', 'TEXT')
+    await add('payment_ref', 'TEXT')
+    await add('remarks', 'TEXT')
+
+    // Relax NOT NULL (legacy DBs), ignore failure
+    try { await client.query(`ALTER TABLE public.franchisees ALTER COLUMN code DROP NOT NULL;`) } catch {}
+    try { await client.query(`ALTER TABLE public.franchisees ALTER COLUMN legal_name DROP NOT NULL;`) } catch {}
 
     // 2) Make franchisee_id NOT NULL + unique safely
     await client.query(`UPDATE public.franchisees SET franchisee_id = CONCAT('TS-UNK-UNK-', LPAD(id::text,3,'0')) WHERE franchisee_id IS NULL;`)
     await client.query(`ALTER TABLE public.franchisees ALTER COLUMN franchisee_id SET NOT NULL;`)
     await client.query(`CREATE UNIQUE INDEX IF NOT EXISTS uq_franchisees_id ON public.franchisees (franchisee_id);`)
 
-    // 3) Helpful uniques / indexes (idempotent)
+    // 3) Helpful unique & indexes (idempotent)
     await client.query(`CREATE UNIQUE INDEX IF NOT EXISTS uq_franchisees_gstin_lower ON public.franchisees ((lower(gstin))) WHERE gstin IS NOT NULL;`)
     await client.query(`CREATE UNIQUE INDEX IF NOT EXISTS uq_franchisees_email_lower ON public.franchisees ((lower(email))) WHERE email IS NOT NULL;`)
     await client.query(`CREATE INDEX IF NOT EXISTS ix_franchisees_state_city ON public.franchisees (state_code, city_code);`)
@@ -126,6 +152,9 @@ app.post('/api/admin/franchisees/install', requireSA, async (_req, res) => {
       BEFORE UPDATE ON public.franchisees
       FOR EACH ROW EXECUTE FUNCTION franchisees_set_updated_at();
     `)
+
+    // 5) Backfill legacy "code" to equal franchisee_id when null
+    await client.query(`UPDATE public.franchisees SET code = franchisee_id WHERE code IS NULL;`)
 
     await client.query('COMMIT')
     res.json({ ok:true, installed:true })
@@ -216,7 +245,7 @@ async function computeNextNumbers(client, cols, franchiseeId) {
   return { invoiceMonthlySeq: nextMonthly, customerSeq: nextCust, mmyy }
 }
 
-// ---------------------- Tyre dosage (preferred) -----------------------
+// ---------------------- Tyre dosage helpers ---------------------------
 function asNum(v) {
   if (v === null || v === undefined) return null
   const s = String(v).trim().replace(/[^0-9.+-]/g,'')
@@ -235,7 +264,6 @@ function inferTyreCountFromPayload(p) {
   if (count === 0) count = asNum(p['tyre_count']) || asNum(p['no_of_tyres']) || asNum(p['number_of_tyres']) || null
   return count
 }
-
 function recommendPerTyreMl(widthMm = 195, rimIn = 15) {
   const w = Number(widthMm)||195
   const r = Number(rimIn)||15
@@ -255,7 +283,6 @@ function recommendPerTyreMl(widthMm = 195, rimIn = 15) {
   base = Math.max(150, Math.min(base, 600))
   return Math.round(base/10)*10
 }
-
 function computeTyreDosageMl(payload) {
   const width = asNum(payload['tyre_width_mm'])
   const rim = asNum(payload['rim_diameter_in'])
@@ -415,7 +442,6 @@ function sel(cols, alias, candidates, type='text') {
   return f ? `i.${qid(f)}::${type} AS ${qid(alias)}`
            : `NULL::${type} AS ${qid(alias)}`
 }
-
 app.get('/api/invoices', async (req, res) => {
   const client = await pool.connect()
   try {
@@ -463,7 +489,6 @@ app.get('/api/invoices', async (req, res) => {
     res.status(500).json({ ok:false, where:'list_invoices', message: err?.message || String(err) })
   } finally { client.release() }
 })
-
 app.get('/api/invoices/latest', async (_req, res) => {
   const client = await pool.connect()
   try {
@@ -476,7 +501,6 @@ app.get('/api/invoices/latest', async (_req, res) => {
     res.status(500).json({ ok:false, where:'latest', message: err?.message || String(err) })
   } finally { client.release() }
 })
-
 app.get(['/api/invoices/:id/full2', '/invoices/:id/full2'], async (req, res) => {
   const client = await pool.connect()
   try {
@@ -492,7 +516,6 @@ app.get(['/api/invoices/:id/full2', '/invoices/:id/full2'], async (req, res) => 
     res.status(500).json({ ok:false, where:'get_invoice_full2', message: err?.message || String(err) })
   } finally { client.release() }
 })
-
 app.get('/api/invoices/by-norm/:norm', async (req, res) => {
   const client = await pool.connect()
   try {
@@ -516,7 +539,6 @@ function makeFrId(stateCode, cityCode, n) {
   const cc = String(cityCode||'').toUpperCase().replace(/[^A-Z]/g,'')
   return `TS-${sc}-${cc}-${String(n).padStart(3,'0')}`
 }
-
 async function nextFrSuffix(client, stateCode, cityCode) {
   const like = `TS-${String(stateCode).toUpperCase()}-${String(cityCode).toUpperCase()}-%`
   const r = await client.query(
@@ -526,14 +548,13 @@ async function nextFrSuffix(client, stateCode, cityCode) {
   let maxN = 0
   for (const row of r.rows) {
     const m = String(row.franchisee_id || '').match(/^TS-[A-Z]+-[A-Z]+-(\d{3,})$/)
-    if (m) {
-      const n = Number(m[1]); if (Number.isFinite(n) && n > maxN) maxN = n
-    }
+    if (m) { const n = Number(m[1]); if (Number.isFinite(n) && n > maxN) maxN = n }
   }
   return maxN + 1
 }
 
-app.post('/api/admin/franchisees/onboard', requireSA, async (req, res) => {
+// Admin: create (PENDING_APPROVAL)
+app.post('/api/admin/franchisees/onboard', requireAdmin, async (req, res) => {
   const client = await pool.connect()
   try {
     const b = req.body || {}
@@ -557,16 +578,29 @@ app.post('/api/admin/franchisees/onboard', requireSA, async (req, res) => {
       franchiseeId = makeFrId(sc, cc, n)
     }
 
+    // Does table have legacy `code` column?
+    const hasCodeCol = await client.query(`
+      SELECT 1 FROM information_schema.columns
+      WHERE table_schema='public' AND table_name='franchisees' AND column_name='code' LIMIT 1
+    `)
+    const includeCode = hasCodeCol.rowCount > 0
+
+    const onboardedBy = (req.get('X-ADMIN-USER') || b.onboarded_by || 'admin').trim() || 'admin'
+    const nowIso = new Date().toISOString()
+
     const sql = `
       INSERT INTO public.franchisees (
-        franchisee_id, legal_name, gstin, pan, state, state_code, city, city_code,
-        pincode, address1, address2, phone, email, status, api_key
+        ${includeCode ? 'code,' : ''} franchisee_id, legal_name, gstin, pan, state, state_code, city, city_code,
+        pincode, address1, address2, phone, email, status, api_key,
+        onboarded_by, onboarded_at, onboard_fee_amount, advance_amount, payment_mode, payment_ref, remarks
       ) VALUES (
-        $1,$2,$3,$4,$5,$6,$7,$8,
-        $9,$10,$11,$12,$13,COALESCE($14,'ACTIVE'),$15
+        ${includeCode ? '$1,' : ''} $${includeCode?2:1},$${includeCode?3:2},$${includeCode?4:3},$${includeCode?5:4},$${includeCode?6:5},$${includeCode?7:6},$${includeCode?8:7},
+        $${includeCode?9:8},$${includeCode?10:9},$${includeCode?11:10},$${includeCode?12:11},$${includeCode?13:12},'PENDING_APPROVAL',$${includeCode?14:13},
+        $${includeCode?15:14},$${includeCode?16:15},$${includeCode?17:16},$${includeCode?18:17},$${includeCode?19:18},$${includeCode?20:19},$${includeCode?21:20}
       ) RETURNING *
     `
     const params = [
+      ...(includeCode ? [franchiseeId] : []),
       franchiseeId,
       b.legal_name || null,
       b.gstin || null,
@@ -580,8 +614,14 @@ app.post('/api/admin/franchisees/onboard', requireSA, async (req, res) => {
       b.address2 || null,
       b.phone || null,
       b.email || null,
-      b.status || null,
-      b.api_key || null
+      b.api_key || null,
+      onboardedBy,
+      nowIso,
+      b.onboard_fee_amount ?? null,
+      b.advance_amount ?? null,
+      b.payment_mode ?? null,
+      b.payment_ref ?? null,
+      b.remarks ?? null,
     ]
     const r = await client.query(sql, params)
     res.status(201).json({ ok:true, franchisee: r.rows[0] })
@@ -590,17 +630,8 @@ app.post('/api/admin/franchisees/onboard', requireSA, async (req, res) => {
   } finally { client.release() }
 })
 
-app.get('/api/admin/franchisees', requireSA, async (_req, res) => {
-  const client = await pool.connect()
-  try {
-    const r = await client.query(`SELECT * FROM public.franchisees ORDER BY created_at DESC LIMIT 500`)
-    res.json({ ok:true, items: r.rows })
-  } catch (e) {
-    res.status(500).json({ ok:false, error:String(e?.message || e) })
-  } finally { client.release() }
-})
-
-app.get('/api/admin/franchisees/:id_or_code', requireSA, async (req, res) => {
+// Admin: get details
+app.get('/api/admin/franchisees/:id_or_code', requireAdmin, async (req, res) => {
   const client = await pool.connect()
   try {
     const v = String(req.params.id_or_code || '').trim()
@@ -608,9 +639,50 @@ app.get('/api/admin/franchisees/:id_or_code', requireSA, async (req, res) => {
     if (/^\d+$/.test(v)) {
       r = await client.query(`SELECT * FROM public.franchisees WHERE id=$1 LIMIT 1`, [Number(v)])
     } else {
-      r = await client.query(`SELECT * FROM public.franchisees WHERE franchisee_id=$1 LIMIT 1`, [v.toUpperCase()])
+      r = await client.query(`SELECT * FROM public.franchisees WHERE franchisee_id=$1 OR code=$1 LIMIT 1`, [v.toUpperCase()])
     }
     if (!r.rows.length) return res.status(404).json({ ok:false, error:'not_found' })
+    res.json({ ok:true, franchisee: r.rows[0] })
+  } catch (e) {
+    res.status(500).json({ ok:false, error:String(e?.message || e) })
+  } finally { client.release() }
+})
+
+// Super Admin: list pending approvals
+app.get('/api/super/franchisees/pending', requireSA, async (_req, res) => {
+  const client = await pool.connect()
+  try {
+    const r = await client.query(`SELECT * FROM public.franchisees WHERE status='PENDING_APPROVAL' ORDER BY created_at DESC LIMIT 500`)
+    res.json({ ok:true, items: r.rows })
+  } catch (e) {
+    res.status(500).json({ ok:false, error:String(e?.message || e) })
+  } finally { client.release() }
+})
+
+// Super Admin: approve
+app.post('/api/super/franchisees/approve/:id', requireSA, async (req, res) => {
+  const client = await pool.connect()
+  try {
+    const id = Number(req.params.id || 0)
+    if (!Number.isFinite(id) || id <= 0) return res.status(400).json({ ok:false, error:'bad_id' })
+
+    // Validate required fields before activation
+    const r0 = await client.query(`SELECT * FROM public.franchisees WHERE id=$1 LIMIT 1`, [id])
+    if (!r0.rows.length) return res.status(404).json({ ok:false, error:'not_found' })
+    const f = r0.rows[0]
+    if (!f.legal_name || !f.state_code || !f.city_code) {
+      return res.status(400).json({ ok:false, error:'missing_required_fields_for_approval' })
+    }
+
+    const approver = (req.get('X-SA-USER') || req.body?.approval_by || 'superadmin').trim() || 'superadmin'
+    const nowIso = new Date().toISOString()
+    const r = await client.query(
+      `UPDATE public.franchisees
+       SET status='ACTIVE', approval_by=$2, approval_at=$3
+       WHERE id=$1
+       RETURNING *`,
+      [id, approver, nowIso]
+    )
     res.json({ ok:true, franchisee: r.rows[0] })
   } catch (e) {
     res.status(500).json({ ok:false, error:String(e?.message || e) })
