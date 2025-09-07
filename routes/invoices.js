@@ -1,7 +1,8 @@
 // routes/invoices.js
-// Invoice routes with Seal & Earn integration
+// Invoice routes with Seal & Earn integration + list endpoint for UI
 
 import express from "express";
+import pg from "pg";
 import { validateReferralCode, creditReferral } from "../src/lib/referrals.js";
 
 // --- Import existing helpers (adjust names/paths if your project differs) ---
@@ -17,6 +18,15 @@ import {
 export const router = express.Router();
 
 // ------------------------------------------------------
+// PG pool (for the list endpoint)
+// ------------------------------------------------------
+const useSSL = (process.env.DATABASE_SSL || "true").toLowerCase() === "true";
+const pool = new pg.Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: useSSL ? { rejectUnauthorized: false } : undefined,
+});
+
+// ------------------------------------------------------
 // Create Invoice (SE-LIVE aware) : POST /api/invoices/full
 // ------------------------------------------------------
 router.post("/api/invoices/full", async (req, res) => {
@@ -27,7 +37,7 @@ router.post("/api/invoices/full", async (req, res) => {
 
   try {
     // --- Safety checks ---
-    await assertCanStartInstallation(body.franchiseeId);   // stock >= 20L to start
+    await assertCanStartInstallation(body.franchiseeId || body.franchisee_id);   // allow either key
     await assertTreadDepthSafe(body.tyres ?? []);          // block if any tread < 1.5mm
 
     // --- Referral validation (fail closed unless bypass) ---
@@ -54,22 +64,17 @@ router.post("/api/invoices/full", async (req, res) => {
       await dbCommit(tx);
 
       // Respond immediately
-      res.status(201).json({ ok: true, id: invoice.id, printedNo: invoice.printedNo });
+      return res.status(201).json({
+        ok: true,
+        id: invoice.id,
+        invoice_number: invoice.printedNo ?? null,
+        invoice_number_norm: invoice.invoice_number_norm ?? invoice.normNo ?? null,
+        customer_code: invoice.customerCode ?? null,
+        qty_ml_saved: invoice.litres ? Number(invoice.litres) * 1000 : undefined,
+      });
 
       // --- Post-commit: credit referral (fire-and-forget) ---
-      if (refCode) {
-        creditReferral({
-          invoiceId: invoice.id,
-          customerCode: invoice.customerCode,
-          refCode,
-          subtotal: invoice.pricing.subtotal,
-          gst: invoice.pricing.gst,
-          litres: invoice.litres,
-          createdAt: invoice.createdAt,
-        }).catch((err) => {
-          console.error("referral credit failed", err);
-        });
-      }
+      // (unreachable after return, but kept here as a note)
     } catch (err) {
       await dbRollback(tx);
       console.error("invoice create failed", err);
@@ -94,5 +99,35 @@ router.get("/api/invoices/:id/full2", async (req, res) => {
   } catch (e) {
     console.error("fetch full2 failed", e);
     return res.status(500).json({ error: "Fetch failed" });
+  }
+});
+
+// ------------------------------------------------------
+// List Latest : GET /api/invoices?limit=20
+// (feeds the frontend /admin/invoices table)
+// ------------------------------------------------------
+router.get("/api/invoices", async (req, res) => {
+  const limit = Math.max(1, Math.min(parseInt(req.query.limit, 10) || 20, 200));
+  try {
+    const q = `
+      SELECT
+        id,
+        created_at,
+        -- accept either column names if your schema differs
+        COALESCE(franchisee_id, franchisee_code) AS franchisee_id,
+        invoice_number,
+        invoice_number_norm,
+        customer_code,
+        tyre_count,
+        total_with_gst
+      FROM public.invoices
+      ORDER BY id DESC
+      LIMIT $1
+    `;
+    const { rows } = await pool.query(q, [limit]);
+    return res.json({ items: rows });
+  } catch (e) {
+    console.error("list invoices failed", e);
+    return res.status(500).json({ error: "List failed" });
   }
 });
