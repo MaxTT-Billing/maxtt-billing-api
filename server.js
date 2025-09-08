@@ -1,449 +1,443 @@
-// server.js — Billing API (ESM) with adaptive columns + CSV export
-// + Wire-up to Seal & Earn using normalized FRAN-#### codes
-// Requires: referralsHook.js, referralsClient.js at repo root
+// server.js — MaxTT / Treadstone Solutions Billing API (ESM)
+// Baseline compatible with your 27-Aug build + PDF route added.
+// 5-zone PDF matches your #46 layout; Zone-2 adds HSN Code + Customer ID.
+// No logo, no PDF watermark (use pre-watermarked paper).
 
 import express from 'express'
-import cors from 'cors'
 import pkg from 'pg'
 const { Pool } = pkg
-
-// === Wire to Seal & Earn ===
-import { sendForInvoice } from './referralsHook.js'
-import { postReferral } from './referralsClient.js'
+import PDFDocument from 'pdfkit'
 
 const app = express()
-app.use(cors())
-app.use(express.json({ limit: '10mb' }))
 
-// --- DB connection ---
+// ------------------------------- CORS ---------------------------------
+const ORIGINS = (process.env.ALLOWED_ORIGINS ||
+  'https://maxtt-billing-frontend.onrender.com,https://maxtt-billing-tools.onrender.com')
+  .split(',').map(s => s.trim()).filter(Boolean)
+
+app.use((req, res, next) => {
+  const origin = req.headers.origin || ''
+  if (ORIGINS.includes(origin)) res.setHeader('Access-Control-Allow-Origin', origin)
+  res.setHeader('Vary', 'Origin')
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS')
+  res.setHeader('Access-Control-Allow-Headers',
+    'Content-Type, Authorization, X-REF-API-KEY, X-SA-KEY, X-ADMIN-KEY, X-SA-USER, X-ADMIN-USER')
+  if (req.method === 'OPTIONS') return res.sendStatus(200)
+  next()
+})
+
+app.use(express.json({ limit: '15mb' }))
+
+// ------------------------------- DB -----------------------------------
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false },
 })
 
-// ------------ Helpers ------------
+// --------------------------- Helpers ----------------------------------
 let cachedCols = null
 async function getInvoiceCols(client) {
   if (cachedCols) return cachedCols
-  const q = `
+  const r = await client.query(`
     SELECT lower(column_name) AS name
     FROM information_schema.columns
-    WHERE table_schema = 'public' AND table_name = 'invoices'
-  `
-  const r = await client.query(q)
+    WHERE table_schema='public' AND table_name='invoices'
+  `)
   cachedCols = new Set(r.rows.map(x => x.name))
   return cachedCols
 }
-function has(cols, name) { return cols.has(String(name).toLowerCase()) }
-function qid(name) { return `"${name}"` }
-function sel(cols, alias, candidates, type = 'text') {
-  const found = candidates.find(c => has(cols, c))
-  return found ? `i.${qid(found)}::${type} AS ${qid(alias)}`
-               : `NULL::${type} AS ${qid(alias)}`
-}
+const has = (cols, n) => cols.has(String(n).toLowerCase())
+const qid = (n) => `"${n}"`
+function findCol(cols, candidates){ for(const c of candidates) if (has(cols,c)) return c; return null }
+const pad = (n,w=4)=>String(Math.max(0,Number(n)||0)).padStart(w,'0')
 
-// ------------ Basic + diagnostics ------------
-app.get('/', (_req, res) => res.send('MaxTT Billing API is running'))
-app.get('/api/health', (_req, res) => res.json({ ok: true }))
-
-app.get('/api/diag/whoami', async (_req, res) => {
-  try {
-    const r = await pool.query(`SELECT current_database() AS db, current_schema() AS schema`)
-    const url = process.env.DATABASE_URL || ''
-    let host = '', databaseFromUrl = ''
-    try { const u = new URL(url); host = u.hostname; databaseFromUrl = (u.pathname||'').replace('/','') } catch {}
-    res.json({ ok: true, current_database: r.rows[0]?.db, current_schema: r.rows[0]?.schema, url_host: host, url_database: databaseFromUrl, ssl: true })
-  } catch (err) {
-    res.status(500).json({ ok:false, where:'whoami', message: err?.message || String(err) })
-  }
-})
-
-app.get('/api/diag/view', async (_req, res) => {
-  try {
-    const r = await pool.query(`SELECT to_regclass('public.v_invoice_export') AS v`)
-    const exists = r.rows[0]?.v
-    if (!exists) return res.json({ ok:false, where:'view_check', reason:'view_missing' })
-    res.json({ ok:true, view: String(exists) })
-  } catch (err) {
-    res.status(500).json({ ok:false, where:'view_check', message: err?.message || String(err) })
-  }
-})
-
-// ------------ Admin helper: auto-create CSV view ------------
-app.get('/api/admin/create-view-auto', async (_req, res) => {
-  const client = await pool.connect()
-  try {
-    const cols = await getInvoiceCols(client)
-    const pick = (...cands) => cands.find(c => has(cols, c)) || null
-    const expr = (alias, candidates) => {
-      const f = pick(...candidates)
-      return f ? `i.${qid(f)}::text AS ${qid(alias)}` : `NULL::text AS ${qid(alias)}`
-    }
-
-    const selectParts = [
-      expr('invoice_id', ['id','invoice_id']),
-      expr('invoice_number', ['invoice_number','invoice_no','inv_no','bill_no','invoice']),
-      expr('invoice_ts_ist', ['invoice_ts_ist','created_at','invoice_date','createdon','created_on','date']),
-      expr('franchisee_code', ['franchisee_code','franchisee','franchise_code']),
-      expr('admin_code', ['admin_code','admin']),
-      expr('super_admin_code', ['super_admin_code','superadmin_code','sa_code']),
-      expr('customer_code', ['customer_code','customer_id','customer','cust_code']),
-      expr('referral_code', ['referral_code','ref_code','referral']),
-      expr('vehicle_no', ['vehicle_no','vehicle_number','registration_no','reg_no','vehicle']),
-      expr('vehicle_make_model', ['vehicle_make_model','make_model','model','make']),
-      expr('odometer_reading', ['odometer_reading','odometer','odo','kms']),
-      expr('tyre_size_fl', ['tyre_size_fl','fl_tyre','tyre_fl']),
-      expr('tyre_size_fr', ['tyre_size_fr','fr_tyre','tyre_fr']),
-      expr('tyre_size_rl', ['tyre_size_rl','rl_tyre','tyre_rl']),
-      expr('tyre_size_rr', ['tyre_size_rr','rr_tyre','tyre_rr']),
-      expr('total_qty_ml', ['total_qty_ml','qty_ml','total_ml','quantity_ml','qty','dosage_ml']),
-      expr('mrp_per_ml', ['mrp_per_ml','price_per_ml','rate_per_ml','mrp_ml']),
-      expr('installation_cost', ['installation_cost','install_cost','labour','labour_cost']),
-      expr('discount_amount', ['discount_amount','discount','disc']),
-      expr('subtotal_ex_gst', ['subtotal_ex_gst','subtotal','sub_total','amount_before_tax','amount_ex_gst','pre_tax_total','total_before_gst']),
-      expr('gst_rate', ['gst_rate','tax_rate','gst_percent','gst']),
-      expr('gst_amount', ['gst_amount','tax_amount','gst_value']),
-      expr('total_amount', ['total_amount','grand_total','total','amount','total_with_gst']),
-      expr('stock_level_at_start_l', ['stock_level_at_start_l','stock_before','stock_at_start_l','stock_start_liters']),
-      expr('gps_lat', ['gps_lat','latitude','lat']),
-      expr('gps_lng', ['gps_lng','longitude','lng','lon']),
-      expr('site_address_text', ['site_address_text','address','site_address','location','customer_address']),
-      expr('tread_depth_min_mm', ['tread_depth_min_mm','tread_depth','min_tread_mm','tread_depth_mm']),
-      expr('speed_rating', ['speed_rating','speedrate','speed']),
-      expr('created_by_user_id', ['created_by_user_id','created_by','user_id']),
-      'NULL::text AS "role"'
-    ]
-
-    const createViewSql = `
-      CREATE OR REPLACE VIEW public.v_invoice_export AS
-      SELECT
-        ${selectParts.join(',\n        ')}
-      FROM public.invoices i;
-    `
-    await client.query(createViewSql)
-    res.json({ ok:true, created:'public.v_invoice_export', note:'adaptive' })
-  } catch (err) {
-    res.status(500).json({ ok:false, where:'create_view_auto', message: err?.message || String(err) })
-  } finally {
-    client.release()
-  }
-})
-
-// ------------ CSV helpers ------------
-const CSV_HEADERS = [
-  'Invoice ID','Invoice No','Timestamp (IST)','Franchisee Code','Admin Code','SuperAdmin Code',
-  'Customer Code','Referral Code','Vehicle No','Make/Model','Odometer',
-  'Tyre Size FL','Tyre Size FR','Tyre Size RL','Tyre Size RR',
-  'Qty (ml)','MRP (/ml ₹)','Installation Cost ₹','Discount ₹','Subtotal (ex-GST) ₹',
-  'GST Rate','GST Amount ₹','Total Amount ₹',
-  'Stock@Start (L)','GPS Lat','GPS Lng','Site Address','Min Tread Depth (mm)','Speed Rating',
-  'Created By UserId','Created By Role'
-]
-function csvField(val) {
-  if (val === null || val === undefined) return ''
-  const s = String(val)
-  const mustQuote = s.includes('"') || s.includes(',') || s.includes('\n') || s.includes('\r') || s.includes(';')
-  const escaped = s.split('"').join('""')
-  return mustQuote ? `"${escaped}"` : escaped
-}
-function rowsToCsv(rows) {
-  const header = CSV_HEADERS.map(csvField).join(',')
-  const lines = [header]
-  for (const r of rows) {
-    const fields = [
-      r.invoice_id, r.invoice_number, r.invoice_ts_ist,
-      r.franchisee_code, r.admin_code, r.super_admin_code,
-      r.customer_code, r.referral_code, r.vehicle_no, r.vehicle_make_model, r.odometer_reading,
-      r.tyre_size_fl, r.tyre_size_fr, r.tyre_size_rl, r.tyre_size_rr,
-      r.total_qty_ml, r.mrp_per_ml, r.installation_cost, r.discount_amount, r.subtotal_ex_gst,
-      r.gst_rate, r.gst_amount, r.total_amount,
-      r.stock_level_at_start_l, r.gps_lat, r.gps_lng, r.site_address_text,
-      r.tread_depth_min_mm, r.speed_rating, r.created_by_user_id, r.role,
-    ]
-    lines.push(fields.map(csvField).join(','))
-  }
-  return lines.join('\r\n') + '\r\n'
-}
-
-// ------------ CSV export ------------
-app.get('/api/exports/invoices', async (req, res) => {
-  try {
-    const { from, to, franchisee, q } = req.query
-    const where = []
-    const params = []
-    let i = 1
-
-    // Read from the adaptive view; if missing, it'll error and be caught
-    const fromSql = `public.v_invoice_export`
-
-    if (from) { where.push(`invoice_ts_ist::date >= $${i++}`); params.push(from) }
-    if (to)   { where.push(`invoice_ts_ist::date <= $${i++}`); params.push(to) }
-    if (franchisee) { where.push(`franchisee_code = $${i++}`); params.push(franchisee) }
-    if (q) {
-      const like = `%${String(q).split('%').join('')}%`
-      where.push(`(vehicle_no ILIKE $${i} OR customer_code ILIKE $${i})`)
-      params.push(like); i++
-    }
-
-    const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : ''
-    const sql = `SELECT * FROM ${fromSql} ${whereSql} ORDER BY invoice_ts_ist DESC LIMIT 50000;`
-
-    const client = await pool.connect()
-    try {
-      const result = await client.query(sql, params)
-      const csv = rowsToCsv(result.rows)
-      const bom = '\uFEFF'
-      const now = new Date().toISOString().slice(0,19).replace(/[:T]/g,'')
-      const wm = franchisee ? `_${franchisee}` : ''
-      const filename = `maxtt_invoices_${now}${wm}.csv`
-
-      res.setHeader('Content-Type', 'text/csv; charset=utf-8')
-      res.setHeader('Content-Disposition', `attachment; filename="${filename}"`)
-      res.setHeader('Cache-Control', 'no-store')
-      res.status(200).send(bom + csv)
-    } finally {
-      client.release()
-    }
-  } catch (err) {
-    res.status(500).json({ ok:false, error:'CSV export failed', message: err?.message || String(err) })
-  }
-})
-
-// ------------ Auth (very light, demo) ------------
-app.post('/api/login', (req, res) => {
-  // Accept anything; return a token so the UI can proceed.
-  res.json({ token: 'token-franchisee' })
-})
-app.post('/api/admin/login', (req, res) => res.json({ token: 'token-admin' }))
-app.post('/api/sa/login',    (req, res) => res.json({ token: 'token-sa' }))
-
-// Profile (static demo info so UI header works)
-app.get('/api/profile', (_req, res) => {
-  res.json({
-    name: 'Franchisee',
-    franchisee_id: 'MAXTT-DEMO-001',
-    gstin: '',
-    address: 'Address not set'
+function inr(n, digits=2){
+  const v = Number(n || 0)
+  return 'Rs. ' + v.toLocaleString('en-IN', {
+    minimumFractionDigits: digits, maximumFractionDigits: digits
   })
-})
+}
+function fmtIST(iso){
+  const d = iso ? new Date(iso) : new Date()
+  const ist = new Date(d.getTime() + 5.5*60*60*1000)
+  const dd = String(ist.getUTCDate()).padStart(2,'0')
+  const mm = String(ist.getUTCMonth()+1).padStart(2,'0')
+  const yy = String(ist.getUTCFullYear())
+  const hh = String(ist.getUTCHours()).padStart(2,'0')
+  const mi = String(ist.getUTCMinutes()).padStart(2,'0')
+  return `${dd}/${mm}/${yy}, ${hh}:${mi} IST`
+}
+function mmYY(d = new Date()){
+  const mm = String(d.getUTCMonth()+1).padStart(2,'0')
+  const yy = String(d.getUTCFullYear()).slice(-2)
+  return `${mm}${yy}`
+}
+function printedFromNorm(norm) {
+  if (!norm || typeof norm !== "string") return null
+  const m = norm.match(/^(.*)-(\d{4})$/)
+  if (!m) return null
+  const prefix = m[1], seq = m[2]
+  return `${prefix}/${mmYY()}/${seq}`
+}
+const safe = (v, alt='—') => (v === null || v === undefined || String(v).trim()==='') ? alt : String(v)
+function tyreSizeFmt(w,a,r){
+  const W = safe(w,'-'), A = safe(a,'-'), R = safe(r,'-')
+  if (W==='-' && R==='-') return '—'
+  if (A==='-' || A==='—') return `${W} R${R}`.replace('  ',' ')
+  return `${W}/${A} R${R}`.replace('  ',' ')
+}
 
-// ------------ Invoices: list / get / create / update / summary ------------
-app.get('/api/invoices', async (req, res) => {
+// ------------------------------- Health --------------------------------
+app.get('/', (_req,res)=>res.send('MaxTT Billing API is running'))
+app.get('/api/health', (_req,res)=>res.json({ ok:true }))
+
+// ------------------------------- Auth ----------------------------------
+function requireSA(req,res,next){
+  const key = req.get('X-SA-KEY') || ''
+  const expect = process.env.SUPER_ADMIN_KEY || ''
+  if (!expect) return res.status(500).json({ ok:false, error:'super_admin_key_not_set' })
+  if (key !== expect) return res.status(401).json({ ok:false, error:'unauthorized' })
+  next()
+}
+function requireAdmin(req,res,next){
+  const key = req.get('X-ADMIN-KEY') || ''
+  const expect = process.env.ADMIN_KEY || ''
+  if (!expect) return res.status(500).json({ ok:false, error:'admin_key_not_set' })
+  if (key !== expect) return res.status(401).json({ ok:false, error:'unauthorized' })
+  next()
+}
+
+// ---------------------- Invoices: create (matches your flows) ----------
+app.post('/api/invoices/full', async (req,res)=>{
   const client = await pool.connect()
-  try {
-    const cols = await getInvoiceCols(client)
-    const selects = [
-      sel(cols, 'id', ['id','invoice_id']),
-      sel(cols, 'created_at', ['created_at','invoice_date','date','createdon','created_on']),
-      sel(cols, 'customer_name', ['customer_name','customer']),
-      sel(cols, 'vehicle_number', ['vehicle_number','vehicle_no','registration_no','reg_no']),
-      sel(cols, 'vehicle_type', ['vehicle_type','category']),
-      sel(cols, 'tyre_count', ['tyre_count','no_of_tyres','number_of_tyres']),
-      sel(cols, 'fitment_locations', ['fitment_locations','fitment','fitment_location']),
-      sel(cols, 'dosage_ml', ['dosage_ml','total_qty_ml','qty_ml','quantity_ml']),
-      sel(cols, 'total_with_gst', ['total_with_gst','total_amount','grand_total','total']),
-      sel(cols, 'total_before_gst', ['total_before_gst','subtotal_ex_gst','subtotal','amount_before_tax']),
-      sel(cols, 'gst_amount', ['gst_amount','tax_amount','gst_value']),
-      sel(cols, 'price_per_ml', ['price_per_ml','mrp_per_ml']),
-      sel(cols, 'tyre_width_mm', ['tyre_width_mm','tyre_width']),
-      sel(cols, 'aspect_ratio', ['aspect_ratio']),
-      sel(cols, 'rim_diameter_in', ['rim_diameter_in','rim_diameter']),
-      sel(cols, 'tread_depth_mm', ['tread_depth_mm','tread_depth']),
-      sel(cols, 'installer_name', ['installer_name'])
-    ]
-    const where = []
-    const params = []
-    let i = 1
-    // filters
-    if (req.query.q) {
-      const like = `%${String(req.query.q).split('%').join('')}%`
-      const or = []
-      if (has(cols,'vehicle_number')) or.push(`i."vehicle_number" ILIKE $${i}`)
-      if (has(cols,'vehicle_no'))     or.push(`i."vehicle_no" ILIKE $${i}`)
-      if (has(cols,'customer_name'))  or.push(`i."customer_name" ILIKE $${i}`)
-      if (or.length) { where.push(`(${or.join(' OR ')})`); params.push(like); i++ }
-    }
-    if (req.query.from && has(cols,'created_at')) { where.push(`i."created_at"::date >= $${i++}`); params.push(req.query.from) }
-    if (req.query.to   && has(cols,'created_at')) { where.push(`i."created_at"::date <= $${i++}`); params.push(req.query.to) }
-
-    const limit = Math.min( Number(req.query.limit || 500), 5000 )
-    const sql = `
-      SELECT ${selects.join(',\n             ')}
-      FROM public.invoices i
-      ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
-      ORDER BY 1 DESC
-      LIMIT ${limit}
-    `
-    const r = await client.query(sql, params)
-    res.json(r.rows)
-  } catch (err) {
-    res.status(500).json({ ok:false, where:'list_invoices', message: err?.message || String(err) })
-  } finally {
-    client.release()
-  }
-})
-
-app.get('/api/invoices/:id', async (req, res) => {
-  const client = await pool.connect()
-  try {
-    const cols = await getInvoiceCols(client)
-    const selects = [
-      sel(cols,'id',['id','invoice_id']),
-      sel(cols,'created_at',['created_at','invoice_date','date','createdon','created_on']),
-      sel(cols,'customer_name',['customer_name','customer']),
-      sel(cols,'mobile_number',['mobile_number','mobile','phone']),
-      sel(cols,'vehicle_number',['vehicle_number','vehicle_no','registration_no','reg_no']),
-      sel(cols,'vehicle_type',['vehicle_type','category']),
-      sel(cols,'tyre_count',['tyre_count','no_of_tyres','number_of_tyres']),
-      sel(cols,'tyre_width_mm',['tyre_width_mm','tyre_width']),
-      sel(cols,'aspect_ratio',['aspect_ratio']),
-      sel(cols,'rim_diameter_in',['rim_diameter_in','rim_diameter']),
-      sel(cols,'tread_depth_mm',['tread_depth_mm','tread_depth']),
-      sel(cols,'fitment_locations',['fitment_locations','fitment','fitment_location']),
-      sel(cols,'dosage_ml',['dosage_ml','total_qty_ml','qty_ml','quantity_ml']),
-      sel(cols,'price_per_ml',['price_per_ml','mrp_per_ml']),
-      sel(cols,'total_before_gst',['total_before_gst','subtotal_ex_gst','subtotal','amount_before_tax']),
-      sel(cols,'gst_amount',['gst_amount','tax_amount','gst_value']),
-      sel(cols,'total_with_gst',['total_with_gst','total_amount','grand_total','total']),
-      sel(cols,'customer_gstin',['customer_gstin','gstin']),
-      sel(cols,'customer_address',['customer_address','address','site_address_text']),
-      sel(cols,'installer_name',['installer_name']),
-      sel(cols,'customer_signature',['customer_signature']),
-      sel(cols,'signed_at',['signed_at']),
-      sel(cols,'consent_signature',['consent_signature']),
-      sel(cols,'consent_signed_at',['consent_signed_at']),
-      sel(cols,'consent_snapshot',['consent_snapshot'])
-    ]
-    const idCol = has(await getInvoiceCols(client),'id') ? 'id' : 'invoice_id'
-    const sql = `
-      SELECT ${selects.join(',\n             ')}
-      FROM public.invoices i
-      WHERE i.${qid(idCol)} = $1
-      LIMIT 1
-    `
-    const r = await client.query(sql, [req.params.id])
-    if (!r.rows.length) return res.status(404).json({ ok:false, error:'not_found' })
-    res.json(r.rows[0])
-  } catch (err) {
-    res.status(500).json({ ok:false, where:'get_invoice', message: err?.message || String(err) })
-  } finally {
-    client.release()
-  }
-})
-
-app.post('/api/invoices', async (req, res) => {
-  const client = await pool.connect()
-  try {
-    const cols = await getInvoiceCols(client)
-    // Only insert keys that exist in your table
-    const payload = req.body || {}
-    const keys = Object.keys(payload).filter(k => has(cols, k))
-    if (!keys.length) return res.status(400).json({ ok:false, error:'no_matching_columns' })
-
-    const colSql = keys.map(k => qid(k)).join(', ')
-    const valSql = keys.map((_,idx) => `$${idx+1}`).join(', ')
-    const vals = keys.map(k => payload[k])
-
-    const sql = `INSERT INTO public.invoices (${colSql}) VALUES (${valSql}) RETURNING *`
-    const r = await client.query(sql, vals)
-
-    // respond first
-    res.status(201).json(r.rows[0])
-
-    // then fire-and-forget — pass transient fields used for referral capture
-    const refCtx = {
-      ...r.rows[0],
-      __raw_referral_code: req.body?.referral_code_raw || '',
-      __remarks: req.body?.remarks || req.body?.notes || req.body?.comment || '',
-      __franchisee_hint: req.body?.franchisee_code || ''
-    }
-    setImmediate(() => {
-      try { sendForInvoice(refCtx) } catch (e) { /* never throw */ }
-    })
-  } catch (err) {
-    res.status(500).json({ ok:false, where:'create_invoice', message: err?.message || String(err) })
-  } finally {
-    client.release()
-  }
-})
-
-app.put('/api/invoices/:id', async (req, res) => {
-  const client = await pool.connect()
-  try {
-    const cols = await getInvoiceCols(client)
-    const payload = req.body || {}
-    const keys = Object.keys(payload).filter(k => has(cols, k))
-    if (!keys.length) return res.status(400).json({ ok:false, error:'no_matching_columns' })
-
-    const sets = keys.map((k,idx) => `${qid(k)} = $${idx+1}`).join(', ')
-    const vals = keys.map(k => payload[k])
-    const idCol = has(cols,'id') ? 'id' : 'invoice_id'
-    const sql = `UPDATE public.invoices SET ${sets} WHERE ${qid(idCol)} = $${keys.length+1} RETURNING *`
-    const r = await client.query(sql, [...vals, req.params.id])
-    if (!r.rows.length) return res.status(404).json({ ok:false, error:'not_found' })
-    res.json(r.rows[0])
-  } catch (err) {
-    res.status(500).json({ ok:false, where:'update_invoice', message: err?.message || String(err) })
-  } finally {
-    client.release()
-  }
-})
-
-app.get('/api/summary', async (req, res) => {
-  const client = await pool.connect()
-  try {
-    const cols = await getInvoiceCols(client)
-    const where = []
-    const params = []
-    let i = 1
-    if (req.query.q) {
-      const like = `%${String(req.query.q).split('%').join('')}%`
-      const or = []
-      if (has(cols,'vehicle_number')) or.push(`i."vehicle_number" ILIKE $${i}`)
-      if (has(cols,'customer_name'))  or.push(`i."customer_name" ILIKE $${i}`)
-      if (or.length) { where.push(`(${or.join(' OR ')})`); params.push(like); i++ }
-    }
-    if (req.query.from && has(cols,'created_at')) { where.push(`i."created_at"::date >= $${i++}`); params.push(req.query.from) }
-    if (req.query.to   && has(cols,'created_at')) { where.push(`i."created_at"::date <= $${i++}`); params.push(req.query.to) }
-
-    const sql = `
-      SELECT
-        COUNT(*)::int AS count,
-        ${has(cols,'dosage_ml') ? `COALESCE(SUM(i."dosage_ml"::numeric),0)` : '0::numeric'} AS dosage_ml,
-        ${has(cols,'total_before_gst') ? `COALESCE(SUM(i."total_before_gst"::numeric),0)` : (has(cols,'subtotal_ex_gst') ? `COALESCE(SUM(i."subtotal_ex_gst"::numeric),0)` : '0::numeric')} AS total_before_gst,
-        ${has(cols,'gst_amount') ? `COALESCE(SUM(i."gst_amount"::numeric),0)` : '0::numeric'} AS gst_amount,
-        ${has(cols,'total_with_gst') ? `COALESCE(SUM(i."total_with_gst"::numeric),0)` : (has(cols,'total_amount') ? `COALESCE(SUM(i."total_amount"::numeric),0)` : '0::numeric')} AS total_with_gst
-      FROM public.invoices i
-      ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
-    `
-    const r = await client.query(sql, params)
-    res.json(r.rows[0])
-  } catch (err) {
-    res.status(500).json({ ok:false, where:'summary', message: err?.message || String(err) })
-  } finally {
-    client.release()
-  }
-})
-
-// ------------ Test route: forward to Referrals (optional) ------------
-app.post('/__wire/referrals/test', async (req, res) => {
-  try {
-    const key = req.get('X-REF-API-KEY') || process.env.REF_API_WRITER_KEY
+  try{
     const body = req.body || {}
+    const franchisee_id = String(body.franchisee_id || body.franchiseeId || '').trim()
+    const tyre_width_mm = Number(body.tyre_width_mm || 195)
+    const rim_diameter_in = Number(body.rim_diameter_in || 15)
+    const tyre_count = Number(body.tyre_count || 4)
+    if (!franchisee_id) return res.status(400).json({ ok:false, error:'missing_franchisee_id' })
 
-    const required = ['referrer_customer_code','referred_invoice_code','franchisee_code','invoice_amount_inr','invoice_date']
-    const miss = required.filter(k => !body[k])
-    if (miss.length) return res.status(400).json({ ok:false, error:'missing', fields: miss })
+    const DEFAULT_QTY_ML = Number(process.env.DEFAULT_QTY_ML || 1200)
+    const MRP_PER_ML = Number(process.env.MRP_PER_ML || process.env.FALLBACK_MRP_PER_ML || 4.5)
+    const total_before_gst = Math.round(DEFAULT_QTY_ML * MRP_PER_ML)
+    const gst_amount = Math.round(total_before_gst * 0.18)
+    const total_with_gst = total_before_gst + gst_amount
 
-    const r = await postReferral(body, key)
-    return res.status(r.ok ? 200 : 502).json(r)
-  } catch (e) {
-    return res.status(500).json({ ok:false, error: String(e?.message || e) })
+    const cols = await getInvoiceCols(client)
+    const fcol = findCol(cols,['franchisee_id','franchisee_code']) || 'franchisee_id'
+    const idCol = findCol(cols,['id','invoice_id']) || 'id'
+
+    const seqQ = await client.query(
+      `SELECT COUNT(*)::int AS c FROM public.invoices WHERE ${qid(fcol)}=$1`, [franchisee_id]
+    )
+    const seq = (seqQ.rows?.[0]?.c || 0) + 1
+    const seqStr = pad(seq,4)
+    const invoice_number_norm = `${franchisee_id}-${seqStr}`
+    const invoice_number = `${franchisee_id}/${mmYY()}/${seqStr}`
+
+    const r = await client.query(`
+      INSERT INTO public.invoices
+      (${qid(fcol)},"invoice_number_norm","invoice_number","tyre_count","tyre_width_mm","rim_diameter_in",
+       "dosage_ml","price_per_ml","total_before_gst","gst_amount","total_with_gst","hsn_code","gst_rate","created_at")
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13, NOW())
+      RETURNING ${qid(idCol)} AS id, "customer_code","invoice_number_norm","invoice_number"
+    `,[
+      franchisee_id, invoice_number_norm, invoice_number, tyre_count, tyre_width_mm, rim_diameter_in,
+      DEFAULT_QTY_ML, MRP_PER_ML, total_before_gst, gst_amount, total_with_gst, '35069999', 18
+    ])
+
+    const row = r.rows[0]
+    res.status(201).json({
+      ok:true,
+      id: row.id,
+      invoice_number: row.invoice_number,
+      invoice_number_norm: row.invoice_number_norm,
+      customer_code: row.customer_code || invoice_number_norm,
+      qty_ml_saved: DEFAULT_QTY_ML
+    })
+  }catch(err){
+    res.status(500).json({ ok:false, where:'create_invoice', message: err?.message || String(err) })
+  }finally{ client.release() }
+})
+
+// ---------------------- Invoices: list / latest / full2 / by-norm ------
+app.get('/api/invoices', async (req,res)=>{
+  const client=await pool.connect()
+  try{
+    const cols=await getInvoiceCols(client)
+    const dcol=findCol(cols,['id','invoice_id','created_at']) || 'id'
+    const params=[]
+    const where=[]
+    if (req.query.franchisee_id) { where.push(`${qid('franchisee_id')} = $${params.length+1}`); params.push(req.query.franchisee_id) }
+    const sql=`
+      SELECT i.*
+      FROM public.invoices i
+      ${where.length ? 'WHERE '+where.join(' AND ') : ''}
+      ORDER BY i.${qid(dcol)} DESC
+      LIMIT ${Math.min(Number(req.query.limit||500),5000)}
+    `
+    const r=await client.query(sql,params)
+    res.json(r.rows)
+  }catch(err){
+    res.status(500).json({ ok:false, where:'list_invoices', message: err?.message || String(err) })
+  }finally{ client.release() }
+})
+
+app.get('/api/invoices/latest', async (_req,res)=>{
+  const client=await pool.connect()
+  try{
+    const cols=await getInvoiceCols(client)
+    const idCol=findCol(cols,['id','invoice_id']) || 'id'
+    const r=await client.query(`SELECT ${qid(idCol)} AS id FROM public.invoices ORDER BY ${qid(idCol)} DESC LIMIT 1`)
+    if(!r.rows.length) return res.status(404).json({ ok:false, error:'empty' })
+    res.json({ id:r.rows[0].id })
+  }catch(err){
+    res.status(500).json({ ok:false, where:'latest', message: err?.message || String(err) })
+  }finally{ client.release() }
+})
+
+app.get(['/api/invoices/:id/full2','/invoices/:id/full2'], async (req,res)=>{
+  const client=await pool.connect()
+  try{
+    const id=Number(req.params.id||0)
+    if (!Number.isFinite(id) || id<=0) return res.status(400).json({ ok:false, error:'bad_id' })
+    const r=await client.query(`SELECT * FROM public.invoices WHERE id=$1 LIMIT 1`,[id])
+    if (!r.rows.length) return res.status(404).json({ ok:false, error:'not_found' })
+    res.setHeader('Cache-Control','no-store')
+    const doc=r.rows[0]
+    const printed = doc.invoice_number || (doc.invoice_number_norm ? printedFromNorm(doc.invoice_number_norm) : null)
+    res.json(printed ? { ...doc, invoice_number: printed } : doc)
+  }catch(err){
+    res.status(500).json({ ok:false, where:'get_invoice_full2', message: err?.message || String(err) })
+  }finally{ client.release() }
+})
+
+app.get('/api/invoices/by-norm/:norm', async (req,res)=>{
+  const client=await pool.connect()
+  try{
+    const norm=String(req.params.norm||'').trim()
+    if(!norm) return res.status(400).json({ ok:false, error:'missing_norm' })
+    const r=await client.query(`SELECT * FROM public.invoices WHERE "invoice_number_norm"=$1 LIMIT 1`,[norm])
+    if(!r.rows.length) return res.status(404).json({ ok:false, error:'not_found' })
+    res.json(r.rows[0])
+  }catch(err){
+    res.status(500).json({ ok:false, where:'by_norm', message: err?.message || err })
+  }finally{ client.release() }
+})
+
+// ---------------------- Franchisee Onboarding (Admin/SA) ---------------
+app.post('/api/super/franchisees/approve/:id', requireSA, async (req,res)=>{
+  const client=await pool.connect()
+  try{
+    const id=Number(req.params.id||0)
+    if (!Number.isFinite(id) || id<=0) return res.status(400).json({ ok:false, error:'bad_id' })
+    const note=(req.body?.note||'').trim()
+    const approver=(req.get('X-SA-USER')||'superadmin').trim()||'superadmin'
+    const nowIso=new Date().toISOString()
+    const r=await client.query(`
+      UPDATE public.franchisees
+      SET status='ACTIVE', approval_by=$2, approval_at=$3, approval_note=$4, rejection_reason=NULL
+      WHERE id=$1 RETURNING *`,[id,approver,nowIso,note])
+    res.json({ ok:true, franchisee:r.rows[0] })
+  }catch(e){
+    res.status(500).json({ ok:false, error:String(e?.message||e) })
+  }finally{ client.release() }
+})
+
+app.post('/api/super/franchisees/reject/:id', requireSA, async (req,res)=>{
+  const client=await pool.connect()
+  try{
+    const id=Number(req.params.id||0)
+    if (!Number.isFinite(id) || id<=0) return res.status(400).json({ ok:false, error:'bad_id' })
+    const reason=(req.body?.reason||'').trim()
+    if (!reason) return res.status(400).json({ ok:false, error:'missing_reason' })
+    const approver=(req.get('X-SA-USER')||'superadmin').trim()||'superadmin'
+    const nowIso=new Date().toISOString()
+    const r=await client.query(`
+      UPDATE public.franchisees
+      SET status='REJECTED', approval_by=$2, approval_at=$3, rejection_reason=$4, approval_note=NULL
+      WHERE id=$1 RETURNING *`,[id,approver,nowIso,reason])
+    res.json({ ok:true, franchisee:r.rows[0] })
+  }catch(e){
+    res.status(500).json({ ok:false, error:String(e?.message||e) })
+  }finally{ client.release() }
+})
+
+// ------------------------------- PDF (5 zones) -------------------------
+// Exact #46-style zones; Zone-2 adds HSN Code + Customer ID. No logo/watermark.
+app.get('/api/invoices/:id/pdf', async (req,res)=>{
+  const id = Number(req.params.id || 0)
+  if (!Number.isFinite(id) || id <= 0) return res.status(400).json({ error:'bad_id' })
+  const download = String(req.query.download||'').trim() === '1'
+
+  const client = await pool.connect()
+  try{
+    const ir = await client.query(`SELECT * FROM public.invoices WHERE id=$1 LIMIT 1`, [id])
+    if (!ir.rows.length) return res.status(404).json({ error:'not_found' })
+    const inv = ir.rows[0]
+
+    // Franchisee header
+    const frCode = inv.franchisee_id || inv.franchisee_code || ''
+    let fr = null
+    if (frCode) {
+      const frq = await client.query(`SELECT * FROM public.franchisees WHERE code=$1 LIMIT 1`, [frCode])
+      fr = frq.rows[0] || null
+    }
+
+    const printed = inv.invoice_number || printedFromNorm(inv.invoice_number_norm) || `INV-${id}`
+    const when = fmtIST(inv.created_at)
+    const cdisp = download ? 'attachment' : 'inline'
+    res.setHeader('Content-Type', 'application/pdf')
+    res.setHeader('Content-Disposition', `${cdisp}; filename="${printed}.pdf"`)
+
+    const doc = new PDFDocument({ size:'A4', margin:36 })
+    doc.pipe(res)
+
+    // ---------- Header (two-column) ----------
+    // Left block: franchisee details
+    doc.fontSize(12).text(safe(fr?.legal_name, 'Franchisee'), { width: 330 })
+    doc.moveDown(0.1)
+    const addr = [fr?.address1, fr?.address2].filter(Boolean).join(', ')
+    doc.fontSize(9).text(safe(addr,'Address not set'), { width: 330 })
+    doc.text(`Franchisee ID: ${safe(frCode)}`, { width: 330 })
+    const gstin = safe(fr?.gstin, '')
+    if (gstin !== '—') doc.text(`GSTIN: ${gstin}`, { width: 330 })
+
+    // Right block: Invoice No + Date (box)
+    const rightX = 352, metaW = 204, topY = 36
+    doc.roundedRect(rightX, topY, metaW, 60, 6).stroke()
+    doc.fontSize(10)
+    doc.text(`Invoice No: ${printed}`, rightX+8, topY+8, { width: metaW-16, height:14 })
+    doc.text(`Date: ${when}`,           rightX+8, topY+28, { width: metaW-16, height:14 })
+
+    doc.moveDown(0.6)
+
+    // ---------- Zone 2: Customer Details (+HSN +Customer ID) ----------
+    const z2Y = doc.y
+    doc.roundedRect(36, z2Y, 520, 96, 6).stroke()
+    doc.fontSize(10).text('Customer Details', 44, z2Y+6)
+    doc.fontSize(10)
+    doc.text(`Name: ${safe(inv.customer_name)}`, 44, z2Y+22, { width: 250 })
+    doc.text(`Mobile: ${safe(inv.mobile_number)}`, 300, z2Y+22, { width: 240 })
+    doc.text(`Vehicle: ${safe(inv.vehicle_number)}`, 44, z2Y+38, { width: 250 })
+    doc.text(`Odometer Reading: ${safe(inv.odometer)} km`, 300, z2Y+38, { width: 240 })
+    doc.text(`Customer GSTIN: ${safe(inv.customer_gstin)}`, 44, z2Y+54, { width: 250 })
+    doc.text(`Address: ${safe(inv.customer_address)}`, 300, z2Y+54, { width: 240 })
+    doc.text(`Installer: ${safe(inv.installer_name)}`, 44, z2Y+70, { width: 250 })
+    const hsn = inv.hsn_code || '35069999'
+    doc.text(`HSN Code: ${hsn}`, 300, z2Y+70, { width: 240 })
+    doc.text(`Customer ID: ${safe(inv.customer_code)}`, 44, z2Y+86, { width: 250 })
+
+    doc.moveDown(7)
+
+    // ---------- Zone 3: Vehicle Details ----------
+    const z3Y = doc.y
+    doc.roundedRect(36, z3Y, 520, 58, 6).stroke()
+    doc.fontSize(10).text('Vehicle Details', 44, z3Y+6)
+    doc.fontSize(10)
+    doc.text(`Category: ${safe(inv.vehicle_type,'—')}`, 44, z3Y+22, { width: 250 })
+    doc.text(`Tyres: ${safe(inv.tyre_count)}`, 300, z3Y+22, { width: 240 })
+    const installed = safe(inv.fitment_locations,'') || `${safe(inv.tyre_count)}`
+    doc.text(`Installed Tyres: ${installed}`, 44, z3Y+38, { width: 250 })
+    const tyreSize = tyreSizeFmt(inv.tyre_width_mm, inv.aspect_ratio, inv.rim_diameter_in) // e.g. 195/65 R17 or 195 R15
+    doc.text(`Tyre Size: ${tyreSize}`, 300, z3Y+38, { width: 240 })
+
+    doc.moveDown(6)
+
+    // ---------- Zone 4: Fitment & Tread Depth (table rows) ----------
+    const z4Y = doc.y
+    const boxH = 88
+    doc.roundedRect(36, z4Y, 520, boxH, 6).stroke()
+    doc.fontSize(10).text('Fitment & Tread Depth (mm)', 44, z4Y+6)
+    // Header
+    doc.fontSize(9).text('Position', 44, z4Y+24)
+    doc.text('Tread (mm)', 300, z4Y+24, { width: 240 })
+    // Rows
+    const rows = [
+      ['Front Left',  safe(inv.tread_fl_mm)],
+      ['Front Right', safe(inv.tread_fr_mm)],
+      ['Rear Left',   safe(inv.tread_rl_mm)],
+      ['Rear Right',  safe(inv.tread_rr_mm)],
+    ]
+    let ry = z4Y + 40
+    for (const [pos, val] of rows){
+      doc.fontSize(10).text(pos, 44, ry, { width: 240 })
+      doc.text(val, 300, ry, { width: 240 })
+      ry += 16
+    }
+    // Dosage summary (bottom)
+    const perTyre = inv.tyre_count ? Math.round((Number(inv.dosage_ml||0) / Number(inv.tyre_count))*10)/10 : null
+    doc.text(`Per-tyre Dosage: ${perTyre ? perTyre+' ml' : '—'}`, 44, z4Y + boxH - 14)
+    doc.text(`Total Dosage: ${safe(inv.dosage_ml)} ml`, 300, z4Y + boxH - 14)
+
+    doc.moveDown(6)
+
+    // ---------- Zone 5: Pricing (Description / Value) ----------
+    const z5Y = doc.y
+    doc.roundedRect(36, z5Y, 520, 156, 6).stroke()
+    doc.fontSize(10).text('Description', 44, z5Y+6)
+    doc.text('Value', 340, z5Y+6, { width: 200, align: 'right' })
+    const Lx = 44, Rx = 340
+    const V = (y, k, v) => { doc.text(k, Lx, y); doc.text(v, Rx, y, { width: 200, align:'right' }) }
+    const mrp = inv.price_per_ml ?? 4.5
+    V(z5Y+22, 'Total Dosage (ml)', safe(inv.dosage_ml,'—'))
+    V(z5Y+38, 'MRP per ml', inr(mrp, 2))
+    V(z5Y+54, 'Gross', inr(inv.total_before_gst || (Number(inv.dosage_ml||0)*Number(mrp||0))))
+    if (inv.discount_amount != null)      V(z5Y+70, 'Discount', `- ${inr(inv.discount_amount)}`)
+    if (inv.installation_charges != null) V(z5Y+86, 'Installation Charges', inr(inv.installation_charges))
+    V(z5Y+102, 'Tax Mode', safe(inv.tax_mode || 'CGST+SGST'))
+    const gstRate = Number(inv.gst_rate ?? 18)
+    const half = gstRate/2
+    const isIGST = String(inv.tax_mode||'').toUpperCase().includes('IGST')
+    if (isIGST) {
+      V(z5Y+118, `IGST (${gstRate}%)`, inr(inv.gst_amount ?? 0))
+      V(z5Y+134, `CGST (${half}%)`, inr(0))
+      V(z5Y+150, `SGST (${half}%)`, inr(0))
+    } else {
+      const halfAmt = (Number(inv.gst_amount ?? 0) / 2)
+      V(z5Y+118, `CGST (${half}%)`, inr(halfAmt))
+      V(z5Y+134, `SGST (${half}%)`, inr(halfAmt))
+      V(z5Y+150, `IGST (${gstRate}%)`, inr(0))
+    }
+    // Totals line + three totals
+    doc.moveTo(36, z5Y+172).lineTo(556, z5Y+172).stroke()
+    const TL = (t,y)=> doc.text(t, 44, y)
+    const TV = (t,y)=> doc.text(t, 340, y, { width:200, align:'right' })
+    TL('Amount (before GST)', z5Y+178); TV(inr(inv.total_before_gst ?? 0), z5Y+178)
+    TL('GST Total', z5Y+194);          TV(inr(inv.gst_amount ?? 0), z5Y+194)
+    TL('Total (with GST)', z5Y+210);   TV(inr(inv.total_with_gst ?? 0), z5Y+210)
+
+    doc.moveDown(9)
+
+    // ---------- Declarations & Signatures ----------
+    doc.fontSize(9).text('Customer Declaration', { underline:true })
+    doc.text('1. I hereby acknowledge that the MaxTT Tyre Sealant installation has been completed on my vehicle to my satisfaction, as per my earlier consent to proceed.')
+    doc.text('2. I have read, understood, and accepted the Terms & Conditions stated herein.')
+    doc.text('3. I acknowledge that the total amount shown is correct and payable to the franchisee/installer of Treadstone Solutions.')
+    doc.moveDown(0.4)
+    doc.text('Terms & Conditions', { underline:true })
+    doc.text('1. The MaxTT Tyre Sealant is a preventive safety solution designed to reduce tyre-related risks and virtually eliminate punctures and blowouts.')
+    doc.text('2. Effectiveness is assured only when the vehicle is operated within the speed limits prescribed by competent traffic/transport authorities (RTO/Transport Department) in India.')
+    doc.text('3. Jurisdiction: Gurgaon.')
+
+    doc.moveDown(1)
+    const y = doc.y
+    doc.rect(36, y, 240, 58).stroke(); doc.text('Installer Signature & Stamp', 44, y+42)
+    doc.rect(320, y, 240, 58).stroke(); doc.text('Customer Accepted & Confirmed', 328, y+42)
+    doc.text(`Signed at: ${when}`, 36, y+70)
+
+    doc.end()
+  }catch(e){
+    res.status(500).json({ error:'pdf_failed', message: e?.message || String(e) })
+  }finally{
+    client.release()
   }
 })
 
-// ------------ Start server ------------
-const port = process.env.PORT || 3001
-app.listen(port, () => {
-  console.log(`Billing API listening on :${port}`)
-})
+// ------------------------------- 404 -----------------------------------
+app.use((_req,res)=>res.status(404).json({ error:'not_found' }))
+
+// ------------------------------ Start ----------------------------------
+const port=Number(process.env.PORT||10000)
+app.listen(port, ()=>console.log(`Billing API listening on :${port}`))
