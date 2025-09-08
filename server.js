@@ -1,6 +1,6 @@
 // server.js — MaxTT / Treadstone Solutions Billing API (ESM)
-// v3: PDF matches 5-zone layout like invoice #46; Zone-2 adds HSN Code + Customer ID.
-// No logo, no PDF watermark (prints on pre-watermarked sheets).
+// v3.1: PDF fixes to match #46: wider meta box (no wrap), tyre-size when aspect missing, IST format, spacing.
+// No logo, no watermark; 5-zone layout; Zone-2 includes HSN Code + Customer ID.
 
 import express from 'express'
 import pkg from 'pg'
@@ -61,20 +61,13 @@ function inr(n, digits=2){
 }
 function fmtIST(iso){
   const d = iso ? new Date(iso) : new Date()
-  // DD/MM/YYYY, HH:mm IST
-  const dd = String(d.getUTCDate()).padStart(2,'0')
-  const mm = String(d.getUTCMonth()+1).padStart(2,'0')
-  const yy = String(d.getUTCFullYear())
-  const hh = String(d.getUTCHours()).padStart(2,'0')
-  const mi = String(d.getUTCMinutes()).padStart(2,'0')
-  // Convert UTC parts to IST quickly by constructing in UTC then shifting:
   const ist = new Date(d.getTime() + 5.5*60*60*1000)
-  const dd2 = String(ist.getUTCDate()).padStart(2,'0')
-  const mm2 = String(ist.getUTCMonth()+1).padStart(2,'0')
-  const yy2 = String(ist.getUTCFullYear())
-  const hh2 = String(ist.getUTCHours()).padStart(2,'0')
-  const mi2 = String(ist.getUTCMinutes()).padStart(2,'0')
-  return `${dd2}/${mm2}/${yy2}, ${hh2}:${mi2} IST`
+  const dd = String(ist.getUTCDate()).padStart(2,'0')
+  const mm = String(ist.getUTCMonth()+1).padStart(2,'0')
+  const yy = String(ist.getUTCFullYear())
+  const hh = String(ist.getUTCHours()).padStart(2,'0')
+  const mi = String(ist.getUTCMinutes()).padStart(2,'0')
+  return `${dd}/${mm}/${yy}, ${hh}:${mi} IST`
 }
 function mmYY(d = new Date()){
   const mm = String(d.getUTCMonth()+1).padStart(2,'0')
@@ -93,7 +86,7 @@ function safe(v, alt='—'){ return (v === null || v === undefined || String(v).
 function tyreSizeFmt(w,a,r){
   const W = safe(w,'-'), A = safe(a,'-'), R = safe(r,'-')
   if (W==='-' && R==='-') return '—'
-  if (A==='-') return `${W}/ R${R}`.replace('//','/').replace('  ',' ')
+  if (A==='-' || A==='—') return `${W} R${R}`.replace('  ',' ')
   return `${W}/${A} R${R}`.replace('  ',' ')
 }
 
@@ -130,17 +123,13 @@ app.post('/api/invoices/full', async (req,res)=>{
     if (!franchisee_id) return res.status(400).json({ ok:false, error:'missing_franchisee_id' })
 
     const DEFAULT_QTY_ML = Number(process.env.DEFAULT_QTY_ML || 1200)
-    const MRP_PER_ML = Number(process.env.MRP_PER_ML || process.env.FALLBACK_MRP_PER_ML || 4.5)
-    const total_before_gst = Math.round(DEFAULT_QTY_ML * MRP_PER_ML)
-    const gst_amount = Math.round(total_before_gst * 0.18)
-    const total_with_gst = total_before_gst + gst_amount
+    someDefaults() // keep function below for clarity
+    const { MRP_PER_ML, total_before_gst, gst_amount, total_with_gst } = someDefaults(DEFAULT_QTY_ML)
 
     const cols = await getInvoiceCols(client)
     const fcol = findCol(cols,['franchisee_id','franchisee_code']) || 'franchisee_id'
     const idCol = findCol(cols,['id','invoice_id']) || 'id'
-    const seqQ = await client.query(
-      `SELECT COUNT(*)::int AS c FROM public.invoices WHERE ${qid(fcol)}=$1`, [franchisee_id]
-    )
+    const seqQ = await client.query(`SELECT COUNT(*)::int AS c FROM public.invoices WHERE ${qid(fcol)}=$1`, [franchisee_id])
     const seq = (seqQ.rows?.[0]?.c || 0) + 1
     const seqStr = pad(seq,4)
     const invoice_number_norm = `${franchisee_id}-${seqStr}`
@@ -170,6 +159,13 @@ app.post('/api/invoices/full', async (req,res)=>{
     res.status(500).json({ ok:false, where:'create_invoice', message: err?.message || String(err) })
   }finally{ client.release() }
 })
+function someDefaults(DEFAULT_QTY_ML=1200){
+  const MRP_PER_ML = Number(process.env.MRP_PER_ML || process.env.FALLBACK_MRP_PER_ML || 4.5)
+  const total_before_gst = Math.round(DEFAULT_QTY_ML * MRP_PER_ML)
+  const gst_amount = Math.round(total_before_gst * 0.18)
+  const total_with_gst = total_before_gst + gst_amount
+  return { MRP_PER_ML, total_before_gst, gst_amount, total_with_gst }
+}
 
 // ---------------------- Invoices: list / latest / full2 / by-norm ------
 app.get('/api/invoices', async (req,res)=>{
@@ -233,9 +229,7 @@ app.get('/api/invoices/by-norm/:norm', async (req,res)=>{
   }finally{ client.release() }
 })
 
-// ------------------------------- PDF (5 zones) -------------------------
-// Layout mirrors your invoice #46; titles/order; no logo/watermark.
-// Zone-2 includes HSN Code + Customer ID at the bottom (your request).
+// ------------------------------- PDF (5 zones; v3.1 tweaks) -----------
 app.get('/api/invoices/:id/pdf', async (req,res)=>{
   const id = Number(req.params.id || 0)
   if (!Number.isFinite(id) || id <= 0) return res.status(400).json({ error:'bad_id' })
@@ -263,18 +257,18 @@ app.get('/api/invoices/:id/pdf', async (req,res)=>{
     const doc = new PDFDocument({ size:'A4', margin:36 })
     doc.pipe(res)
 
-    // ---------- Header (two-column) ----------
+    // ---------- Header ----------
     // Left: Franchisee block
-    doc.fontSize(12).text(safe(fr?.legal_name, 'Franchisee'), { width: 320 })
+    doc.fontSize(12).text(safe(fr?.legal_name, 'Franchisee'), { width: 330 })
     doc.moveDown(0.1)
     const addr = [fr?.address1, fr?.address2].filter(Boolean).join(', ')
-    doc.fontSize(9).text(safe(addr,'Address not set'), { width: 320 })
-    doc.text(`Franchisee ID: ${safe(frCode)}`, { width: 320 })
+    doc.fontSize(9).text(safe(addr,'Address not set'), { width: 330 })
+    doc.text(`Franchisee ID: ${safe(frCode)}`, { width: 330 })
     const gstin = safe(fr?.gstin, '')
-    if (gstin !== '—') doc.text(`GSTIN: ${gstin}`, { width: 320 })
+    if (gstin !== '—') doc.text(`GSTIN: ${gstin}`, { width: 330 })
 
-    // Right: Invoice meta box (single-line no wrap)
-    const rightX = 365, metaW = 190, topY = 36
+    // Right: Invoice meta box (wider to avoid wrap)
+    const rightX = 352, metaW = 204, topY = 36
     doc.roundedRect(rightX, topY, metaW, 60, 6).stroke()
     doc.fontSize(10)
     doc.text(`Invoice No: ${printed}`, rightX+8, topY+8, { width: metaW-16, height:14 })
@@ -284,7 +278,7 @@ app.get('/api/invoices/:id/pdf', async (req,res)=>{
 
     // ---------- Zone 2: Customer Details (with HSN + Customer ID) ----------
     const z2Y = doc.y
-    doc.roundedRect(36, z2Y, 520, 92, 6).stroke()
+    doc.roundedRect(36, z2Y, 520, 96, 6).stroke()
     doc.fontSize(10).text('Customer Details', 44, z2Y+6)
     doc.fontSize(10)
     doc.text(`Name: ${safe(inv.customer_name)}`, 44, z2Y+22, { width: 250 })
@@ -294,11 +288,10 @@ app.get('/api/invoices/:id/pdf', async (req,res)=>{
     doc.text(`Customer GSTIN: ${safe(inv.customer_gstin)}`, 44, z2Y+54, { width: 250 })
     doc.text(`Address: ${safe(inv.customer_address)}`, 300, z2Y+54, { width: 240 })
     doc.text(`Installer: ${safe(inv.installer_name)}`, 44, z2Y+70, { width: 250 })
-    // Additions (bottom row)
+    // Additions
     const hsn = inv.hsn_code || '35069999'
     doc.text(`HSN Code: ${hsn}`, 300, z2Y+70, { width: 240 })
-
-    // Second line for Customer ID (under Installer/HSN)
+    // Second line below
     doc.text(`Customer ID: ${safe(inv.customer_code)}`, 44, z2Y+86, { width: 250 })
 
     doc.moveDown(7)
@@ -327,14 +320,13 @@ app.get('/api/invoices/:id/pdf', async (req,res)=>{
     doc.text(`Front Right: ${safe(inv.tread_fr_mm)}`, 300, rowY1, { width: 240 })
     doc.text(`Rear Left: ${safe(inv.tread_rl_mm)}`, 44, rowY2, { width: 240 })
     doc.text(`Rear Right: ${safe(inv.tread_rr_mm)}`, 300, rowY2, { width: 240 })
-    // dosage summary
     const perTyre = inv.tyre_count ? Math.round((Number(inv.dosage_ml||0) / Number(inv.tyre_count))*10)/10 : null
     doc.text(`Per-tyre Dosage: ${perTyre ? perTyre+' ml' : '—'}`, 44, z4Y+58)
     doc.text(`Total Dosage: ${safe(inv.dosage_ml)} ml`, 300, z4Y+58)
 
     doc.moveDown(6)
 
-    // ---------- Zone 5: Pricing (Description / Value list) ----------
+    // ---------- Zone 5: Pricing ----------
     const z5Y = doc.y
     doc.roundedRect(36, z5Y, 520, 156, 6).stroke()
     doc.fontSize(10).text('Description', 44, z5Y+6)
@@ -349,7 +341,6 @@ app.get('/api/invoices/:id/pdf', async (req,res)=>{
     V(z5Y+102, 'Tax Mode', safe(inv.tax_mode || 'CGST+SGST'))
     const gstRate = Number(inv.gst_rate ?? 18)
     const half = gstRate/2
-    // Always display CGST, SGST, IGST rows (IGST=0 under CGST+SGST)
     const isIGST = String(inv.tax_mode||'').toUpperCase().includes('IGST')
     if (isIGST) {
       V(z5Y+118, `IGST (${gstRate}%)`, inr(inv.gst_amount ?? 0))
@@ -361,8 +352,6 @@ app.get('/api/invoices/:id/pdf', async (req,res)=>{
       V(z5Y+134, `SGST (${half}%)`, inr(halfAmt))
       V(z5Y+150, `IGST (${gstRate}%)`, inr(0))
     }
-
-    // Totals separator + three lines
     doc.moveTo(36, z5Y+172).lineTo(556, z5Y+172).stroke()
     const TL = (t,y)=> doc.text(t, 44, y)
     const TV = (t,y)=> doc.text(t, 340, y, { width:200, align:'right' })
@@ -372,7 +361,7 @@ app.get('/api/invoices/:id/pdf', async (req,res)=>{
 
     doc.moveDown(9)
 
-    // ---------- Declarations & Terms (as #46 tone) ----------
+    // ---------- Declarations & Signatures ----------
     doc.fontSize(9).text('Customer Declaration', { underline:true })
     doc.text('1. I hereby acknowledge that the MaxTT Tyre Sealant installation has been completed on my vehicle to my satisfaction, as per my earlier consent to proceed.')
     doc.text('2. I have read, understood, and accepted the Terms & Conditions stated herein.')
@@ -382,10 +371,7 @@ app.get('/api/invoices/:id/pdf', async (req,res)=>{
     doc.text('1. The MaxTT Tyre Sealant is a preventive safety solution designed to reduce tyre-related risks and virtually eliminate punctures and blowouts.')
     doc.text('2. Effectiveness is assured only when the vehicle is operated within the speed limits prescribed by competent traffic/transport authorities (RTO/Transport Department) in India.')
     doc.text('3. Jurisdiction: Gurgaon.')
-
     doc.moveDown(1)
-
-    // ---------- Signatures ----------
     const y = doc.y
     doc.rect(36, y, 240, 58).stroke(); doc.text('Installer Signature & Stamp', 44, y+42)
     doc.rect(320, y, 240, 58).stroke(); doc.text('Customer Accepted & Confirmed', 328, y+42)
