@@ -1,20 +1,21 @@
-// server.js — Treadstone Solutions / MaxTT Billing API (ESM)
-// NOTE: PDF matches 5-zone layout from Invoice #46; Zone-2 includes HSN Code + Customer ID.
-// No TS logo, no watermark; intended for printing on pre-watermarked sheets.
+// server.js — MaxTT / Treadstone Solutions Billing API (ESM)
+// v3: PDF matches 5-zone layout like invoice #46; Zone-2 adds HSN Code + Customer ID.
+// No logo, no PDF watermark (prints on pre-watermarked sheets).
 
 import express from 'express'
 import pkg from 'pg'
 const { Pool } = pkg
 import { fileURLToPath } from 'url'
 import path from 'path'
-import PDFDocument from 'pdfkit' // PDF generation
+import PDFDocument from 'pdfkit'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
 const app = express()
 
 // ------------------------------- CORS ---------------------------------
-const ORIGINS = (process.env.ALLOWED_ORIGINS || 'https://maxtt-billing-tools.onrender.com,https://maxtt-billing-frontend.onrender.com')
+const ORIGINS = (process.env.ALLOWED_ORIGINS ||
+  'https://maxtt-billing-frontend.onrender.com,https://maxtt-billing-tools.onrender.com')
   .split(',').map(s => s.trim()).filter(Boolean)
 
 app.use((req, res, next) => {
@@ -58,6 +59,23 @@ function inr(n, digits=2){
   if (!isFinite(v)) return String(n)
   return 'Rs. ' + v.toLocaleString('en-IN', { minimumFractionDigits: digits, maximumFractionDigits: digits })
 }
+function fmtIST(iso){
+  const d = iso ? new Date(iso) : new Date()
+  // DD/MM/YYYY, HH:mm IST
+  const dd = String(d.getUTCDate()).padStart(2,'0')
+  const mm = String(d.getUTCMonth()+1).padStart(2,'0')
+  const yy = String(d.getUTCFullYear())
+  const hh = String(d.getUTCHours()).padStart(2,'0')
+  const mi = String(d.getUTCMinutes()).padStart(2,'0')
+  // Convert UTC parts to IST quickly by constructing in UTC then shifting:
+  const ist = new Date(d.getTime() + 5.5*60*60*1000)
+  const dd2 = String(ist.getUTCDate()).padStart(2,'0')
+  const mm2 = String(ist.getUTCMonth()+1).padStart(2,'0')
+  const yy2 = String(ist.getUTCFullYear())
+  const hh2 = String(ist.getUTCHours()).padStart(2,'0')
+  const mi2 = String(ist.getUTCMinutes()).padStart(2,'0')
+  return `${dd2}/${mm2}/${yy2}, ${hh2}:${mi2} IST`
+}
 function mmYY(d = new Date()){
   const mm = String(d.getUTCMonth()+1).padStart(2,'0')
   const yy = String(d.getUTCFullYear()).slice(-2)
@@ -72,6 +90,12 @@ function printedFromNorm(norm) {
   return `${prefix}/${mmYY()}/${seq}`
 }
 function safe(v, alt='—'){ return (v === null || v === undefined || String(v).trim()==='') ? alt : String(v) }
+function tyreSizeFmt(w,a,r){
+  const W = safe(w,'-'), A = safe(a,'-'), R = safe(r,'-')
+  if (W==='-' && R==='-') return '—'
+  if (A==='-') return `${W}/ R${R}`.replace('//','/').replace('  ',' ')
+  return `${W}/${A} R${R}`.replace('  ',' ')
+}
 
 // ------------------------------- Health --------------------------------
 app.get('/', (_req,res)=>res.send('MaxTT Billing API is running'))
@@ -190,7 +214,6 @@ app.get(['/api/invoices/:id/full2','/invoices/:id/full2'], async (req,res)=>{
     if (!r.rows.length) return res.status(404).json({ ok:false, error:'not_found' })
     res.setHeader('Cache-Control','no-store')
     const doc=r.rows[0]
-    // If printed missing but norm exists, compute on-the-fly for response
     const printed = doc.invoice_number || (doc.invoice_number_norm ? printedFromNorm(doc.invoice_number_norm) : null)
     res.json(printed ? { ...doc, invoice_number: printed } : doc)
   }catch(err){
@@ -210,21 +233,20 @@ app.get('/api/invoices/by-norm/:norm', async (req,res)=>{
   }finally{ client.release() }
 })
 
-// ------------------------------- PDF (5 zones, no logo/watermark) ------
+// ------------------------------- PDF (5 zones) -------------------------
+// Layout mirrors your invoice #46; titles/order; no logo/watermark.
+// Zone-2 includes HSN Code + Customer ID at the bottom (your request).
 app.get('/api/invoices/:id/pdf', async (req,res)=>{
   const id = Number(req.params.id || 0)
   if (!Number.isFinite(id) || id <= 0) return res.status(400).json({ error:'bad_id' })
-
   const download = String(req.query.download||'').trim() === '1'
 
   const client = await pool.connect()
   try{
-    // Invoice row
     const ir = await client.query(`SELECT * FROM public.invoices WHERE id=$1 LIMIT 1`, [id])
     if (!ir.rows.length) return res.status(404).json({ error:'not_found' })
     const inv = ir.rows[0]
 
-    // Franchisee row (for header details)
     const frCode = inv.franchisee_id || inv.franchisee_code || ''
     let fr = null
     if (frCode) {
@@ -233,127 +255,133 @@ app.get('/api/invoices/:id/pdf', async (req,res)=>{
     }
 
     const printed = inv.invoice_number || printedFromNorm(inv.invoice_number_norm) || `INV-${id}`
+    const when = fmtIST(inv.created_at)
     const cdisp = download ? 'attachment' : 'inline'
     res.setHeader('Content-Type', 'application/pdf')
     res.setHeader('Content-Disposition', `${cdisp}; filename="${printed}.pdf"`)
 
-    const doc = new PDFDocument({ size:'A4', margin:36 }) // slightly tighter margin to fit 5 zones neatly
+    const doc = new PDFDocument({ size:'A4', margin:36 })
     doc.pipe(res)
 
-    // ---------- Zone 1: Franchisee Header (no logo) ----------
-    // Use franchisee info if present; else placeholders
-    doc.fontSize(12).text(safe(fr?.legal_name, 'Franchisee'), { continued:false, align:'left' })
-    doc.moveDown(0.15)
+    // ---------- Header (two-column) ----------
+    // Left: Franchisee block
+    doc.fontSize(12).text(safe(fr?.legal_name, 'Franchisee'), { width: 320 })
+    doc.moveDown(0.1)
     const addr = [fr?.address1, fr?.address2].filter(Boolean).join(', ')
-    doc.fontSize(9).text(safe(addr,'Address not set'))
-    const idLine = `Franchisee ID: ${safe(frCode)}`
-    const gstLine = `GSTIN: ${safe(fr?.gstin,'')}`
-    doc.text(idLine + (gstLine.endsWith(': ') ? '' : '    ' + gstLine))
-    doc.moveDown(0.4)
+    doc.fontSize(9).text(safe(addr,'Address not set'), { width: 320 })
+    doc.text(`Franchisee ID: ${safe(frCode)}`, { width: 320 })
+    const gstin = safe(fr?.gstin, '')
+    if (gstin !== '—') doc.text(`GSTIN: ${gstin}`, { width: 320 })
 
-    // Right-side meta: Invoice No / Date box
-    const rightX = 380, topY = 36
-    doc.roundedRect(rightX, topY, 180, 60, 6).stroke()
+    // Right: Invoice meta box (single-line no wrap)
+    const rightX = 365, metaW = 190, topY = 36
+    doc.roundedRect(rightX, topY, metaW, 60, 6).stroke()
     doc.fontSize(10)
-    doc.text(`Invoice No: ${printed}`, rightX+8, topY+8, { width:164 })
-    const dt = new Date(inv.created_at || Date.now())
-    const when = dt.toLocaleString('en-IN', { hour12:false, timeZone: 'Asia/Kolkata' }).replace(',', '')
-    doc.text(`Date: ${when} IST`, rightX+8, topY+28, { width:164 })
+    doc.text(`Invoice No: ${printed}`, rightX+8, topY+8, { width: metaW-16, height:14 })
+    doc.text(`Date: ${when}`,           rightX+8, topY+28, { width: metaW-16, height:14 })
 
     doc.moveDown(0.6)
 
-    // ---------- Zone 2: Customer Details (+ HSN Code + Customer ID) ----------
+    // ---------- Zone 2: Customer Details (with HSN + Customer ID) ----------
     const z2Y = doc.y
-    doc.roundedRect(36, z2Y, 524, 82, 6).stroke()
+    doc.roundedRect(36, z2Y, 520, 92, 6).stroke()
+    doc.fontSize(10).text('Customer Details', 44, z2Y+6)
     doc.fontSize(10)
-    doc.text(`Customer Name: ${safe(inv.customer_name)}`, 44, z2Y+8, { width: 250 })
-    doc.text(`Mobile: ${safe(inv.mobile_number)}`, 300, z2Y+8, { width: 250 })
-    doc.text(`Vehicle: ${safe(inv.vehicle_number)}`, 44, z2Y+26, { width: 250 })
-    doc.text(`Odometer: ${safe(inv.odometer)} km`, 300, z2Y+26, { width: 250 })
-    doc.text(`Address: ${safe(inv.customer_address)}`, 44, z2Y+44, { width: 250 })
-    doc.text(`Installer: ${safe(inv.installer_name)}`, 300, z2Y+44, { width: 250 })
-    // additions per spec:
+    doc.text(`Name: ${safe(inv.customer_name)}`, 44, z2Y+22, { width: 250 })
+    doc.text(`Mobile: ${safe(inv.mobile_number)}`, 300, z2Y+22, { width: 240 })
+    doc.text(`Vehicle: ${safe(inv.vehicle_number)}`, 44, z2Y+38, { width: 250 })
+    doc.text(`Odometer Reading: ${safe(inv.odometer)} km`, 300, z2Y+38, { width: 240 })
+    doc.text(`Customer GSTIN: ${safe(inv.customer_gstin)}`, 44, z2Y+54, { width: 250 })
+    doc.text(`Address: ${safe(inv.customer_address)}`, 300, z2Y+54, { width: 240 })
+    doc.text(`Installer: ${safe(inv.installer_name)}`, 44, z2Y+70, { width: 250 })
+    // Additions (bottom row)
     const hsn = inv.hsn_code || '35069999'
-    doc.text(`HSN Code: ${hsn}`, 44, z2Y+62, { width: 250 })
-    doc.text(`Customer ID: ${safe(inv.customer_code)}`, 300, z2Y+62, { width: 250 })
+    doc.text(`HSN Code: ${hsn}`, 300, z2Y+70, { width: 240 })
 
-    doc.moveDown(6)
+    // Second line for Customer ID (under Installer/HSN)
+    doc.text(`Customer ID: ${safe(inv.customer_code)}`, 44, z2Y+86, { width: 250 })
+
+    doc.moveDown(7)
 
     // ---------- Zone 3: Vehicle Details ----------
     const z3Y = doc.y
-    doc.roundedRect(36, z3Y, 524, 56, 6).stroke()
+    doc.roundedRect(36, z3Y, 520, 58, 6).stroke()
+    doc.fontSize(10).text('Vehicle Details', 44, z3Y+6)
     doc.fontSize(10)
-    doc.text(`Category: ${safe(inv.vehicle_type,'—')}`, 44, z3Y+8, { width: 250 })
-    doc.text(`Tyres: ${safe(inv.tyre_count)}`, 300, z3Y+8, { width: 250 })
-    const tyreSize = [safe(inv.tyre_width_mm,'-'), safe(inv.aspect_ratio,'-'), safe(inv.rim_diameter_in,'-')].join(' / ').replace(' / -','').replace('/ -','')
-    doc.text(`Tyre Size: ${tyreSize}`, 44, z3Y+26, { width: 250 })
-    const installed = safe(inv.fitment_locations,'') || `${safe(inv.tyre_count)}` // fallback: show count
-    doc.text(`Installed Tyres: ${installed}`, 300, z3Y+26, { width: 250 })
+    doc.text(`Category: ${safe(inv.vehicle_type,'—')}`, 44, z3Y+22, { width: 250 })
+    doc.text(`Tyres: ${safe(inv.tyre_count)}`, 300, z3Y+22, { width: 240 })
+    const tyreSize = tyreSizeFmt(inv.tyre_width_mm, inv.aspect_ratio, inv.rim_diameter_in)
+    doc.text(`Tyre Size: ${tyreSize}`, 44, z3Y+38, { width: 250 })
+    const installed = safe(inv.fitment_locations,'') || `${safe(inv.tyre_count)}`
+    doc.text(`Installed Tyres: ${installed}`, 300, z3Y+38, { width: 240 })
 
-    doc.moveDown(5)
+    doc.moveDown(6)
 
     // ---------- Zone 4: Fitment & Tread Depth ----------
     const z4Y = doc.y
-    doc.roundedRect(36, z4Y, 524, 70, 6).stroke()
+    doc.roundedRect(36, z4Y, 520, 70, 6).stroke()
     doc.fontSize(10).text('Fitment & Tread Depth (mm)', 44, z4Y+6)
-    // Simple 2x2 grid labels (FL/FR/RL/RR) using whatever fields are available
     const rowY1 = z4Y + 24
     const rowY2 = z4Y + 42
-    doc.text(`Front Left: ${safe(inv.tread_fl_mm)}`, 44, rowY1, { width: 250 })
-    doc.text(`Front Right: ${safe(inv.tread_fr_mm)}`, 300, rowY1, { width: 250 })
-    doc.text(`Rear Left: ${safe(inv.tread_rl_mm)}`, 44, rowY2, { width: 250 })
-    doc.text(`Rear Right: ${safe(inv.tread_rr_mm)}`, 300, rowY2, { width: 250 })
-    // dosage summary (if present)
+    doc.text(`Front Left: ${safe(inv.tread_fl_mm)}`, 44, rowY1, { width: 240 })
+    doc.text(`Front Right: ${safe(inv.tread_fr_mm)}`, 300, rowY1, { width: 240 })
+    doc.text(`Rear Left: ${safe(inv.tread_rl_mm)}`, 44, rowY2, { width: 240 })
+    doc.text(`Rear Right: ${safe(inv.tread_rr_mm)}`, 300, rowY2, { width: 240 })
+    // dosage summary
     const perTyre = inv.tyre_count ? Math.round((Number(inv.dosage_ml||0) / Number(inv.tyre_count))*10)/10 : null
     doc.text(`Per-tyre Dosage: ${perTyre ? perTyre+' ml' : '—'}`, 44, z4Y+58)
     doc.text(`Total Dosage: ${safe(inv.dosage_ml)} ml`, 300, z4Y+58)
 
-    doc.moveDown(5.5)
+    doc.moveDown(6)
 
-    // ---------- Zone 5: Pricing (aligned table) ----------
+    // ---------- Zone 5: Pricing (Description / Value list) ----------
     const z5Y = doc.y
-    doc.roundedRect(36, z5Y, 524, 130, 6).stroke()
-    doc.fontSize(10)
-    // left column
-    const Lx = 44, Rx = 340, Vy = (y, k, v) => { doc.text(k, Lx, y); doc.text(v, Rx, y, { width: 210, align:'right' }) }
+    doc.roundedRect(36, z5Y, 520, 156, 6).stroke()
+    doc.fontSize(10).text('Description', 44, z5Y+6)
+    doc.text('Value', 340, z5Y+6, { width: 200, align: 'right' })
+    const Lx = 44, Rx = 340, V = (y, k, v) => { doc.text(k, Lx, y); doc.text(v, Rx, y, { width: 200, align:'right' }) }
     const mrp = inv.price_per_ml ?? 4.5
-    Vy(z5Y+10, 'Total Dosage (ml)', safe(inv.dosage_ml,'—'))
-    Vy(z5Y+26, 'MRP per ml', inr(mrp, 2))
-    Vy(z5Y+42, 'Gross', inr(inv.total_before_gst || (Number(inv.dosage_ml||0)*Number(mrp||0))))
-    // optional discount & installation charges (only render if present)
-    if (inv.discount_amount != null) Vy(z5Y+58, 'Discount', `- ${inr(inv.discount_amount)}`)
-    if (inv.installation_charges != null) Vy(z5Y+74, 'Installation Charges', inr(inv.installation_charges))
-    const taxMode = inv.tax_mode || 'CGST+SGST'
-    Vy(z5Y+90, 'Tax Mode', taxMode)
-    const gstRate = inv.gst_rate || 18
+    V(z5Y+22, 'Total Dosage (ml)', safe(inv.dosage_ml,'—'))
+    V(z5Y+38, 'MRP per ml', inr(mrp, 2))
+    V(z5Y+54, 'Gross', inr(inv.total_before_gst || (Number(inv.dosage_ml||0)*Number(mrp||0))))
+    if (inv.discount_amount != null)      V(z5Y+70, 'Discount', `- ${inr(inv.discount_amount)}`)
+    if (inv.installation_charges != null) V(z5Y+86, 'Installation Charges', inr(inv.installation_charges))
+    V(z5Y+102, 'Tax Mode', safe(inv.tax_mode || 'CGST+SGST'))
+    const gstRate = Number(inv.gst_rate ?? 18)
     const half = gstRate/2
-    if (taxMode.toUpperCase().includes('IGST')) {
-      Vy(z5Y+106, `IGST (${gstRate}%)`, inr(inv.gst_amount ?? 0))
+    // Always display CGST, SGST, IGST rows (IGST=0 under CGST+SGST)
+    const isIGST = String(inv.tax_mode||'').toUpperCase().includes('IGST')
+    if (isIGST) {
+      V(z5Y+118, `IGST (${gstRate}%)`, inr(inv.gst_amount ?? 0))
+      V(z5Y+134, `CGST (${half}%)`, inr(0))
+      V(z5Y+150, `SGST (${half}%)`, inr(0))
     } else {
-      Vy(z5Y+106, `CGST (${half}%)`, inr((inv.gst_amount ?? 0)/2))
-      Vy(z5Y+122, `SGST (${half}%)`, inr((inv.gst_amount ?? 0)/2))
+      const halfAmt = (Number(inv.gst_amount ?? 0) / 2)
+      V(z5Y+118, `CGST (${half}%)`, inr(halfAmt))
+      V(z5Y+134, `SGST (${half}%)`, inr(halfAmt))
+      V(z5Y+150, `IGST (${gstRate}%)`, inr(0))
     }
-    // right column footer lines (Amount before GST, GST Total, Total with GST)
-    const AYG = z5Y + 148
-    doc.moveTo(36, z5Y+150).lineTo(560, z5Y+150).stroke()
-    const lbl = (t, y)=> doc.text(t, 44, y)
-    const val = (t, y)=> doc.text(t, 340, y, { width: 210, align: 'right' })
-    lbl('Amount (before GST)', z5Y+156);   val(inr(inv.total_before_gst ?? 0), z5Y+156)
-    lbl('GST Total', z5Y+172);             val(inr(inv.gst_amount ?? 0), z5Y+172)
-    lbl('Total (with GST)', z5Y+188);      val(inr(inv.total_with_gst ?? 0), z5Y+188)
+
+    // Totals separator + three lines
+    doc.moveTo(36, z5Y+172).lineTo(556, z5Y+172).stroke()
+    const TL = (t,y)=> doc.text(t, 44, y)
+    const TV = (t,y)=> doc.text(t, 340, y, { width:200, align:'right' })
+    TL('Amount (before GST)', z5Y+178); TV(inr(inv.total_before_gst ?? 0), z5Y+178)
+    TL('GST Total', z5Y+194);          TV(inr(inv.gst_amount ?? 0), z5Y+194)
+    TL('Total (with GST)', z5Y+210);   TV(inr(inv.total_with_gst ?? 0), z5Y+210)
 
     doc.moveDown(9)
 
-    // ---------- Declaration & Terms (compact) ----------
+    // ---------- Declarations & Terms (as #46 tone) ----------
     doc.fontSize(9).text('Customer Declaration', { underline:true })
-    doc.text('1) I hereby acknowledge that the MaxTT Tyre Sealant installation has been completed on my vehicle to my satisfaction, as per my earlier consent to proceed.')
-    doc.text('2) I have read, understood, and accepted the Terms & Conditions stated herein.')
-    doc.text('3) I acknowledge that the total amount shown is correct and payable to the franchisee/installer of Treadstone Solutions.')
+    doc.text('1. I hereby acknowledge that the MaxTT Tyre Sealant installation has been completed on my vehicle to my satisfaction, as per my earlier consent to proceed.')
+    doc.text('2. I have read, understood, and accepted the Terms & Conditions stated herein.')
+    doc.text('3. I acknowledge that the total amount shown is correct and payable to the franchisee/installer of Treadstone Solutions.')
     doc.moveDown(0.4)
-    doc.fontSize(9).text('Terms & Conditions', { underline:true })
-    doc.text('1) MaxTT Tyre Sealant is a preventive safety solution; effectiveness depends on adherence to driving norms and vehicle condition.')
-    doc.text('2) Effectiveness assured only within lawful speed limits as prescribed by competent authorities.')
-    doc.text('3) Jurisdiction: Gurgaon.')
+    doc.text('Terms & Conditions', { underline:true })
+    doc.text('1. The MaxTT Tyre Sealant is a preventive safety solution designed to reduce tyre-related risks and virtually eliminate punctures and blowouts.')
+    doc.text('2. Effectiveness is assured only when the vehicle is operated within the speed limits prescribed by competent traffic/transport authorities (RTO/Transport Department) in India.')
+    doc.text('3. Jurisdiction: Gurgaon.')
 
     doc.moveDown(1)
 
@@ -361,7 +389,7 @@ app.get('/api/invoices/:id/pdf', async (req,res)=>{
     const y = doc.y
     doc.rect(36, y, 240, 58).stroke(); doc.text('Installer Signature & Stamp', 44, y+42)
     doc.rect(320, y, 240, 58).stroke(); doc.text('Customer Accepted & Confirmed', 328, y+42)
-    doc.text(`Signed at: ${when} IST`, 36, y+70)
+    doc.text(`Signed at: ${when}`, 36, y+70)
 
     doc.end()
   }catch(e){
@@ -372,12 +400,6 @@ app.get('/api/invoices/:id/pdf', async (req,res)=>{
 })
 
 // ---------------------- Franchisee Onboarding APIs (minimal) -----------
-function makeFrId(stateCode, cityCode, n){
-  const sc=String(stateCode||'').toUpperCase().replace(/[^A-Z]/g,'').slice(0,2)
-  const cc=String(cityCode||'').toUpperCase().replace(/[^A-Z]/g,'').slice(0,3)
-  const num=String(Number(n)||1).padStart(3,'0')
-  return `TS-${sc}-${cc}-${num}`
-}
 app.post('/api/super/franchisees/approve/:id', requireSA, async (req,res)=>{
   const client=await pool.connect()
   try{
