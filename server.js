@@ -1,7 +1,6 @@
 // server.js — MaxTT / Treadstone Solutions Billing API (ESM)
-// Baseline compatible with your 27-Aug build + PDF route added.
-// 5-zone PDF matches your #46 layout; Zone-2 adds HSN Code + Customer ID.
-// No logo, no PDF watermark (use pre-watermarked paper).
+// Baseline compatible with your 27-Aug build + schema-adaptive /api/invoices/full + PDF route.
+// 5-zone PDF matches your #46 layout; Zone-2 adds HSN Code + Customer ID. No logo/watermark.
 
 import express from 'express'
 import pkg from 'pg'
@@ -107,7 +106,7 @@ function requireAdmin(req,res,next){
   next()
 }
 
-// ---------------------- Invoices: create (matches your flows) ----------
+// ---------------------- Invoices: create (schema-adaptive) -------------
 app.post('/api/invoices/full', async (req,res)=>{
   const client = await pool.connect()
   try{
@@ -128,35 +127,50 @@ app.post('/api/invoices/full', async (req,res)=>{
     const fcol = findCol(cols,['franchisee_id','franchisee_code']) || 'franchisee_id'
     const idCol = findCol(cols,['id','invoice_id']) || 'id'
 
+    // numbering (we will store printed form only if a column exists)
     const seqQ = await client.query(
       `SELECT COUNT(*)::int AS c FROM public.invoices WHERE ${qid(fcol)}=$1`, [franchisee_id]
     )
     const seq = (seqQ.rows?.[0]?.c || 0) + 1
     const seqStr = pad(seq,4)
     const invoice_number_norm = `${franchisee_id}-${seqStr}`
-    const invoice_number = `${franchisee_id}/${mmYY()}/${seqStr}`
+    const invoice_number_printed = `${franchisee_id}/${mmYY()}/${seqStr}`
 
-    const r = await client.query(`
-      INSERT INTO public.invoices
-      (${qid(fcol)},"invoice_number_norm","invoice_number","tyre_count","tyre_width_mm","rim_diameter_in",
-       "dosage_ml","price_per_ml","total_before_gst","gst_amount","total_with_gst","hsn_code","gst_rate","created_at")
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13, NOW())
-      RETURNING ${qid(idCol)} AS id, "customer_code","invoice_number_norm","invoice_number"
-    `,[
-      franchisee_id, invoice_number_norm, invoice_number, tyre_count, tyre_width_mm, rim_diameter_in,
-      DEFAULT_QTY_ML, MRP_PER_ML, total_before_gst, gst_amount, total_with_gst, '35069999', 18
-    ])
+    // Build adaptive insert
+    const toInsert = {}
+    toInsert[fcol] = franchisee_id
+    if (has(cols,'invoice_number_norm')) toInsert['invoice_number_norm'] = invoice_number_norm
+    if (has(cols,'invoice_number'))     toInsert['invoice_number']     = invoice_number_printed
+    if (has(cols,'tyre_count'))         toInsert['tyre_count']         = tyre_count
+    if (has(cols,'tyre_width_mm'))      toInsert['tyre_width_mm']      = tyre_width_mm
+    if (has(cols,'rim_diameter_in'))    toInsert['rim_diameter_in']    = rim_diameter_in
+    if (has(cols,'dosage_ml'))          toInsert['dosage_ml']          = DEFAULT_QTY_ML
+    if (has(cols,'price_per_ml'))       toInsert['price_per_ml']       = MRP_PER_ML
+    if (has(cols,'total_before_gst'))   toInsert['total_before_gst']   = total_before_gst
+    if (has(cols,'gst_amount'))         toInsert['gst_amount']         = gst_amount
+    if (has(cols,'total_with_gst'))     toInsert['total_with_gst']     = total_with_gst
+    if (has(cols,'hsn_code'))           toInsert['hsn_code']           = '35069999'
+    if (has(cols,'gst_rate'))           toInsert['gst_rate']           = 18
+    if (has(cols,'created_at'))         toInsert['created_at']         = new Date().toISOString()
+
+    const columns = Object.keys(toInsert)
+    const values  = Object.values(toInsert)
+    const params  = values.map((_,i)=>`$${i+1}`).join(',')
+    const sql = `INSERT INTO public.invoices (${columns.map(qid).join(',')}) VALUES (${params}) RETURNING ${qid(idCol)} AS id, "customer_code", ${has(cols,'invoice_number_norm')?'"invoice_number_norm"':'NULL AS invoice_number_norm'}, ${has(cols,'invoice_number')?'"invoice_number"':'NULL AS invoice_number'}`
+    const r = await client.query(sql, values)
 
     const row = r.rows[0]
+    const printed = row.invoice_number || printedFromNorm(row.invoice_number_norm) || invoice_number_printed
     res.status(201).json({
       ok:true,
       id: row.id,
-      invoice_number: row.invoice_number,
-      invoice_number_norm: row.invoice_number_norm,
+      invoice_number: printed,
+      invoice_number_norm: row.invoice_number_norm || invoice_number_norm,
       customer_code: row.customer_code || invoice_number_norm,
       qty_ml_saved: DEFAULT_QTY_ML
     })
   }catch(err){
+    console.error('create_invoice error:', err)
     res.status(500).json({ ok:false, where:'create_invoice', message: err?.message || String(err) })
   }finally{ client.release() }
 })
@@ -227,7 +241,16 @@ app.get('/api/invoices/by-norm/:norm', async (req,res)=>{
 })
 
 // ---------------------- Franchisee Onboarding (Admin/SA) ---------------
-app.post('/api/super/franchisees/approve/:id', requireSA, async (req,res)=>{
+function requireKey(keyHeader, envVar){
+  return (req,res,next)=>{
+    const key = req.get(keyHeader) || ''
+    const expect = process.env[envVar] || ''
+    if (!expect) return res.status(500).json({ ok:false, error:`${envVar.toLowerCase()}_not_set` })
+    if (key !== expect) return res.status(401).json({ ok:false, error:'unauthorized' })
+    next()
+  }
+}
+app.post('/api/super/franchisees/approve/:id', requireKey('X-SA-KEY','SUPER_ADMIN_KEY'), async (req,res)=>{
   const client=await pool.connect()
   try{
     const id=Number(req.params.id||0)
@@ -244,8 +267,7 @@ app.post('/api/super/franchisees/approve/:id', requireSA, async (req,res)=>{
     res.status(500).json({ ok:false, error:String(e?.message||e) })
   }finally{ client.release() }
 })
-
-app.post('/api/super/franchisees/reject/:id', requireSA, async (req,res)=>{
+app.post('/api/super/franchisees/reject/:id', requireKey('X-SA-KEY','SUPER_ADMIN_KEY'), async (req,res)=>{
   const client=await pool.connect()
   try{
     const id=Number(req.params.id||0)
@@ -265,7 +287,6 @@ app.post('/api/super/franchisees/reject/:id', requireSA, async (req,res)=>{
 })
 
 // ------------------------------- PDF (5 zones) -------------------------
-// Exact #46-style zones; Zone-2 adds HSN Code + Customer ID. No logo/watermark.
 app.get('/api/invoices/:id/pdf', async (req,res)=>{
   const id = Number(req.params.id || 0)
   if (!Number.isFinite(id) || id <= 0) return res.status(400).json({ error:'bad_id' })
@@ -277,7 +298,6 @@ app.get('/api/invoices/:id/pdf', async (req,res)=>{
     if (!ir.rows.length) return res.status(404).json({ error:'not_found' })
     const inv = ir.rows[0]
 
-    // Franchisee header
     const frCode = inv.franchisee_id || inv.franchisee_code || ''
     let fr = null
     if (frCode) {
@@ -294,8 +314,7 @@ app.get('/api/invoices/:id/pdf', async (req,res)=>{
     const doc = new PDFDocument({ size:'A4', margin:36 })
     doc.pipe(res)
 
-    // ---------- Header (two-column) ----------
-    // Left block: franchisee details
+    // ---------- Header ----------
     doc.fontSize(12).text(safe(fr?.legal_name, 'Franchisee'), { width: 330 })
     doc.moveDown(0.1)
     const addr = [fr?.address1, fr?.address2].filter(Boolean).join(', ')
@@ -304,7 +323,6 @@ app.get('/api/invoices/:id/pdf', async (req,res)=>{
     const gstin = safe(fr?.gstin, '')
     if (gstin !== '—') doc.text(`GSTIN: ${gstin}`, { width: 330 })
 
-    // Right block: Invoice No + Date (box)
     const rightX = 352, metaW = 204, topY = 36
     doc.roundedRect(rightX, topY, metaW, 60, 6).stroke()
     doc.fontSize(10)
@@ -313,7 +331,7 @@ app.get('/api/invoices/:id/pdf', async (req,res)=>{
 
     doc.moveDown(0.6)
 
-    // ---------- Zone 2: Customer Details (+HSN +Customer ID) ----------
+    // ---------- Zone 2: Customer Details ----------
     const z2Y = doc.y
     doc.roundedRect(36, z2Y, 520, 96, 6).stroke()
     doc.fontSize(10).text('Customer Details', 44, z2Y+6)
@@ -340,20 +358,18 @@ app.get('/api/invoices/:id/pdf', async (req,res)=>{
     doc.text(`Tyres: ${safe(inv.tyre_count)}`, 300, z3Y+22, { width: 240 })
     const installed = safe(inv.fitment_locations,'') || `${safe(inv.tyre_count)}`
     doc.text(`Installed Tyres: ${installed}`, 44, z3Y+38, { width: 250 })
-    const tyreSize = tyreSizeFmt(inv.tyre_width_mm, inv.aspect_ratio, inv.rim_diameter_in) // e.g. 195/65 R17 or 195 R15
+    const tyreSize = tyreSizeFmt(inv.tyre_width_mm, inv.aspect_ratio, inv.rim_diameter_in)
     doc.text(`Tyre Size: ${tyreSize}`, 300, z3Y+38, { width: 240 })
 
     doc.moveDown(6)
 
-    // ---------- Zone 4: Fitment & Tread Depth (table rows) ----------
+    // ---------- Zone 4: Fitment & Tread Depth ----------
     const z4Y = doc.y
     const boxH = 88
     doc.roundedRect(36, z4Y, 520, boxH, 6).stroke()
     doc.fontSize(10).text('Fitment & Tread Depth (mm)', 44, z4Y+6)
-    // Header
     doc.fontSize(9).text('Position', 44, z4Y+24)
     doc.text('Tread (mm)', 300, z4Y+24, { width: 240 })
-    // Rows
     const rows = [
       ['Front Left',  safe(inv.tread_fl_mm)],
       ['Front Right', safe(inv.tread_fr_mm)],
@@ -366,14 +382,13 @@ app.get('/api/invoices/:id/pdf', async (req,res)=>{
       doc.text(val, 300, ry, { width: 240 })
       ry += 16
     }
-    // Dosage summary (bottom)
     const perTyre = inv.tyre_count ? Math.round((Number(inv.dosage_ml||0) / Number(inv.tyre_count))*10)/10 : null
     doc.text(`Per-tyre Dosage: ${perTyre ? perTyre+' ml' : '—'}`, 44, z4Y + boxH - 14)
     doc.text(`Total Dosage: ${safe(inv.dosage_ml)} ml`, 300, z4Y + boxH - 14)
 
     doc.moveDown(6)
 
-    // ---------- Zone 5: Pricing (Description / Value) ----------
+    // ---------- Zone 5: Pricing ----------
     const z5Y = doc.y
     doc.roundedRect(36, z5Y, 520, 156, 6).stroke()
     doc.fontSize(10).text('Description', 44, z5Y+6)
@@ -400,7 +415,6 @@ app.get('/api/invoices/:id/pdf', async (req,res)=>{
       V(z5Y+134, `SGST (${half}%)`, inr(halfAmt))
       V(z5Y+150, `IGST (${gstRate}%)`, inr(0))
     }
-    // Totals line + three totals
     doc.moveTo(36, z5Y+172).lineTo(556, z5Y+172).stroke()
     const TL = (t,y)=> doc.text(t, 44, y)
     const TV = (t,y)=> doc.text(t, 340, y, { width:200, align:'right' })
@@ -409,8 +423,6 @@ app.get('/api/invoices/:id/pdf', async (req,res)=>{
     TL('Total (with GST)', z5Y+210);   TV(inr(inv.total_with_gst ?? 0), z5Y+210)
 
     doc.moveDown(9)
-
-    // ---------- Declarations & Signatures ----------
     doc.fontSize(9).text('Customer Declaration', { underline:true })
     doc.text('1. I hereby acknowledge that the MaxTT Tyre Sealant installation has been completed on my vehicle to my satisfaction, as per my earlier consent to proceed.')
     doc.text('2. I have read, understood, and accepted the Terms & Conditions stated herein.')
@@ -420,7 +432,6 @@ app.get('/api/invoices/:id/pdf', async (req,res)=>{
     doc.text('1. The MaxTT Tyre Sealant is a preventive safety solution designed to reduce tyre-related risks and virtually eliminate punctures and blowouts.')
     doc.text('2. Effectiveness is assured only when the vehicle is operated within the speed limits prescribed by competent traffic/transport authorities (RTO/Transport Department) in India.')
     doc.text('3. Jurisdiction: Gurgaon.')
-
     doc.moveDown(1)
     const y = doc.y
     doc.rect(36, y, 240, 58).stroke(); doc.text('Installer Signature & Stamp', 44, y+42)
