@@ -53,7 +53,7 @@ export async function createV46Pdf(stream, inv, fr) {
     doc.text(`Invoice No: ${printed}`, boxX+8, boxY+8, { width: boxW-16 })
     doc.text(`Date: ${fmtIST(inv.created_at)}`, boxX+8, boxY+28, { width: boxW-16 })
 
-    // === Zone 2: Customer Details (height tuned to #46) ===
+    // === Zone 2: Customer Details ===
     const z2Y = 110
     doc.roundedRect(36, z2Y, 520, 96, 6).stroke()
     doc.font('Helvetica-Bold').fontSize(10).text('Customer Details', 44, z2Y+6)
@@ -83,8 +83,8 @@ export async function createV46Pdf(stream, inv, fr) {
 
     // === Zone 4: Fitment & Tread Depth ===
     const z4Y = z3Y + 72
-    const boxH = 88
-    doc.roundedRect(36, z4Y, 520, boxH, 6).stroke()
+    const z4BoxH = 88  // (renamed from boxH to avoid duplicate identifier conflicts)
+    doc.roundedRect(36, z4Y, 520, z4BoxH, 6).stroke()
     doc.font('Helvetica-Bold').fontSize(10).text('Fitment & Tread Depth (mm)', 44, z4Y+6)
     doc.font('Helvetica').fontSize(9).text('Position', 44, z4Y+24)
     doc.text('Tread (mm)', 300, z4Y+24, { width: 240 })
@@ -101,11 +101,11 @@ export async function createV46Pdf(stream, inv, fr) {
       ry += 16
     }
     const perTyre = inv.tyre_count ? Math.round((Number(inv.dosage_ml||0) / Number(inv.tyre_count))*10)/10 : null
-    doc.text(`Per-tyre Dosage: ${perTyre ? perTyre+' ml' : '—'}`, 44, z4Y + boxH - 14)
-    doc.text(`Total Dosage: ${safe(inv.dosage_ml)} ml`, 300, z4Y + boxH - 14)
+    doc.text(`Per-tyre Dosage: ${perTyre ? perTyre+' ml' : '—'}`, 44, z4Y + z4BoxH - 14)
+    doc.text(`Total Dosage: ${safe(inv.dosage_ml)} ml`, 300, z4Y + z4BoxH - 14)
 
     // === Zone 5: Pricing (desc/value, three tax lines, three totals) ===
-    const z5Y = z4Y + boxH + 14
+    const z5Y = z4Y + z4BoxH + 14
     doc.roundedRect(36, z5Y, 520, 156, 6).stroke()
     doc.font('Helvetica-Bold').fontSize(10).text('Description', 44, z5Y+6)
     doc.text('Value', 340, z5Y+6, { width: 200, align: 'right' })
