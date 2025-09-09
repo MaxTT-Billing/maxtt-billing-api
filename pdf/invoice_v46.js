@@ -1,14 +1,19 @@
-// pdf/invoice_v46.js — v46 single-page layout (refined)
-// Changes per your spec:
-// • Thin horizontal lines between zones (no big boxes).
-// • Zone 1 separator moved up slightly.
-// • Zone 2 split strictly: LEFT = "Customer Details" (10 rows incl. heading),
-//   RIGHT = "Vehicle Details" (13 rows incl. heading & subheading).
-// • Zone 3: "Description/Particulars" vs "Value" (13 rows incl. heading).
-// • Zone 4: "Customer Declaration" (3 points, justified).
-// • Zone 5: "Terms & Conditions" (3 points, justified) + TWO SIGNATURE BOXES aligned.
-// • Reduced line gaps so content stays on one page.
-// • Customer ID uses invoice_number_norm (norm style). Tyre size formatter keeps “195/65 R17” or “195 R15” when aspect missing.
+// pdf/invoice_v46.js — v46 single-page layout (refined, aligned)
+// Updates per your notes:
+// ZONE 1
+// • Add “Contact No / Email ID” row for Franchisee
+// • “Invoice No” in bold
+// • Left/right rows synced to a neat grid
+// ZONE 2
+// • Left: “Customer Details” (as finalized earlier)
+// • Right: “Vehicle Details”; first 4 rows’ VALUES align with the Fitment/Tread value column
+// • “Position” and “Tread (mm)” bold
+// ZONE 3
+// • “Description/Particulars” vs “Value”; right column aligned with Zone 2’s right VALUE column
+// ZONE 4 & 5
+// • Justified paragraphs, consistent spacing, aligned continuations
+// • Zone 5 point 3 text updated
+// • Two aligned signature boxes
 
 import PDFDocument from 'pdfkit'
 
@@ -44,41 +49,63 @@ export async function createV46Pdf(stream, inv, fr) {
     const doc = new PDFDocument({ size:'A4', margin:36 })
     doc.pipe(stream)
 
-    const HLine = (y)=> { doc.moveTo(36, y).lineTo(556, y).lineWidth(0.5).stroke() }
-    const Lx = 44, Rx = 300, Lw = 250, Rw = 248
-    const rowGap = 14 // tighter row spacing
+    // ---- Layout constants / grid ----
+    const pageLeft = 36, pageRight = 556
+    const Lx = 44, Lw = 250
+    const Rx = 300, Rw = 248
+    const RxVal = Rx + 180         // right VALUE column x (aligns with Fitment/Tread values)
+    const RvW = pageRight - RxVal  // width for right-side values
+    const rowGap = 14              // tight line height for rows
+    const paraGap = 18             // paragraph spacing for decl/T&C
+    const thin = 0.5
+    const HLine = (y)=> { doc.moveTo(pageLeft, y).lineTo(pageRight, y).lineWidth(thin).stroke() }
 
-    // ===== Zone 1: Header =====
+    // ===== ZONE 1: Header (synced rows) =====
     const frName  = safe(fr?.legal_name,'Franchisee')
     const frAddr  = safe([fr?.address1, fr?.address2].filter(Boolean).join(', '), 'Address not set')
     const frCode  = safe(inv.franchisee_id || inv.franchisee_code)
     const frGstin = safe(fr?.gstin, '—')
+    const frPhone = safe(fr?.phone, '—')
+    const frEmail = safe(fr?.email, '—')
     const printed = inv.invoice_number || printedFromNorm(inv.invoice_number_norm, inv.id)
 
-    // Left header (franchisee)
-    doc.font('Helvetica-Bold').fontSize(12).text(frName, 36, 36, { width: 322 })
-    doc.font('Helvetica').fontSize(9)
-      .text(frAddr,                     36, 54, { width: 322 })
-      .text(`Franchisee ID: ${frCode}`, 36, 68, { width: 322 })
-      .text(`GSTIN: ${frGstin}`,        36, 82, { width: 322 })
+    // grid base
+    let y = 36
+    doc.font('Helvetica-Bold').fontSize(12).text(frName, Lx, y, { width: 322 })
+    // Right column row 1: Invoice No (bold)
+    doc.font('Helvetica-Bold').fontSize(10).text(`Invoice No: ${printed}`, 352, y+4, { width: 204 })
+    y += rowGap + 4
 
-    // Right header (stacked, no box)
-    doc.font('Helvetica').fontSize(10)
-      .text(`Invoice No: ${printed}`,        352, 40, { width: 204 })
-      .text(`Date: ${fmtIST(inv.created_at)}`, 352, 58, { width: 204 })
+    // Row 2
+    doc.font('Helvetica').fontSize(9).text(frAddr, Lx, y, { width: 322 })
+    doc.font('Helvetica').fontSize(10).text(`Date: ${fmtIST(inv.created_at)}`, 352, y, { width: 204 })
+    y += rowGap
 
-    // Separator after Zone 1 (moved up ~ one row)
-    HLine(96)
+    // Row 3
+    doc.font('Helvetica').fontSize(9).text(`Franchisee ID: ${frCode}`, Lx, y, { width: 322 })
+    // keep right blank to preserve grid symmetry
+    y += rowGap
 
-    // ===== Zone 2: Customer & Vehicle =====
-    let y = 104 + 8 // start a bit below the line
-    // Headings
+    // Row 4
+    doc.font('Helvetica').fontSize(9).text(`GSTIN: ${frGstin}`, Lx, y, { width: 322 })
+    y += rowGap
+
+    // Row 5 (NEW): Contact & Email
+    doc.font('Helvetica').fontSize(9).text(`Contact: ${frPhone}  |  Email: ${frEmail}`, Lx, y, { width: 322 })
+    y += rowGap - 2
+
+    // Separator for Zone 1 (moved up slightly vs prior)
+    HLine(y)
+
+    // ===== ZONE 2: Customer (Left) & Vehicle (Right) =====
+    y += 8
+    const z2HeadY = y
     doc.font('Helvetica-Bold').fontSize(10).text('Customer Details', Lx, y)
     doc.font('Helvetica-Bold').fontSize(10).text('Vehicle Details',  Rx, y)
     y += rowGap
 
+    // Left column rows (as finalized)
     doc.font('Helvetica').fontSize(10)
-    // LEFT (Customer): Name; Address; Contact Number; Customer GSTIN; Vehicle Number; Odometer reading; Customer ID; Installer name; HSN CODE
     const custId = safe(inv.invoice_number_norm)
     const leftRows = [
       ['Name',               safe(inv.customer_name)],
@@ -97,68 +124,77 @@ export async function createV46Pdf(stream, inv, fr) {
       ly += rowGap
     }
 
-    // RIGHT (Vehicle): Category; Tyres; Installed In Tyres; Tyre Size; subheading; Position/Tread header; 4 rows; Per-tyre; Total
+    // Right column rows (first 4 with VALUE aligned to RxVal)
     const tyreSize = tyreSizeFmt(inv.tyre_width_mm, inv.aspect_ratio, inv.rim_diameter_in)
     const installed = safe(inv.fitment_locations,'') || `${safe(inv.tyre_count)}`
-    const vehicleRows = [
-      ['Category',              safe(inv.vehicle_type,'4-Wheeler (Car/Van/SUV)')], // default label as per your example
-      ['Tyres',                 safe(inv.tyre_count)],
-      ['Installed In Tyres',    installed],
-      ['Tyre Size',             tyreSize],
-    ]
     let ry = y
-    for (const [k,v] of vehicleRows){
-      doc.text(`${k}: ${v}`, Rx, ry, { width: Rw })
+    const rightFirst4 = [
+      ['Category',           safe(inv.vehicle_type,'4-Wheeler (Car/Van/SUV)')],
+      ['Tyres',              safe(inv.tyre_count)],
+      ['Installed In Tyres', installed],
+      ['Tyre Size',          tyreSize],
+    ]
+    doc.font('Helvetica').fontSize(10)
+    for (const [k,v] of rightFirst4){
+      // key at Rx; value aligned with RxVal to line up with tread values
+      doc.text(`${k}:`, Rx, ry, { width: 170 })
+      doc.text(String(v), RxVal, ry, { width: RvW, align: 'left' })
       ry += rowGap
     }
 
-    // Subheading
+    // Subheading + headers (bold)
     doc.font('Helvetica-Bold').fontSize(10).text('Fitment & Tread Depth (mm)', Rx, ry); ry += rowGap
-    doc.font('Helvetica').fontSize(9)
-      .text('Position', Rx, ry)
-      .text('Tread (mm)', Rx + 180, ry, { width: 68, align:'left' })
+    doc.font('Helvetica-Bold').fontSize(9).text('Position', Rx, ry)
+    doc.font('Helvetica-Bold').fontSize(9).text('Tread (mm)', RxVal, ry, { width: 80, align:'left' })
     ry += rowGap
 
-    // Tread rows
+    // Tread rows (values at RxVal column)
+    doc.font('Helvetica').fontSize(10)
     const treadRows = [
       ['Front Left',  safe(inv.tread_fl_mm)],
       ['Front Right', safe(inv.tread_fr_mm)],
       ['Rear Left',   safe(inv.tread_rl_mm)],
       ['Rear Right',  safe(inv.tread_rr_mm)],
     ]
-    doc.font('Helvetica').fontSize(10)
     for (const [pos, val] of treadRows){
       doc.text(pos, Rx, ry, { width: 170 })
-      doc.text(val, Rx + 180, ry, { width: 68, align:'left' })
+      doc.text(val, RxVal, ry, { width: 80, align:'left' })
       ry += rowGap
     }
 
-    // Dosages
+    // Dosages (values aligned with RxVal)
     const perTyre = inv.tyre_count ? Math.round((Number(inv.dosage_ml||0) / Number(inv.tyre_count))*10)/10 : null
-    doc.text(`Per-tyre Dosage: ${perTyre ? perTyre+' ml' : '—'}`, Rx, ry); ry += rowGap
-    doc.text(`Total Dosage: ${safe(inv.dosage_ml)} ml`,       Rx, ry); ry += rowGap
+    doc.text('Per-tyre Dosage:', Rx, ry, { width: 170 })
+    doc.text(perTyre ? `${perTyre} ml` : '—', RxVal, ry, { width: 80, align:'left' })
+    ry += rowGap
+    doc.text('Total Dosage:', Rx, ry, { width: 170 })
+    doc.text(`${safe(inv.dosage_ml)} ml`, RxVal, ry, { width: 80, align:'left' })
+    ry += rowGap
 
-    // Separator after Zone 2
+    // Separator for Zone 2
     const z2Bottom = Math.max(ly, ry) + 6
     HLine(z2Bottom)
 
-    // ===== Zone 3: Pricing =====
-    y = z2Bottom + 8
-    doc.font('Helvetica-Bold').fontSize(10).text('Description/Particulars', Lx, y)
-    doc.font('Helvetica-Bold').fontSize(10).text('Value',                   340, y, { width: 212, align:'right' })
-    y += rowGap
+    // ===== ZONE 3: Pricing (right column aligned with RxVal) =====
+    let py = z2Bottom + 8
+    doc.font('Helvetica-Bold').fontSize(10).text('Description/Particulars', Lx, py)
+    doc.font('Helvetica-Bold').fontSize(10).text('Value', Rx, py) // heading label column
+    doc.font('Helvetica-Bold').fontSize(10).text('', RxVal, py)   // value col header placeholder (keeps grid)
+    py += rowGap
 
     const V = (label, value) => {
-      doc.font('Helvetica').fontSize(10).text(label, Lx, y)
-      doc.font('Helvetica').fontSize(10).text(value, 340, y, { width: 212, align:'right' })
-      y += rowGap
+      doc.font('Helvetica').fontSize(10).text(label, Lx, py)
+      // place the VALUE label at Rx and the value itself aligned at RxVal (same column as Zone 2 values)
+      doc.font('Helvetica').fontSize(10).text('', Rx, py)
+      doc.font('Helvetica').fontSize(10).text(value, RxVal, py, { width: RvW, align:'left' })
+      py += rowGap
     }
     const mrp = inv.price_per_ml ?? 4.5
     const gross = inv.total_before_gst ?? (Number(inv.dosage_ml||0) * Number(mrp||0))
     const gstRate = Number(inv.gst_rate ?? 18)
-    const halfRate = gstRate/2
     const isIGST = String(inv.tax_mode||'').toUpperCase().includes('IGST')
     const gstTotal = Number(inv.gst_amount ?? Math.round(gross * gstRate/100))
+    const halfRate = gstRate/2
     const cgst = isIGST ? 0 : gstTotal/2
     const sgst = isIGST ? 0 : gstTotal/2
     const igst = isIGST ? gstTotal : 0
@@ -177,60 +213,65 @@ export async function createV46Pdf(stream, inv, fr) {
     V('Total GST',           inr(gstTotal))
     V('Grand Total (with GST)', inr(grand))
 
-    // Separator after Zone 3
-    HLine(y + 2)
+    HLine(py + 2)
 
-    // ===== Zone 4: Customer Declaration (justified) =====
-    let dY = y + 10
-    doc.font('Helvetica-Bold').fontSize(10).text('Customer Declaration', 36, dY)
+    // ===== ZONE 4: Customer Declaration (justified, even spacing) =====
+    let dY = py + 10
+    const paraW = 520
+    doc.font('Helvetica-Bold').fontSize(10).text('Customer Declaration', pageLeft, dY)
     dY += rowGap
     doc.font('Helvetica').fontSize(9)
       .text(
         '1. I hereby acknowledge that the MaxTT Tyre Sealant installation has been completed on my vehicle to my satisfaction, as per my earlier consent to proceed.',
-        36, dY, { width: 520, align: 'justify' }
-      ); dY += 18
+        pageLeft, dY, { width: paraW, align: 'justify' }
+      )
+    dY += paraGap
     doc.text(
         '2. I have read, understood, and accepted the Terms & Conditions stated herein.',
-        36, dY, { width: 520, align: 'justify' }
-      ); dY += 18
+        pageLeft, dY, { width: paraW, align: 'justify' }
+      )
+    dY += paraGap
     doc.text(
         '3. I acknowledge that the total amount shown is correct and payable to the franchisee/installer of Treadstone Solutions.',
-        36, dY, { width: 520, align: 'justify' }
-      ); dY += 4
+        pageLeft, dY, { width: paraW, align: 'justify' }
+      )
+    dY += 4
 
-    // Separator after Zone 4
     HLine(dY + 14)
 
-    // ===== Zone 5: Terms & Conditions (justified) + two signature boxes =====
+    // ===== ZONE 5: Terms & Conditions (justified) + signature boxes =====
     let tY = dY + 22
-    doc.font('Helvetica-Bold').fontSize(10).text('Terms & Conditions', 36, tY)
+    doc.font('Helvetica-Bold').fontSize(10).text('Terms & Conditions', pageLeft, tY)
     tY += rowGap
     doc.font('Helvetica').fontSize(9)
       .text(
         '1. The MaxTT Tyre Sealant is a preventive safety solution designed to reduce tyre-related risks and virtually eliminate punctures and blowouts.',
-        36, tY, { width: 520, align: 'justify' }
-      ); tY += 18
+        pageLeft, tY, { width: paraW, align: 'justify' }
+      )
+    tY += paraGap
     doc.text(
         '2. Effectiveness is assured only when the vehicle is operated within the speed limits prescribed by competent traffic/transport authorities (RTO/Transport Department) in India.',
-        36, tY, { width: 520, align: 'justify' }
-      ); tY += 18
+        pageLeft, tY, { width: paraW, align: 'justify' }
+      )
+    tY += paraGap
     doc.text(
-        '3. Jurisdiction: Gurgaon.',
-        36, tY, { width: 520, align: 'justify' }
-      ); tY += 10
+        '3. By signing/accepting this invoice, the customer affirms that the installation has been carried out to their satisfaction and agrees to abide by these conditions. Jurisdiction: Gurgaon.',
+        pageLeft, tY, { width: paraW, align: 'justify' }
+      )
+    tY += 10
 
-    // Signature boxes (aligned, neat)
+    // Signature boxes (aligned)
     const sigY = tY + 10
     const boxW = 240, boxH = 62, gap = 44
-    // Left box
-    doc.roundedRect(36, sigY, boxW, boxH, 6).stroke()
-    doc.font('Helvetica').fontSize(9).text('Customer Signature', 36+10, sigY+boxH-18)
-    // Right box
-    doc.roundedRect(36 + boxW + gap, sigY, boxW, boxH, 6).stroke()
-    doc.font('Helvetica').fontSize(9).text('Installer Signature & Company Stamp', 36 + boxW + gap + 10, sigY+boxH-18)
+    // Left: Customer Signature
+    doc.roundedRect(pageLeft, sigY, boxW, boxH, 6).stroke()
+    doc.font('Helvetica').fontSize(9).text('Customer Signature', pageLeft+10, sigY+boxH-18)
+    // Right: Installer Signature & Company Stamp
+    doc.roundedRect(pageLeft + boxW + gap, sigY, boxW, boxH, 6).stroke()
+    doc.font('Helvetica').fontSize(9).text('Installer Signature & Company Stamp', pageLeft + boxW + gap + 10, sigY+boxH-18)
 
     // Signed at:
-    doc.font('Helvetica').fontSize(9).text(`Signed at: ${fmtIST(inv.created_at)}`, 36, sigY + boxH + 12)
+    doc.font('Helvetica').fontSize(9).text(`Signed at: ${fmtIST(inv.created_at)}`, pageLeft, sigY + boxH + 12)
 
     doc.end()
     doc.on('end', resolve)
