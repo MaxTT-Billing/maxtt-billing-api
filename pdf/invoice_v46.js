@@ -1,9 +1,9 @@
-// pdf/invoice_v46.js — v46 single-page layout (final alignments)
+// pdf/invoice_v46.js — v46 single-page layout (FINAL: hanging indents for Z4/Z5)
 //
-// This version applies:
-// • Z3 "Value" heading aligned to the exact value column X used across Z2/Z3.
-// • Z4/Z5 paragraphs start at the same left margin as Zones 1–3 (Lx), with no hanging indents;
-//   continuation lines align under line 1; equal spacing between points.
+// Final tweaks:
+// • Zone 4 & Zone 5 numbered paragraphs now render with a hanging indent so
+//   continuation lines align flush under the first word (after "1. ", "2. ", "3. ").
+// • Uniform gaps between points. Zones 1–3 unchanged from your accepted version.
 
 import PDFDocument from 'pdfkit'
 
@@ -34,6 +34,23 @@ const printedFromNorm = (norm, id) => {
   return `${m[1]}/${mm}${yy}/${seq}`
 }
 
+// Render a numbered paragraph with hanging indent:
+// - prefix like "1. " drawn at (x,y)
+// - body drawn at (x + prefixWidth, y) with width reduced accordingly
+// - returns new y after paragraph with uniform gap
+function bulletPara(doc, {x, y, width, number, text, font='Helvetica', size=9, align='justify', gap=10}) {
+  const prefix = `${number}. `
+  doc.font(font).fontSize(size)
+  const pw = doc.widthOfString(prefix) // measure width of "n. "
+  // draw prefix
+  doc.text(prefix, x, y, { width: pw, continued: false })
+  // draw body with hanging indent
+  const bodyW = Math.max(10, width - pw)
+  const h = doc.heightOfString(text, { width: bodyW, align })
+  doc.text(text, x + pw, y, { width: bodyW, align })
+  return y + h + gap
+}
+
 export async function createV46Pdf(stream, inv, fr) {
   return new Promise((resolve,reject)=>{
     const doc = new PDFDocument({ size:'A4', margin:36 })
@@ -41,7 +58,7 @@ export async function createV46Pdf(stream, inv, fr) {
 
     // ---- Grid / constants ----
     const pageLeft = 36, pageRight = 556
-    const Lx = 44, Lw = 250               // left column anchor
+    const Lx = 44, Lw = 250               // left column anchor (Zones 1–3 & para left)
     const Rx = 292, RkW = 150             // right keys anchor/width
     const RxVal = 430                     // unified VALUE column X for Z2 & Z3
     const RvW = pageRight - RxVal         // width for right values
@@ -49,7 +66,7 @@ export async function createV46Pdf(stream, inv, fr) {
     const thin = 0.5
     const HLine = (y)=> { doc.moveTo(pageLeft, y).lineTo(pageRight, y).lineWidth(thin).stroke() }
 
-    // ===== ZONE 1: Header (OK as last accepted) =====
+    // ===== ZONE 1: Header (final) =====
     const frName  = safe(fr?.legal_name,'Franchisee')
     const frAddr  = safe([fr?.address1, fr?.address2].filter(Boolean).join(', '), 'Address not set')
     const frCode  = safe(inv.franchisee_id || inv.franchisee_code)
@@ -73,7 +90,7 @@ export async function createV46Pdf(stream, inv, fr) {
     y += rowGap - 2
     HLine(y)
 
-    // ===== ZONE 2: Customer & Vehicle (OK previously; keep) =====
+    // ===== ZONE 2: Customer & Vehicle (final) =====
     y += 8
     doc.font('Helvetica-Bold').fontSize(10).text('Customer Details', Lx, y)
     doc.font('Helvetica-Bold').fontSize(10).text('Vehicle Details',  Rx, y)
@@ -140,11 +157,10 @@ export async function createV46Pdf(stream, inv, fr) {
     const z2Bottom = Math.max(ly, ry) + 6
     HLine(z2Bottom)
 
-    // ===== ZONE 3: Pricing — align heading "Value" + all values to RxVal =====
+    // ===== ZONE 3: Pricing (final; heading + values at RxVal) =====
     let py = z2Bottom + 8
     doc.font('Helvetica-Bold').fontSize(10).text('Description/Particulars', Lx, py)
-    // Move heading "Value" to value column X:
-    doc.font('Helvetica-Bold').fontSize(10).text('Value', RxVal, py)
+    doc.font('Helvetica-Bold').fontSize(10).text('Value', RxVal, py)  // aligned to value column
     py += rowGap
 
     const V = (label, value) => {
@@ -178,37 +194,46 @@ export async function createV46Pdf(stream, inv, fr) {
 
     HLine(py + 2)
 
-    // ===== ZONE 4: Customer Declaration — align left with Lx; even gaps; continuation flush-left =====
+    // ===== ZONE 4: Customer Declaration — hanging indents =====
     let dY = py + 10
     const paraX = Lx
     const paraW = pageRight - paraX
-    const addPara = (text) => {
-      const h = doc.heightOfString(text, { width: paraW, align: 'justify' })
-      doc.text(text, paraX, dY, { width: paraW, align: 'justify' })
-      dY += h + 10
-    }
+
     doc.font('Helvetica-Bold').fontSize(10).text('Customer Declaration', Lx, dY)
     dY += rowGap
     doc.font('Helvetica').fontSize(9)
-    addPara('1. I hereby acknowledge that the MaxTT Tyre Sealant installation has been completed on my vehicle to my satisfaction, as per my earlier consent to proceed.')
-    addPara('2. I have read, understood, and accepted the Terms & Conditions stated herein.')
-    addPara('3. I acknowledge that the total amount shown is correct and payable to the franchisee/installer of Treadstone Solutions.')
+    dY = bulletPara(doc, { x: paraX, y: dY, width: paraW, number: 1,
+      text: 'I hereby acknowledge that the MaxTT Tyre Sealant installation has been completed on my vehicle to my satisfaction, as per my earlier consent to proceed.',
+      align: 'justify', gap: 10
+    })
+    dY = bulletPara(doc, { x: paraX, y: dY, width: paraW, number: 2,
+      text: 'I have read, understood, and accepted the Terms & Conditions stated herein.',
+      align: 'justify', gap: 10
+    })
+    dY = bulletPara(doc, { x: paraX, y: dY, width: paraW, number: 3,
+      text: 'I acknowledge that the total amount shown is correct and payable to the franchisee/installer of Treadstone Solutions.',
+      align: 'justify', gap: 4
+    })
 
     HLine(dY + 6)
 
-    // ===== ZONE 5: Terms & Conditions — same left alignment; even gaps; updated point 3 =====
+    // ===== ZONE 5: Terms & Conditions — hanging indents + updated point 3 =====
     let tY = dY + 14
     doc.font('Helvetica-Bold').fontSize(10).text('Terms & Conditions', Lx, tY)
     tY += rowGap
     doc.font('Helvetica').fontSize(9)
-    const addT = (text) => {
-      const h = doc.heightOfString(text, { width: paraW, align: 'justify' })
-      doc.text(text, paraX, tY, { width: paraW, align: 'justify' })
-      tY += h + 10
-    }
-    addT('1. The MaxTT Tyre Sealant is a preventive safety solution designed to reduce tyre-related risks and virtually eliminate punctures and blowouts.')
-    addT('2. Effectiveness is assured only when the vehicle is operated within the speed limits prescribed by competent traffic/transport authorities (RTO/Transport Department) in India.')
-    addT('3. By signing/accepting this invoice, the customer affirms that the installation has been carried out to their satisfaction and agrees to abide by these conditions. Jurisdiction: Gurgaon.')
+    tY = bulletPara(doc, { x: paraX, y: tY, width: paraW, number: 1,
+      text: 'The MaxTT Tyre Sealant is a preventive safety solution designed to reduce tyre-related risks and virtually eliminate punctures and blowouts.',
+      align: 'justify', gap: 10
+    })
+    tY = bulletPara(doc, { x: paraX, y: tY, width: paraW, number: 2,
+      text: 'Effectiveness is assured only when the vehicle is operated within the speed limits prescribed by competent traffic/transport authorities (RTO/Transport Department) in India.',
+      align: 'justify', gap: 10
+    })
+    tY = bulletPara(doc, { x: paraX, y: tY, width: paraW, number: 3,
+      text: 'By signing/accepting this invoice, the customer affirms that the installation has been carried out to their satisfaction and agrees to abide by these conditions. Jurisdiction: Gurgaon.',
+      align: 'justify', gap: 10
+    })
 
     // Signature boxes
     const sigY = tY + 4
