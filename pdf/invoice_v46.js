@@ -1,11 +1,9 @@
-// pdf/invoice_v46.js — v46 single-page layout (aligned & refined per latest notes)
+// pdf/invoice_v46.js — v46 single-page layout (final alignments)
 //
-// Changes in this version:
-// • Z2 Vehicle column and VALUE column moved left and widened so long values (e.g. "4-Wheeler (Car/Van/SUV)")
-//   render on a single line and align vertically with Fitment/Tread values.
-// • Z3 "Value" for ALL rows uses the same value column as Z2 for perfect column alignment.
-// • Z4 & Z5 paragraphs use measured heights to create equal gaps between points; continuation lines align cleanly.
-// • Keeps previous improvements (thin separators, bold headers where requested, justification where needed).
+// This version applies:
+// • Z3 "Value" heading aligned to the exact value column X used across Z2/Z3.
+// • Z4/Z5 paragraphs start at the same left margin as Zones 1–3 (Lx), with no hanging indents;
+//   continuation lines align under line 1; equal spacing between points.
 
 import PDFDocument from 'pdfkit'
 
@@ -41,17 +39,17 @@ export async function createV46Pdf(stream, inv, fr) {
     const doc = new PDFDocument({ size:'A4', margin:36 })
     doc.pipe(stream)
 
-    // ---- Layout constants / grid ----
+    // ---- Grid / constants ----
     const pageLeft = 36, pageRight = 556
-    const Lx = 44, Lw = 250
-    // (Moved right column left, widened values)
-    const Rx = 292, RkW = 150               // right keys column x & width
-    const RxVal = 430, RvW = pageRight - RxVal  // right values column x & width (wider so long values stay on one line)
+    const Lx = 44, Lw = 250               // left column anchor
+    const Rx = 292, RkW = 150             // right keys anchor/width
+    const RxVal = 430                     // unified VALUE column X for Z2 & Z3
+    const RvW = pageRight - RxVal         // width for right values
     const rowGap = 14
     const thin = 0.5
     const HLine = (y)=> { doc.moveTo(pageLeft, y).lineTo(pageRight, y).lineWidth(thin).stroke() }
 
-    // ===== ZONE 1: Header (leave as-is per latest instruction) =====
+    // ===== ZONE 1: Header (OK as last accepted) =====
     const frName  = safe(fr?.legal_name,'Franchisee')
     const frAddr  = safe([fr?.address1, fr?.address2].filter(Boolean).join(', '), 'Address not set')
     const frCode  = safe(inv.franchisee_id || inv.franchisee_code)
@@ -75,7 +73,7 @@ export async function createV46Pdf(stream, inv, fr) {
     y += rowGap - 2
     HLine(y)
 
-    // ===== ZONE 2: Customer (Left) & Vehicle (Right) =====
+    // ===== ZONE 2: Customer & Vehicle (OK previously; keep) =====
     y += 8
     doc.font('Helvetica-Bold').fontSize(10).text('Customer Details', Lx, y)
     doc.font('Helvetica-Bold').fontSize(10).text('Vehicle Details',  Rx, y)
@@ -101,7 +99,7 @@ export async function createV46Pdf(stream, inv, fr) {
       ly += rowGap
     }
 
-    // RIGHT (Vehicle) — first 4 rows aligned with value column RxVal
+    // RIGHT (Vehicle)
     const tyreSize = tyreSizeFmt(inv.tyre_width_mm, inv.aspect_ratio, inv.rim_diameter_in)
     const installed = safe(inv.fitment_locations,'') || `${safe(inv.tyre_count)}`
     let ry = y
@@ -113,18 +111,16 @@ export async function createV46Pdf(stream, inv, fr) {
     ]
     doc.font('Helvetica').fontSize(10)
     for (const [k,v] of rightFirst4){
-      doc.text(`${k}:`, Rx, ry, { width: RkW })                               // key
-      doc.text(String(v), RxVal, ry, { width: RvW, align: 'left' })           // value (wide to avoid wrap)
+      doc.text(`${k}:`, Rx, ry, { width: RkW })
+      doc.text(String(v), RxVal, ry, { width: RvW, align: 'left' })
       ry += rowGap
     }
-
     // Subheading + headers (bold)
     doc.font('Helvetica-Bold').fontSize(10).text('Fitment & Tread Depth (mm)', Rx, ry); ry += rowGap
     doc.font('Helvetica-Bold').fontSize(9).text('Position',  Rx,    ry)
     doc.font('Helvetica-Bold').fontSize(9).text('Tread (mm)', RxVal, ry, { width: 80, align:'left' })
     ry += rowGap
-
-    // Tread rows (values at RxVal column)
+    // Tread rows
     doc.font('Helvetica').fontSize(10)
     const treadRows = [
       ['Front Left',  safe(inv.tread_fl_mm)],
@@ -137,29 +133,23 @@ export async function createV46Pdf(stream, inv, fr) {
       doc.text(val, RxVal, ry, { width: 80, align:'left' })
       ry += rowGap
     }
-
-    // Dosages (values aligned with RxVal)
     const perTyre = inv.tyre_count ? Math.round((Number(inv.dosage_ml||0) / Number(inv.tyre_count))*10)/10 : null
-    doc.text('Per-tyre Dosage:', Rx, ry, { width: RkW })
-    doc.text(perTyre ? `${perTyre} ml` : '—', RxVal, ry, { width: 80, align:'left' })
-    ry += rowGap
-    doc.text('Total Dosage:', Rx, ry, { width: RkW })
-    doc.text(`${safe(inv.dosage_ml)} ml`, RxVal, ry, { width: 80, align:'left' })
-    ry += rowGap
+    doc.text('Per-tyre Dosage:', Rx, ry, { width: RkW }); doc.text(perTyre ? `${perTyre} ml` : '—', RxVal, ry, { width: 80, align:'left' }); ry += rowGap
+    doc.text('Total Dosage:',    Rx, ry, { width: RkW }); doc.text(`${safe(inv.dosage_ml)} ml`,      RxVal, ry, { width: 80, align:'left' }); ry += rowGap
 
-    // Separator Z2
     const z2Bottom = Math.max(ly, ry) + 6
     HLine(z2Bottom)
 
-    // ===== ZONE 3: Pricing — values aligned with RxVal =====
+    // ===== ZONE 3: Pricing — align heading "Value" + all values to RxVal =====
     let py = z2Bottom + 8
     doc.font('Helvetica-Bold').fontSize(10).text('Description/Particulars', Lx, py)
-    doc.font('Helvetica-Bold').fontSize(10).text('Value', Rx, py) // label column (kept for symmetry)
+    // Move heading "Value" to value column X:
+    doc.font('Helvetica-Bold').fontSize(10).text('Value', RxVal, py)
     py += rowGap
 
     const V = (label, value) => {
       doc.font('Helvetica').fontSize(10).text(label, Lx, py)
-      doc.font('Helvetica').fontSize(10).text(String(value), RxVal, py, { width: RvW, align:'left' }) // exact same value column as Z2
+      doc.font('Helvetica').fontSize(10).text(String(value), RxVal, py, { width: RvW, align:'left' })
       py += rowGap
     }
     const mrp = inv.price_per_ml ?? 4.5
@@ -188,16 +178,16 @@ export async function createV46Pdf(stream, inv, fr) {
 
     HLine(py + 2)
 
-    // ===== ZONE 4: Customer Declaration (even spacing using measured heights) =====
+    // ===== ZONE 4: Customer Declaration — align left with Lx; even gaps; continuation flush-left =====
     let dY = py + 10
-    const paraW = 520
+    const paraX = Lx
+    const paraW = pageRight - paraX
     const addPara = (text) => {
       const h = doc.heightOfString(text, { width: paraW, align: 'justify' })
-      doc.text(text, pageLeft, dY, { width: paraW, align: 'justify' })
-      dY += h + 10  // equal gap after each point
+      doc.text(text, paraX, dY, { width: paraW, align: 'justify' })
+      dY += h + 10
     }
-
-    doc.font('Helvetica-Bold').fontSize(10).text('Customer Declaration', pageLeft, dY)
+    doc.font('Helvetica-Bold').fontSize(10).text('Customer Declaration', Lx, dY)
     dY += rowGap
     doc.font('Helvetica').fontSize(9)
     addPara('1. I hereby acknowledge that the MaxTT Tyre Sealant installation has been completed on my vehicle to my satisfaction, as per my earlier consent to proceed.')
@@ -206,21 +196,21 @@ export async function createV46Pdf(stream, inv, fr) {
 
     HLine(dY + 6)
 
-    // ===== ZONE 5: Terms & Conditions (even spacing via measured heights) + signature boxes =====
+    // ===== ZONE 5: Terms & Conditions — same left alignment; even gaps; updated point 3 =====
     let tY = dY + 14
-    doc.font('Helvetica-Bold').fontSize(10).text('Terms & Conditions', pageLeft, tY)
+    doc.font('Helvetica-Bold').fontSize(10).text('Terms & Conditions', Lx, tY)
     tY += rowGap
     doc.font('Helvetica').fontSize(9)
     const addT = (text) => {
       const h = doc.heightOfString(text, { width: paraW, align: 'justify' })
-      doc.text(text, pageLeft, tY, { width: paraW, align: 'justify' })
+      doc.text(text, paraX, tY, { width: paraW, align: 'justify' })
       tY += h + 10
     }
     addT('1. The MaxTT Tyre Sealant is a preventive safety solution designed to reduce tyre-related risks and virtually eliminate punctures and blowouts.')
     addT('2. Effectiveness is assured only when the vehicle is operated within the speed limits prescribed by competent traffic/transport authorities (RTO/Transport Department) in India.')
     addT('3. By signing/accepting this invoice, the customer affirms that the installation has been carried out to their satisfaction and agrees to abide by these conditions. Jurisdiction: Gurgaon.')
 
-    // Signature boxes (aligned)
+    // Signature boxes
     const sigY = tY + 4
     const boxW = 240, boxH = 62, gap = 44
     doc.roundedRect(pageLeft, sigY, boxW, boxH, 6).stroke()
