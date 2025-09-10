@@ -13,7 +13,7 @@ const pool = new Pool({
   ssl: process.env.DATABASE_SSL ? { rejectUnauthorized: false } : false,
 });
 
-export const adminLatestInvoicesRouter = express.Router();
+const adminLatestInvoicesRouter = express.Router();
 
 // simple health
 adminLatestInvoicesRouter.get("/ping", (req, res) => res.json({ ok: true }));
@@ -24,15 +24,14 @@ adminLatestInvoicesRouter.get("/ping", (req, res) => res.json({ ok: true }));
  * - id
  * - created_at
  * - franchisee_code (or franchisee_id fallback)
- * - printed_no   => derived from invoice_number_norm as `${prefix}/${MMYY}/${seq}`
+ * - printed_no   => derived from invoice_number_norm as `${prefix}/${MMYY}/${seq}` (if invoice_number not set)
  * - norm_no      => invoice_number_norm
  * - customer_code (raw as stored)
  * - tyre_count
  * - total_with_gst
  */
-adminLatestInvoicesRouter.get("/latest", async (req, res) => {
+adminLatestInvoicesRouter.get("/latest", async (_req, res) => {
   try {
-    // Prefer the same SELECT the app uses for listing, but keep it defensive.
     const q = `
       SELECT
         id,
@@ -62,7 +61,7 @@ adminLatestInvoicesRouter.get("/latest", async (req, res) => {
         if (m) {
           const seq = m[2];
           const d = created ? new Date(created) : new Date();
-          const mm = String((d.getUTCMonth() + 1)).padStart(2, "0");
+          const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
           const yy = String(d.getUTCFullYear()).slice(-2);
           printed = `${m[1]}/${mm}${yy}/${seq}`;
         }
@@ -74,7 +73,7 @@ adminLatestInvoicesRouter.get("/latest", async (req, res) => {
         franchisee_code: r.franchisee_code || r.franchisee_id || null,
         printed_no: printed,
         norm_no: norm,
-        customer_code: r.customer_code ?? null, // show raw, do not transform
+        customer_code: r.customer_code ?? null, // raw as stored
         tyre_count: r.tyre_count ?? null,
         total_with_gst: r.total_with_gst ?? null,
       };
@@ -86,3 +85,5 @@ adminLatestInvoicesRouter.get("/latest", async (req, res) => {
     res.status(500).json({ error: "admin_latest_failed" });
   }
 });
+
+export default adminLatestInvoicesRouter;
