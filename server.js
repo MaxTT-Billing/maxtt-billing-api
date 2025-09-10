@@ -6,6 +6,7 @@ import express from 'express'
 import pkg from 'pg'
 const { Pool } = pkg
 import { createV46Pdf } from './pdf/invoice_v46.js'
+import { adminLatestInvoicesRouter } from "./routes/admin.latest.invoices.js";
 
 const app = express()
 
@@ -24,6 +25,7 @@ app.use((req, res, next) => {
   if (req.method === 'OPTIONS') return res.sendStatus(200)
   next()
 })
+app.use("/api/invoices/admin", adminLatestInvoicesRouter);
 
 app.use(express.json({ limit: '15mb' }))
 
