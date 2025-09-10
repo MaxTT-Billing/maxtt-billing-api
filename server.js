@@ -6,7 +6,7 @@ import express from 'express'
 import pkg from 'pg'
 const { Pool } = pkg
 import { createV46Pdf } from './pdf/invoice_v46.js'
-import  adminLatestInvoicesRouter  from "./routes/admin.latest.invoices.js";
+import adminLatestInvoicesRouter from "./routes/admin.latest.invoices.js";
 
 const app = express()
 
