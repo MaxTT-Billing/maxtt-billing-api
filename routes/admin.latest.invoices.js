@@ -1,3 +1,8 @@
+// routes/admin.latest.invoices.js
+// Read-only admin invoices listing with normalized fields for UI.
+// Uses only columns known to exist in your DB: id, created_at, invoice_number_norm,
+// customer_code, tyre_count, total_with_gst. Everything else is derived.
+
 import express from "express";
 import pkg from "pg";
 const { Pool } = pkg;
@@ -11,20 +16,46 @@ const adminLatestInvoicesRouter = express.Router();
 
 adminLatestInvoicesRouter.get("/ping", (_req, res) => res.json({ ok: true }));
 
+// Helper: printed number from norm  =>  {prefix}/{MMYY}/{seq}
+function printedFromNorm(norm, createdAt) {
+  if (!norm) return null;
+  const m = String(norm).match(/^(.*)-(\d{4})$/);
+  if (!m) return norm;
+  const seq = m[2];
+  const d = createdAt ? new Date(createdAt) : new Date();
+  const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const yy = String(d.getUTCFullYear()).slice(-2);
+  return `${m[1]}/${mm}${yy}/${seq}`;
+}
+
+// Helper: franchisee code from norm  =>  strip trailing -####
+// e.g. TS-HR-GGM-001-0019  ->  TS-HR-GGM-001
+function franchiseeFromNorm(norm) {
+  if (!norm) return null;
+  const m = String(norm).match(/^(.*)-\d{4}$/);
+  return m ? m[1] : null;
+}
+
+/**
+ * GET /api/invoices/admin/latest
+ * Output fields:
+ *  - id, created_at
+ *  - franchisee_code (derived from norm)
+ *  - printed_no  (derived from norm)
+ *  - norm_no     (invoice_number_norm)
+ *  - customer_code (raw stored)
+ *  - tyre_count, total_with_gst
+ */
 adminLatestInvoicesRouter.get("/latest", async (_req, res) => {
   try {
-    // Select only columns we know exist everywhere. Avoid optional columns in SQL.
     const q = `
       SELECT
         id,
         created_at,
-        invoice_number,          -- printed (nullable)
-        invoice_number_norm,     -- normalized (nullable)
-        customer_code,           -- may be 'C000xxx' or legacy 'TS-...-0009'
+        invoice_number_norm,
+        customer_code,
         tyre_count,
-        total_with_gst,
-        -- keep JSON if your schema has it; otherwise COALESCE(NULL) is harmless
-        COALESCE(invoice_json, NULL) AS invoice_json
+        total_with_gst
       FROM invoices
       ORDER BY id DESC
       LIMIT 200
@@ -32,44 +63,15 @@ adminLatestInvoicesRouter.get("/latest", async (_req, res) => {
     const { rows } = await pool.query(q);
 
     const out = rows.map((r) => {
-      const id = r.id;
-      const created = r.created_at;
       const norm = r.invoice_number_norm || null;
-
-      // Try to get franchisee from a few places without selecting potentially-missing columns
-      let franchisee = null;
-      if (r.invoice_json && typeof r.invoice_json === "object") {
-        // e.g., some schemas store it inside JSON
-        franchisee =
-          r.invoice_json.franchisee_code ||
-          r.invoice_json.franchisee_id ||
-          r.invoice_json.franchisee ||
-          null;
-      }
-      // If still null, leave it null (frontend will show "-")
-
-      // printed number from either invoice_number or derived from norm
-      let printed = r.invoice_number || null;
-      if (!printed && norm) {
-        const m = String(norm).match(/^(.*)-(\d{4})$/);
-        if (m) {
-          const seq = m[2];
-          const d = created ? new Date(created) : new Date();
-          const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
-          const yy = String(d.getUTCFullYear()).slice(-2);
-          printed = `${m[1]}/${mm}${yy}/${seq}`;
-        } else {
-          printed = norm; // fallback: show whatever we have
-        }
-      }
-
+      const created = r.created_at || null;
       return {
-        id,
+        id: r.id,
         created_at: created,
-        franchisee_code: franchisee,
-        printed_no: printed,
+        franchisee_code: franchiseeFromNorm(norm),
+        printed_no: printedFromNorm(norm, created),
         norm_no: norm,
-        customer_code: r.customer_code ?? null,
+        customer_code: r.customer_code ?? null,   // raw as stored (C000xxx or legacy)
         tyre_count: r.tyre_count ?? null,
         total_with_gst: r.total_with_gst ?? null,
       };
