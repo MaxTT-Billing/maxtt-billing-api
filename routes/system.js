@@ -1,4 +1,4 @@
-// routes/system.js (ESM) — self-test + migration + schema debug
+// routes/system.js (ESM) — self-test + migrations + schema debug
 
 import pkg from "pg";
 import { runSelfTest } from "../src/selftest.js";
@@ -11,7 +11,7 @@ export default function systemRouter(app) {
     ssl: { rejectUnauthorized: false },
   });
 
-  // ===== Existing self-test (kept) =====
+  // ===== Keep: Self-test for installations table =====
   app.get("/__db/installations-selftest", async (req, res) => {
     try {
       const report = await runSelfTest(pool);
@@ -21,12 +21,13 @@ export default function systemRouter(app) {
     }
   });
 
-  // ===== One-time migration (kept) =====
-  async function applyMigration(client) {
+  // ===== Keep: One-time migration for installations =====
+  async function applyInstallationsMigration(client) {
     const steps = [];
     const push = (name, ok, details = null) => steps.push({ name, ok, details });
 
     const stmts = [
+      // helper function
       `
       CREATE OR REPLACE FUNCTION set_updated_at()
       RETURNS TRIGGER AS $$
@@ -36,6 +37,7 @@ export default function systemRouter(app) {
       END;
       $$ LANGUAGE plpgsql;
       `,
+      // installations table
       `
       CREATE TABLE IF NOT EXISTS installations (
         id BIGSERIAL PRIMARY KEY,
@@ -77,21 +79,80 @@ export default function systemRouter(app) {
     }
   }
 
-  const migrHandler = async (req, res) => {
+  const migrInstHandler = async (req, res) => {
     const client = await pool.connect();
     try {
-      const result = await applyMigration(client);
+      const result = await applyInstallationsMigration(client);
       res.status(result.ok ? 200 : 500).json(result);
     } finally {
       client.release();
     }
   };
-  app.get("/__db/installations-apply-migration", migrHandler);
-  app.post("/__db/installations-apply-migration", migrHandler);
+  app.get("/__db/installations-apply-migration", migrInstHandler);
+  app.post("/__db/installations-apply-migration", migrInstHandler);
 
-  // ===== NEW: schema/connection introspection =====
+  // ===== NEW: One-time migration for inventory =====
+  async function applyInventoryMigration(client) {
+    const steps = [];
+    const push = (name, ok, details = null) => steps.push({ name, ok, details });
 
-  // 1) Where am I? DB, search_path, schema, user, server
+    const stmts = [
+      // ensure helper exists
+      `
+      CREATE OR REPLACE FUNCTION set_updated_at()
+      RETURNS TRIGGER AS $$
+      BEGIN
+        NEW.updated_at = NOW();
+        RETURN NEW;
+      END;
+      $$ LANGUAGE plpgsql;
+      `,
+      // minimal inventory table (per-franchisee litres)
+      `
+      CREATE TABLE IF NOT EXISTS inventory (
+        franchisee_id TEXT PRIMARY KEY,
+        available_litres NUMERIC(10,2) NOT NULL DEFAULT 0,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      `,
+      `DROP TRIGGER IF EXISTS trg_inventory_updated_at ON inventory;`,
+      `
+      CREATE TRIGGER trg_inventory_updated_at
+      BEFORE UPDATE ON inventory
+      FOR EACH ROW
+      EXECUTE PROCEDURE set_updated_at();
+      `,
+    ];
+
+    await client.query("BEGIN");
+    try {
+      for (let i = 0; i < stmts.length; i++) {
+        await client.query(stmts[i]);
+        push(`step_${i + 1}`, true);
+      }
+      await client.query("COMMIT");
+      return { ok: true, steps };
+    } catch (e) {
+      await client.query("ROLLBACK");
+      push("error", false, { message: e.message });
+      return { ok: false, steps };
+    }
+  }
+
+  const migrInvHandler = async (req, res) => {
+    const client = await pool.connect();
+    try {
+      const result = await applyInventoryMigration(client);
+      res.status(result.ok ? 200 : 500).json(result);
+    } finally {
+      client.release();
+    }
+  };
+  app.get("/__db/inventory-apply-migration", migrInvHandler);
+  app.post("/__db/inventory-apply-migration", migrInvHandler);
+
+  // ===== Schema/connection introspection (kept) =====
   app.get("/__dbg/schema/where", async (req, res) => {
     const client = await pool.connect();
     try {
@@ -113,7 +174,6 @@ export default function systemRouter(app) {
     }
   });
 
-  // 2) List ALL tables across ALL non-system schemas
   app.get("/__dbg/schema/alltables", async (req, res) => {
     const client = await pool.connect();
     try {
@@ -132,8 +192,6 @@ export default function systemRouter(app) {
     }
   });
 
-  // 3) Columns for a table in a given schema
-  //    /__dbg/schema/allcolumns?schema=<schema>&table=<table>
   app.get("/__dbg/schema/allcolumns", async (req, res) => {
     const schema = String(req.query.schema || "");
     const table = String(req.query.table || "");
