@@ -1,4 +1,6 @@
-// src/selftest.js
+// src/selftest.js  (ESM)
+// NOTE: must export a *named* function: runSelfTest
+
 export async function runSelfTest(pool) {
   const report = {
     steps: [],
