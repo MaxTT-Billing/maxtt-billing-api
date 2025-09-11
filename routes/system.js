@@ -1,4 +1,5 @@
-// routes/system.js  (ESM)
+// routes/system.js (ESM) — self-test + migration + schema debug
+
 import pkg from "pg";
 import { runSelfTest } from "../src/selftest.js";
 
@@ -10,7 +11,7 @@ export default function systemRouter(app) {
     ssl: { rejectUnauthorized: false },
   });
 
-  // ---- Self-test: verify table/constraints
+  // ===== Existing self-test (kept) =====
   app.get("/__db/installations-selftest", async (req, res) => {
     try {
       const report = await runSelfTest(pool);
@@ -20,14 +21,12 @@ export default function systemRouter(app) {
     }
   });
 
-  // ---- One-time migration: create installations table (+ function/trigger/indexes)
+  // ===== One-time migration (kept) =====
   async function applyMigration(client) {
     const steps = [];
     const push = (name, ok, details = null) => steps.push({ name, ok, details });
 
-    // DDL statements are idempotent (CREATE IF NOT EXISTS / OR REPLACE)
     const stmts = [
-      // helper function for updated_at
       `
       CREATE OR REPLACE FUNCTION set_updated_at()
       RETURNS TRIGGER AS $$
@@ -37,7 +36,6 @@ export default function systemRouter(app) {
       END;
       $$ LANGUAGE plpgsql;
       `,
-      // table
       `
       CREATE TABLE IF NOT EXISTS installations (
         id BIGSERIAL PRIMARY KEY,
@@ -52,11 +50,9 @@ export default function systemRouter(app) {
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
       `,
-      // indexes
       `CREATE INDEX IF NOT EXISTS idx_installations_franchisee ON installations (franchisee_id);`,
       `CREATE INDEX IF NOT EXISTS idx_installations_status ON installations (status);`,
       `CREATE INDEX IF NOT EXISTS idx_installations_created_at ON installations (created_at);`,
-      // trigger
       `DROP TRIGGER IF EXISTS trg_installations_updated_at ON installations;`,
       `
       CREATE TRIGGER trg_installations_updated_at
@@ -81,8 +77,7 @@ export default function systemRouter(app) {
     }
   }
 
-  // Allow GET (easy in browser) and POST (safer) to run it once
-  const handler = async (req, res) => {
+  const migrHandler = async (req, res) => {
     const client = await pool.connect();
     try {
       const result = await applyMigration(client);
@@ -91,6 +86,75 @@ export default function systemRouter(app) {
       client.release();
     }
   };
-  app.get("/__db/installations-apply-migration", handler);
-  app.post("/__db/installations-apply-migration", handler);
+  app.get("/__db/installations-apply-migration", migrHandler);
+  app.post("/__db/installations-apply-migration", migrHandler);
+
+  // ===== NEW: schema/connection introspection =====
+
+  // 1) Where am I? DB, search_path, schema, user, server
+  app.get("/__dbg/schema/where", async (req, res) => {
+    const client = await pool.connect();
+    try {
+      const db = await client.query("SELECT current_database() AS db, current_schema() AS schema, current_user AS user;");
+      const sp = await client.query("SHOW search_path;");
+      const svr = await client.query("SELECT inet_server_addr() AS host, inet_server_port() AS port;");
+      res.status(200).json({
+        ok: true,
+        db: db.rows[0]?.db,
+        current_schema: db.rows[0]?.schema,
+        current_user: db.rows[0]?.user,
+        search_path: sp.rows[0]?.search_path,
+        server: svr.rows[0],
+      });
+    } catch (e) {
+      res.status(500).json({ ok: false, message: e.message });
+    } finally {
+      client.release();
+    }
+  });
+
+  // 2) List ALL tables across ALL non-system schemas
+  app.get("/__dbg/schema/alltables", async (req, res) => {
+    const client = await pool.connect();
+    try {
+      const r = await client.query(`
+        SELECT table_schema, table_name
+          FROM information_schema.tables
+         WHERE table_type='BASE TABLE'
+           AND table_schema NOT IN ('pg_catalog','information_schema')
+         ORDER BY table_schema, table_name
+      `);
+      res.status(200).json({ ok: true, tables: r.rows });
+    } catch (e) {
+      res.status(500).json({ ok: false, message: e.message });
+    } finally {
+      client.release();
+    }
+  });
+
+  // 3) Columns for a table in a given schema
+  //    /__dbg/schema/allcolumns?schema=<schema>&table=<table>
+  app.get("/__dbg/schema/allcolumns", async (req, res) => {
+    const schema = String(req.query.schema || "");
+    const table = String(req.query.table || "");
+    const ident = s => /^[A-Za-z0-9_]+$/.test(s);
+    if (!ident(schema) || !ident(table)) {
+      return res.status(400).json({ ok: false, code: "invalid_identifiers" });
+    }
+    const client = await pool.connect();
+    try {
+      const r = await client.query(
+        `SELECT column_name, data_type
+           FROM information_schema.columns
+          WHERE table_schema=$1 AND table_name=$2
+          ORDER BY ordinal_position`,
+        [schema, table]
+      );
+      res.status(200).json({ ok: true, schema, table, columns: r.rows });
+    } catch (e) {
+      res.status(500).json({ ok: false, message: e.message });
+    } finally {
+      client.release();
+    }
+  });
 }
