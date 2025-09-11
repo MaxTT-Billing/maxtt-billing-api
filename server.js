@@ -10,8 +10,6 @@ import adminLatestInvoicesRouter from "./routes/admin.latest.invoices.js";
 
 const app = express()
 import systemRouter from './routes/system.js';
-systemRouter(app); // TEMP: DB self-test endpoint
-import systemRouter from './routes/system.js';
 systemRouter(app);
 
 // ------------------------------- CORS ---------------------------------
