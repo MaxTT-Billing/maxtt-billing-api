@@ -1,4 +1,4 @@
-// routes/installations.js  (ESM) — production with ADMIN_KEY auth
+// routes/installations.js — production with ADMIN_KEY auth + simple rate limiting
 
 import pkg from "pg";
 import {
@@ -16,20 +16,42 @@ export default function installationsRouter(app) {
     ssl: { rejectUnauthorized: false },
   });
 
-  // ---- simple admin-key auth (set ADMIN_KEY in env) ----
+  // ---- ADMIN KEY auth (set ADMIN_KEY in env) ----
   const ADMIN_KEY = process.env.ADMIN_KEY;
   function requireAdmin(req, res, next) {
-    if (!ADMIN_KEY) return next(); // if not set, allow (useful in dev)
+    if (!ADMIN_KEY) return next(); // allow in dev if not set
     const key = req.get("X-ADMIN-KEY");
     if (key && key === ADMIN_KEY) return next();
     return res.status(401).json({ ok: false, code: "unauthorized" });
   }
 
+  // ---- Simple rate limiting (per X-ADMIN-KEY or IP) ----
+  // Defaults: 30 requests / 60s per key (or per IP if no key).
+  const RL_WINDOW_MS = Number(process.env.RL_WINDOW_MS || 60_000);
+  const RL_MAX = Number(process.env.RL_MAX || 30);
+  const buckets = new Map(); // id -> { count, resetAt }
+
+  function rateLimit(req, res, next) {
+    const now = Date.now();
+    const key = req.get("X-ADMIN-KEY") || req.ip || "anon";
+    let b = buckets.get(key);
+    if (!b || now >= b.resetAt) {
+      b = { count: 0, resetAt: now + RL_WINDOW_MS };
+      buckets.set(key, b);
+    }
+    b.count += 1;
+    if (b.count > RL_MAX) {
+      const retry = Math.max(0, Math.ceil((b.resetAt - now) / 1000));
+      res.setHeader("Retry-After", String(retry));
+      return res.status(429).json({ ok: false, code: "rate_limited", retry_after_s: retry });
+    }
+    next();
+  }
+
   // ---------------------------
   // POST /installations/start
-  // body: { franchisee_id: "MAXTT-..." }
   // ---------------------------
-  app.post("/installations/start", requireAdmin, async (req, res) => {
+  app.post("/installations/start", requireAdmin, rateLimit, async (req, res) => {
     const { franchisee_id } = req.body || {};
     if (!franchisee_id) {
       return res.status(400).json({ ok: false, code: "missing_franchisee_id" });
@@ -94,9 +116,8 @@ export default function installationsRouter(app) {
 
   // ------------------------------
   // POST /installations/complete
-  // body: { installation_id: 123, used_litres: 1.25 }
   // ------------------------------
-  app.post("/installations/complete", requireAdmin, async (req, res) => {
+  app.post("/installations/complete", requireAdmin, rateLimit, async (req, res) => {
     const { installation_id, used_litres } = req.body || {};
     const used = parseFloat(used_litres);
     if (!installation_id || !Number.isFinite(used) || used <= 0) {
@@ -171,9 +192,8 @@ export default function installationsRouter(app) {
 
   // ----------------------------
   // POST /installations/cancel
-  // body: { installation_id }
   // ----------------------------
-  app.post("/installations/cancel", requireAdmin, async (req, res) => {
+  app.post("/installations/cancel", requireAdmin, rateLimit, async (req, res) => {
     const { installation_id } = req.body || {};
     if (!installation_id) {
       return res.status(400).json({ ok: false, code: "invalid_input" });
