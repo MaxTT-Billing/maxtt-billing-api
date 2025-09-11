@@ -11,6 +11,9 @@ import adminLatestInvoicesRouter from "./routes/admin.latest.invoices.js";
 const app = express()
 import systemRouter from './routes/system.js';
 systemRouter(app);
+import installationsRouter from './routes/installations.js';
+installationsRouter(app);
+app.get('/__dbg/ping', (req, res) => res.json({ ok: true, where: 'root' }));
 
 // ------------------------------- CORS ---------------------------------
 const ORIGINS = (process.env.ALLOWED_ORIGINS ||
