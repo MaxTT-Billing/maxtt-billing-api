@@ -1,5 +1,5 @@
 // server.js — MaxTT Billing API (ESM)
-// Baseline + v46 PDF + Installations (stock lock) + AUTH (F1)
+// Baseline + v46 PDF + Installations (stock lock) + AUTH (F1) + F2 (auto-seed + /me/stock)
 
 import express from 'express';
 import crypto from 'crypto';
@@ -268,6 +268,32 @@ app.get('/me/ping', requireFranchisee, (req, res) => {
   res.status(200).json({ ok: true, franchisee_id: req.franchisee_id });
 });
 
+// --------------------- F2: My stock (token-protected) ------------------
+const INV_TABLE = process.env.INVENTORY_TABLE || 'inventory';
+const INV_FR_COL = process.env.INVENTORY_FRANCHISEE_COL || 'franchisee_id';
+const INV_STOCK_COL = process.env.INVENTORY_STOCK_COL || 'available_litres';
+const INITIAL_STOCK_LITRES = Number(process.env.INITIAL_STOCK_LITRES || 120);
+
+app.get('/me/stock', requireFranchisee, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const frid = req.franchisee_id;
+    const r = await client.query(
+      `SELECT ${qid(INV_STOCK_COL)} AS stock
+         FROM public.${qid(INV_TABLE)}
+        WHERE ${qid(INV_FR_COL)}=$1
+        LIMIT 1`,
+      [frid]
+    );
+    const stock = r.rowCount ? Number(r.rows[0].stock) : 0;
+    res.status(200).json({ ok: true, franchisee_id: frid, available_litres: stock });
+  } catch (e) {
+    res.status(500).json({ ok: false, code: 'me_stock_failed', message: e?.message || String(e) });
+  } finally {
+    client.release();
+  }
+});
+
 // ---------------------- Invoices: create (schema-adaptive) -------------
 app.post('/api/invoices/full', async (req, res) => {
   const client = await pool.connect();
@@ -401,7 +427,9 @@ app.get(['/api/invoices/:id/full2', '/invoices/:id/full2'], async (req, res) => 
       (doc.invoice_number_norm ? printedFromNorm(doc.invoice_number_norm) : null);
     res.json(printed ? { ...doc, invoice_number: printed } : doc);
   } catch (err) {
-    res.status(500).json({ ok: false, where: 'get_invoice_full2', message: err?.message || String(err) });
+    res
+      .status(500)
+      .json({ ok: false, where: 'get_invoice_full2', message: err?.message || String(err) });
   } finally {
     client.release();
   }
@@ -425,18 +453,23 @@ app.get('/api/invoices/by-norm/:norm', async (req, res) => {
   }
 });
 
-// ---------------------- Franchisee Onboarding (Admin/SA) ---------------
-function requireKeyWrap(header, envName) { return requireKey(header, envName); } // keep existing ref
-const requireSA2 = requireKeyWrap('X-SA-KEY', 'SUPER_ADMIN_KEY');
+// -------------- Franchisee Onboarding (Admin/SA) + F2 seeding ----------
+const requireSA2 = requireKey('X-SA-KEY', 'SUPER_ADMIN_KEY');
 
 app.post('/api/super/franchisees/approve/:id', requireSA2, async (req, res) => {
   const client = await pool.connect();
   try {
+    await client.query('BEGIN');
+
     const id = Number(req.params.id || 0);
-    if (!Number.isFinite(id) || id <= 0) return res.status(400).json({ ok: false, error: 'bad_id' });
+    if (!Number.isFinite(id) || id <= 0) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ ok: false, error: 'bad_id' });
+    }
     const note = (req.body?.note || '').trim();
     const approver = (req.get('X-SA-USER') || 'superadmin').trim() || 'superadmin';
     const nowIso = new Date().toISOString();
+
     const r = await client.query(
       `
       UPDATE public.franchisees
@@ -444,8 +477,49 @@ app.post('/api/super/franchisees/approve/:id', requireSA2, async (req, res) => {
       WHERE id=$1 RETURNING *`,
       [id, approver, nowIso, note]
     );
-    res.json({ ok: true, franchisee: r.rows[0] });
+    if (!r.rowCount) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ ok: false, error: 'not_found' });
+    }
+    const frRow = r.rows[0];
+    const frid = frRow.franchisee_id || frRow.code || null;
+
+    // F2: Auto-seed inventory if missing (idempotent)
+    let seeded_inventory_litres = 0;
+    let inventory_after = null;
+
+    if (frid) {
+      const sel = await client.query(
+        `SELECT ${qid(INV_STOCK_COL)} AS stock
+           FROM public.${qid(INV_TABLE)}
+          WHERE ${qid(INV_FR_COL)}=$1
+          LIMIT 1`,
+        [frid]
+      );
+      if (sel.rowCount === 0) {
+        const initial = INITIAL_STOCK_LITRES;
+        const ins = await client.query(
+          `INSERT INTO public.${qid(INV_TABLE)} (${qid(INV_FR_COL)}, ${qid(INV_STOCK_COL)})
+           VALUES ($1,$2)
+           RETURNING ${qid(INV_STOCK_COL)} AS stock`,
+          [frid, initial]
+        );
+        seeded_inventory_litres = initial;
+        inventory_after = Number(ins.rows[0].stock);
+      } else {
+        inventory_after = Number(sel.rows[0].stock);
+      }
+    }
+
+    await client.query('COMMIT');
+    res.json({
+      ok: true,
+      franchisee: frRow,
+      seeded_inventory_litres,
+      inventory_after
+    });
   } catch (e) {
+    try { await pool.query('ROLLBACK'); } catch {}
     res.status(500).json({ ok: false, error: String(e?.message || e) });
   } finally {
     client.release();
@@ -491,13 +565,18 @@ app.get('/api/invoices/:id/pdf', async (req, res) => {
     const frCode = inv.franchisee_id || inv.franchisee_code || '';
     let fr = null;
     if (frCode) {
-      const frq = await client.query(`SELECT * FROM public.franchisees WHERE code=$1 LIMIT 1`, [frCode]);
+      const frq = await client.query(`SELECT * FROM public.franchisees WHERE code=$1 LIMIT 1`, [
+        frCode,
+      ]);
       fr = frq.rows[0] || null;
     }
 
     res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', `${download ? 'attachment' : 'inline'}; filename="invoice-${id}.pdf"`);
-    await createV46Pdf(res, inv, fr);
+    res.setHeader(
+      'Content-Disposition',
+      `${download ? 'attachment' : 'inline'}; filename="invoice-${id}.pdf"`
+    );
+    await createV46Pdf(res, inv, fr); // stream out
   } catch (e) {
     res.status(500).json({ error: 'pdf_failed', message: e?.message || String(e) });
   } finally {
