@@ -1,8 +1,10 @@
 // routes/system.js
-const { Pool } = require("pg");
-const { runSelfTest } = require("../src/selftest");
+import pkg from "pg";
+import { runSelfTest } from "../src/selftest.js";
 
-module.exports = (app) => {
+const { Pool } = pkg;
+
+export default function systemRouter(app) {
   const pool = new Pool({
     connectionString: process.env.DATABASE_URL,
     ssl: { rejectUnauthorized: false },
@@ -16,4 +18,4 @@ module.exports = (app) => {
       res.status(500).json({ ok: false, error: String(err && err.message || err) });
     }
   });
-};
+}
