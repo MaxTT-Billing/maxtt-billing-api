@@ -1,6 +1,6 @@
 // server.js — MaxTT Billing API (ESM)
-// Baseline + v46 PDF + Installations (stock lock) + AUTH (F1) + F2 (auto-seed + /me/stock)
-// + NEW: approve-by-franchisee-id convenience route
+// Baseline + v46 PDF + Installations (stock lock) + AUTH (F1)
+// + F2 (auto-seed + /me/stock) + Strict Actuals /me/summary
 
 import express from 'express';
 import crypto from 'crypto';
@@ -69,7 +69,7 @@ function findCol(cols, candidates) {
 }
 const pad = (n, w = 4) => String(Math.max(0, Number(n) || 0)).padStart(w, '0');
 function mmYY(d = new Date()) {
-  const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
+  const mm = String(d.getUTCMonth() + 1).toString().padStart(2, '0');
   const yy = String(d.getUTCFullYear()).slice(-2);
   return `${mm}${yy}`;
 }
@@ -292,6 +292,141 @@ app.get('/me/stock', requireFranchisee, async (req, res) => {
   }
 });
 
+// --------------------- F3 (Strict Actuals): /me/summary ----------------
+// Month window default: current calendar month in IST (Asia/Kolkata).
+// You can override via ?month=YYYY-MM (interpreted in IST).
+const METRICS_TZ = process.env.METRICS_TZ || 'Asia/Kolkata';
+
+// Compute month window boundaries in UTC for IST month (no DST in IST).
+function istMonthBounds(monthParam /* 'YYYY-MM' or undefined */) {
+  // IST offset = +05:30 => UTC = local - 5:30
+  const pad2 = n => String(n).padStart(2, '0');
+  let y, m; // month 1..12
+  if (monthParam && /^\d{4}-\d{2}$/.test(monthParam)) {
+    y = Number(monthParam.slice(0,4));
+    m = Number(monthParam.slice(5,7));
+  } else {
+    // Now in IST
+    const now = new Date(Date.now() + 330 * 60 * 1000); // add 5h30m
+    y = now.getUTCFullYear();
+    m = now.getUTCMonth() + 1;
+  }
+  // IST month start at local 00:00 => UTC = -05:30
+  const startUtcMs = Date.UTC(y, m - 1, 1, -5, -30, 0);
+  const endUtcMs   = Date.UTC(m === 12 ? y + 1 : y, m === 12 ? 0 : m, 1, -5, -30, 0);
+  const startUtcIso = new Date(startUtcMs).toISOString();
+  const endUtcIso   = new Date(endUtcMs).toISOString();
+  const monthStr = `${y}-${pad2(m)}`;
+  const startLocal = `${monthStr}-01T00:00:00+05:30`;
+  // Compute next month local string
+  const nextY = m === 12 ? y + 1 : y;
+  const nextM = m === 12 ? 1 : m + 1;
+  const endLocal = `${nextY}-${pad2(nextM)}-01T00:00:00+05:30`;
+  return { monthStr, startUtcIso, endUtcIso, startLocal, endLocal, tz: 'Asia/Kolkata' };
+}
+
+app.get('/me/summary', requireFranchisee, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const frid = req.franchisee_id;
+    const monthParam = String(req.query.month || '').trim() || undefined;
+    const b = istMonthBounds(monthParam);
+
+    // 1) Current stock
+    const rStock = await client.query(
+      `SELECT ${qid(INV_STOCK_COL)} AS stock
+         FROM public.${qid(INV_TABLE)}
+        WHERE ${qid(INV_FR_COL)}=$1
+        LIMIT 1`,
+      [frid]
+    );
+    const currentStock = rStock.rowCount ? Number(rStock.rows[0].stock) : 0;
+
+    // 2) Vehicles installed (this month) & material used (strict actuals)
+    const rInst = await client.query(
+      `SELECT
+          COUNT(*)::int AS vehicles,
+          COALESCE(SUM(used_litres), 0)::float AS used_l
+         FROM public.installations
+        WHERE franchisee_id = $1
+          AND status = 'completed'
+          AND completed_at >= $2::timestamptz
+          AND completed_at <  $3::timestamptz`,
+      [frid, b.startUtcIso, b.endUtcIso]
+    );
+    const vehiclesThisMonth = rInst.rows[0]?.vehicles || 0;
+    const materialUsedThisMonthL = Number(rInst.rows[0]?.used_l || 0);
+
+    // 3) Material used to date (since onboarded_at if present)
+    const rToDate = await client.query(
+      `SELECT
+          COALESCE(SUM(i.used_litres), 0)::float AS used_l
+         FROM public.installations i
+         LEFT JOIN public.franchisees f ON f.franchisee_id = i.franchisee_id
+        WHERE i.franchisee_id = $1
+          AND i.status = 'completed'
+          AND (
+                f.onboarded_at IS NULL
+                OR i.completed_at >= f.onboarded_at
+              )`,
+      [frid]
+    );
+    const materialUsedToDateL = Number(rToDate.rows[0]?.used_l || 0);
+
+    // 4) Sales & GST (this month) — from invoices created_at
+    // Note: created_at is TIMESTAMP WITHOUT TIME ZONE. We compare to UTC window.
+    const rSales = await client.query(
+      `SELECT
+          COALESCE(SUM(total_with_gst), 0)::float AS sales,
+          COALESCE(SUM(gst_amount), 0)::float AS gst,
+          COUNT(*)::int AS invoices
+         FROM public.invoices
+        WHERE franchisee_id = $1
+          AND created_at >= $2::timestamp
+          AND created_at <  $3::timestamp`,
+      [frid, b.startUtcIso.replace('Z',''), b.endUtcIso.replace('Z','')]
+    );
+    const salesThisMonth = Number(rSales.rows[0]?.sales || 0);
+    const gstThisMonth = Number(rSales.rows[0]?.gst || 0);
+    const invoicesThisMonth = rSales.rows[0]?.invoices || 0;
+
+    // 5) Reconciliation (strict actuals): installs that were started but not completed in the window
+    const rRecon = await client.query(
+      `SELECT COUNT(*)::int AS pending
+         FROM public.installations
+        WHERE franchisee_id = $1
+          AND status <> 'completed'
+          AND created_at >= $2::timestamptz
+          AND created_at <  $3::timestamptz`,
+      [frid, b.startUtcIso, b.endUtcIso]
+    );
+    const needsReconciliation = rRecon.rows[0]?.pending || 0;
+
+    res.status(200).json({
+      ok: true,
+      franchisee_id: frid,
+      period: {
+        month: b.monthStr,
+        from_local: b.startLocal,
+        to_local: b.endLocal,
+        tz: METRICS_TZ
+      },
+      current_stock_l: currentStock,
+      vehicles_this_month: vehiclesThisMonth,
+      sales_this_month: salesThisMonth,
+      gst_this_month: gstThisMonth,
+      material_used_this_month_l: materialUsedThisMonthL,
+      material_used_to_date_l: materialUsedToDateL,
+      needs_reconciliation_count: needsReconciliation,
+      computed_via: { material: 'installations_only' }
+    });
+  } catch (e) {
+    res.status(500).json({ ok: false, code: 'me_summary_failed', message: e?.message || String(e) });
+  } finally {
+    client.release();
+  }
+});
+
 // ---------------------- Invoices: create (schema-adaptive) -------------
 app.post('/api/invoices/full', async (req, res) => {
   const client = await pool.connect();
@@ -366,6 +501,89 @@ app.post('/api/invoices/full', async (req, res) => {
   }
 });
 
+// ---------------------- Invoices: list / latest / full2 / by-norm ------
+app.get('/api/invoices', async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const cols = await getInvoiceCols(client);
+    const dcol = findCol(cols, ['id', 'invoice_id', 'created_at']) || 'id';
+    const params = [];
+    const where = [];
+    if (req.query.franchisee_id) {
+      where.push(`${qid('franchisee_id')} = $${params.length + 1}`);
+      params.push(req.query.franchisee_id);
+    }
+    const sql = `
+      SELECT i.*
+      FROM public.invoices i
+      ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
+      ORDER BY i.${qid(dcol)} DESC
+      LIMIT ${Math.min(Number(req.query.limit || 500), 5000)}
+    `;
+    const r = await client.query(sql, params);
+    res.json(r.rows);
+  } catch (err) {
+    res.status(500).json({ ok: false, where: 'list_invoices', message: err?.message || String(err) });
+  } finally {
+    client.release();
+  }
+});
+
+app.get('/api/invoices/latest', async (_req, res) => {
+  const client = await pool.connect();
+  try {
+    const cols = await getInvoiceCols(client);
+    const idCol = findCol(cols, ['id', 'invoice_id']) || 'id';
+    const r = await client.query(
+      `SELECT ${qid(idCol)} AS id FROM public.invoices ORDER BY ${qid(idCol)} DESC LIMIT 1`
+    );
+    if (!r.rows.length) return res.status(404).json({ ok: false, error: 'empty' });
+    res.json({ id: r.rows[0].id });
+  } catch (err) {
+    res.status(500).json({ ok: false, where: 'latest', message: err?.message || String(err) });
+  } finally {
+    client.release();
+  }
+});
+
+app.get(['/api/invoices/:id/full2', '/invoices/:id/full2'], async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const id = Number(req.params.id || 0);
+    if (!Number.isFinite(id) || id <= 0) return res.status(400).json({ ok: false, error: 'bad_id' });
+    const r = await client.query(`SELECT * FROM public.invoices WHERE id=$1 LIMIT 1`, [id]);
+    if (!r.rows.length) return res.status(404).json({ ok: false, error: 'not_found' });
+    res.setHeader('Cache-Control', 'no-store');
+    const doc = r.rows[0];
+    const printed =
+      doc.invoice_number ||
+      (doc.invoice_number_norm ? printedFromNorm(doc.invoice_number_norm) : null);
+    res.json(printed ? { ...doc, invoice_number: printed } : doc);
+  } catch (err) {
+    res.status(500).json({ ok: false, where: 'get_invoice_full2', message: err?.message || String(err) });
+  } finally {
+    client.release();
+  }
+});
+
+app.get('/api/invoices/by-norm/:norm', async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const norm = String(req.params.norm || '').trim();
+    if (!norm) return res.status(400).json({ ok: false, error: 'missing_norm' });
+    const r = await client.query(
+      `SELECT * FROM public.invoices WHERE "invoice_number_norm"=$1 LIMIT 1`,
+      [norm]
+    );
+    if (!r.rows.length) return res.status(404).json({ ok: false, error: 'not_found' });
+    res.json(r.rows[0]);
+  } catch (err) {
+    res.status(500).json({ ok: false, where: 'by_norm', message: err?.message || err });
+  } finally {
+    client.release();
+  }
+});
+
 // -------------- Franchisee Onboarding (Admin/SA) + F2 seeding ----------
 const requireSA2 = requireKey('X-SA-KEY', 'SUPER_ADMIN_KEY');
 
@@ -435,7 +653,7 @@ app.post('/api/super/franchisees/approve/:id', requireSA2, async (req, res) => {
   }
 });
 
-// NEW: approve by franchisee_id (string) — convenience
+// Approve by franchisee_id (string) — convenience
 app.post('/api/super/franchisees/approve/by-franchisee-id/:franchisee_id', requireSA2, async (req, res) => {
   const client = await pool.connect();
   try {
