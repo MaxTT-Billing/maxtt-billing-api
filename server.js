@@ -1,5 +1,6 @@
 // server.js — MaxTT Billing API (ESM)
 // Baseline + v46 PDF + Installations (stock lock) + AUTH (F1) + F2 (auto-seed + /me/stock)
+// + NEW: approve-by-franchisee-id convenience route
 
 import express from 'express';
 import crypto from 'crypto';
@@ -101,7 +102,6 @@ function generatePassword(len = 20) {
   const bytes = crypto.randomBytes(len);
   let out = '';
   for (let i = 0; i < len; i++) out += PW_ALPH[bytes[i] % PW_ALPH.length];
-  // 4 blocks of 5
   return `${out.slice(0,5)}-${out.slice(5,10)}-${out.slice(10,15)}-${out.slice(15,20)}`;
 }
 
@@ -182,7 +182,6 @@ app.get('/', (_req, res) => res.send('MaxTT Billing API is running'));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 // ------------------------------- AUTH F1 --------------------------------
-// Super Admin resets (or sets) password by numeric franchisee row id
 app.post('/admin/franchisees/reset-password/:id', requireSA, async (req, res) => {
   const id = Number(req.params.id || 0);
   if (!Number.isFinite(id) || id <= 0) return res.status(400).json({ ok: false, code: 'bad_id' });
@@ -207,7 +206,6 @@ app.post('/admin/franchisees/reset-password/:id', requireSA, async (req, res) =>
   }
 });
 
-// Convenience: reset by franchisee_id value
 app.post('/admin/franchisees/reset-password/by-franchisee-id/:franchisee_id', requireSA, async (req, res) => {
   const frid = String(req.params.franchisee_id || '').trim();
   if (!frid) return res.status(400).json({ ok: false, code: 'missing_franchisee_id' });
@@ -368,94 +366,10 @@ app.post('/api/invoices/full', async (req, res) => {
   }
 });
 
-// ---------------------- Invoices: list / latest / full2 / by-norm ------
-app.get('/api/invoices', async (req, res) => {
-  const client = await pool.connect();
-  try {
-    const cols = await getInvoiceCols(client);
-    const dcol = findCol(cols, ['id', 'invoice_id', 'created_at']) || 'id';
-    const params = [];
-    const where = [];
-    if (req.query.franchisee_id) {
-      where.push(`${qid('franchisee_id')} = $${params.length + 1}`);
-      params.push(req.query.franchisee_id);
-    }
-    const sql = `
-      SELECT i.*
-      FROM public.invoices i
-      ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
-      ORDER BY i.${qid(dcol)} DESC
-      LIMIT ${Math.min(Number(req.query.limit || 500), 5000)}
-    `;
-    const r = await client.query(sql, params);
-    res.json(r.rows);
-  } catch (err) {
-    res.status(500).json({ ok: false, where: 'list_invoices', message: err?.message || String(err) });
-  } finally {
-    client.release();
-  }
-});
-
-app.get('/api/invoices/latest', async (_req, res) => {
-  const client = await pool.connect();
-  try {
-    const cols = await getInvoiceCols(client);
-    const idCol = findCol(cols, ['id', 'invoice_id']) || 'id';
-    const r = await client.query(
-      `SELECT ${qid(idCol)} AS id FROM public.invoices ORDER BY ${qid(idCol)} DESC LIMIT 1`
-    );
-    if (!r.rows.length) return res.status(404).json({ ok: false, error: 'empty' });
-    res.json({ id: r.rows[0].id });
-  } catch (err) {
-    res.status(500).json({ ok: false, where: 'latest', message: err?.message || String(err) });
-  } finally {
-    client.release();
-  }
-});
-
-app.get(['/api/invoices/:id/full2', '/invoices/:id/full2'], async (req, res) => {
-  const client = await pool.connect();
-  try {
-    const id = Number(req.params.id || 0);
-    if (!Number.isFinite(id) || id <= 0) return res.status(400).json({ ok: false, error: 'bad_id' });
-    const r = await client.query(`SELECT * FROM public.invoices WHERE id=$1 LIMIT 1`, [id]);
-    if (!r.rows.length) return res.status(404).json({ ok: false, error: 'not_found' });
-    res.setHeader('Cache-Control', 'no-store');
-    const doc = r.rows[0];
-    const printed =
-      doc.invoice_number ||
-      (doc.invoice_number_norm ? printedFromNorm(doc.invoice_number_norm) : null);
-    res.json(printed ? { ...doc, invoice_number: printed } : doc);
-  } catch (err) {
-    res
-      .status(500)
-      .json({ ok: false, where: 'get_invoice_full2', message: err?.message || String(err) });
-  } finally {
-    client.release();
-  }
-});
-
-app.get('/api/invoices/by-norm/:norm', async (req, res) => {
-  const client = await pool.connect();
-  try {
-    const norm = String(req.params.norm || '').trim();
-    if (!norm) return res.status(400).json({ ok: false, error: 'missing_norm' });
-    const r = await client.query(
-      `SELECT * FROM public.invoices WHERE "invoice_number_norm"=$1 LIMIT 1`,
-      [norm]
-    );
-    if (!r.rows.length) return res.status(404).json({ ok: false, error: 'not_found' });
-    res.json(r.rows[0]);
-  } catch (err) {
-    res.status(500).json({ ok: false, where: 'by_norm', message: err?.message || err });
-  } finally {
-    client.release();
-  }
-});
-
 // -------------- Franchisee Onboarding (Admin/SA) + F2 seeding ----------
 const requireSA2 = requireKey('X-SA-KEY', 'SUPER_ADMIN_KEY');
 
+// Existing approve by numeric row id
 app.post('/api/super/franchisees/approve/:id', requireSA2, async (req, res) => {
   const client = await pool.connect();
   try {
@@ -484,7 +398,7 @@ app.post('/api/super/franchisees/approve/:id', requireSA2, async (req, res) => {
     const frRow = r.rows[0];
     const frid = frRow.franchisee_id || frRow.code || null;
 
-    // F2: Auto-seed inventory if missing (idempotent)
+    // Auto-seed inventory if missing (idempotent)
     let seeded_inventory_litres = 0;
     let inventory_after = null;
 
@@ -512,12 +426,71 @@ app.post('/api/super/franchisees/approve/:id', requireSA2, async (req, res) => {
     }
 
     await client.query('COMMIT');
-    res.json({
-      ok: true,
-      franchisee: frRow,
-      seeded_inventory_litres,
-      inventory_after
-    });
+    res.json({ ok: true, franchisee: frRow, seeded_inventory_litres, inventory_after });
+  } catch (e) {
+    try { await pool.query('ROLLBACK'); } catch {}
+    res.status(500).json({ ok: false, error: String(e?.message || e) });
+  } finally {
+    client.release();
+  }
+});
+
+// NEW: approve by franchisee_id (string) — convenience
+app.post('/api/super/franchisees/approve/by-franchisee-id/:franchisee_id', requireSA2, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const frid = String(req.params.franchisee_id || '').trim();
+    if (!frid) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ ok: false, error: 'missing_franchisee_id' });
+    }
+    const note = (req.body?.note || '').trim();
+    const approver = (req.get('X-SA-USER') || 'superadmin').trim() || 'superadmin';
+    const nowIso = new Date().toISOString();
+
+    const r = await client.query(
+      `
+      UPDATE public.franchisees
+      SET status='ACTIVE', approval_by=$2, approval_at=$3, approval_note=$4, rejection_reason=NULL
+      WHERE franchisee_id=$1
+      RETURNING *`,
+      [frid, approver, nowIso, note]
+    );
+    if (!r.rowCount) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ ok: false, error: 'not_found' });
+    }
+    const frRow = r.rows[0];
+
+    // Auto-seed inventory if missing (idempotent)
+    let seeded_inventory_litres = 0;
+    let inventory_after = null;
+
+    const sel = await client.query(
+      `SELECT ${qid(INV_STOCK_COL)} AS stock
+         FROM public.${qid(INV_TABLE)}
+        WHERE ${qid(INV_FR_COL)}=$1
+        LIMIT 1`,
+      [frid]
+    );
+    if (sel.rowCount === 0) {
+      const initial = INITIAL_STOCK_LITRES;
+      const ins = await client.query(
+        `INSERT INTO public.${qid(INV_TABLE)} (${qid(INV_FR_COL)}, ${qid(INV_STOCK_COL)})
+         VALUES ($1,$2)
+         RETURNING ${qid(INV_STOCK_COL)} AS stock`,
+        [frid, initial]
+      );
+      seeded_inventory_litres = initial;
+      inventory_after = Number(ins.rows[0].stock);
+    } else {
+      inventory_after = Number(sel.rows[0].stock);
+    }
+
+    await client.query('COMMIT');
+    res.json({ ok: true, franchisee: frRow, seeded_inventory_litres, inventory_after });
   } catch (e) {
     try { await pool.query('ROLLBACK'); } catch {}
     res.status(500).json({ ok: false, error: String(e?.message || e) });
