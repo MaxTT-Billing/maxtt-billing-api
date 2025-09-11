@@ -1,5 +1,5 @@
 // src/selftest.js
-async function runSelfTest(pool) {
+export async function runSelfTest(pool) {
   const report = {
     steps: [],
     notes: "Verifies 'installations' table + status constraint + basic write path",
@@ -14,7 +14,7 @@ async function runSelfTest(pool) {
     const a = await client.query("SELECT to_regclass('public.installations') AS exists_check;");
     const exists = a.rows[0] && a.rows[0].exists_check !== null;
     push("A_table_exists", exists, { exists_check: a.rows[0] && a.rows[0].exists_check });
-    if (!exists) return report; // stop early, migration not applied
+    if (!exists) return report;
 
     // STEP B: schema columns
     const b = await client.query(`
@@ -25,13 +25,13 @@ async function runSelfTest(pool) {
     `);
     push("B_schema_columns", true, { columns: b.rows });
 
-    // STEP C: insert dummy row (started)
+    // STEP C: insert dummy row
     const c = await client.query(
       `INSERT INTO installations
          (franchisee_id, stock_check_litres_snapshot, allowed_to_proceed, status)
        VALUES ($1, $2, $3, 'started')
        RETURNING id, franchisee_id, stock_check_litres_snapshot, allowed_to_proceed, status, created_at;`,
-      ["MAXTT-DEMO-001", 25.00, true]
+      ["MAXTT-DEMO-001", 25.0, true]
     );
     insertedId = c.rows[0].id;
     push("C_insert_started", true, c.rows[0]);
@@ -46,7 +46,7 @@ async function runSelfTest(pool) {
     );
     push("D_update_completed", true, d.rows[0]);
 
-    // STEP E: invalid status should fail due to CHECK constraint
+    // STEP E: invalid status (expect constraint error)
     try {
       await client.query(`UPDATE installations SET status='foo' WHERE id=$1;`, [insertedId]);
       push("E_invalid_status_constraint", false, "Unexpectedly succeeded");
@@ -63,5 +63,3 @@ async function runSelfTest(pool) {
     client.release();
   }
 }
-
-module.exports = { runSelfTest };
