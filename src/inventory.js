@@ -1,11 +1,18 @@
-// src/inventory.js  (ESM)
-// Supports ENV overrides and scanning to find inventory table/columns.
+// src/inventory.js  (ESM) — Expanded detector + schema helpers
 
+// Broadened synonym sets (UK/US spellings + common variants)
 const STOCK_COL_CANDIDATES = [
-  "available_litres", "available_ltrs", "stock_litres", "stock_ltrs",
-  "balance_litres", "balance_ltrs", "stock"
+  "available_litres","available_ltrs","available_liters","available_ltr","available",
+  "available_stock","available_qty","qty_litres","qty_liters","quantity_litres","quantity_liters",
+  "stock_litres","stock_liters","stock","stock_qty","stock_quantity",
+  "balance_litres","balance_ltrs","balance_liters","balance","current_stock","current_qty"
 ];
-const FRANCHISEE_COL_CANDIDATES = ["franchisee_id", "fr_code", "franchise_code", "kiosk_id"];
+
+const FRANCHISEE_COL_CANDIDATES = [
+  "franchisee_id","franchisee","franchisee_code","franchise_code","fr_code","frcode",
+  "kiosk_id","kiosk_code","kiosk","outlet_id","outlet_code",
+  "partner_id","partner_code","dealer_id","dealer_code"
+];
 
 let cached = null;
 
@@ -13,6 +20,7 @@ function isSafeIdentifier(s) {
   return typeof s === "string" && /^[a-zA-Z0-9_]+$/.test(s);
 }
 
+// ENV override support: set INVENTORY_TABLE, INVENTORY_FRANCHISEE_COL, INVENTORY_STOCK_COL
 function envMapping() {
   const table = process.env.INVENTORY_TABLE;
   const franchiseeCol = process.env.INVENTORY_FRANCHISEE_COL;
@@ -32,28 +40,33 @@ export async function detectInventoryMapping(client) {
 
   // 2) Auto-scan information_schema
   const q = await client.query(`
-    SELECT table_name, column_name, data_type
+    SELECT table_name, column_name
     FROM information_schema.columns
     WHERE table_schema='public'
   `);
+
+  // Group by table
   const byTable = new Map();
-  for (const row of q.rows) {
-    const t = row.table_name;
-    if (!byTable.has(t)) byTable.set(t, []);
-    byTable.get(t).push(row);
+  for (const r of q.rows) {
+    const t = r.table_name;
+    if (!byTable.has(t)) byTable.set(t, new Set());
+    byTable.get(t).add(r.column_name);
   }
 
+  // Score candidates: prefer tables named like inventory/stock/franchisee/kiosk
   let best = null;
-  for (const [table, cols] of byTable.entries()) {
-    const names = cols.map(c => c.column_name);
-    const hasFr = FRANCHISEE_COL_CANDIDATES.find(c => names.includes(c));
-    const hasStock = STOCK_COL_CANDIDATES.find(c => names.includes(c));
+  for (const [table, colsSet] of byTable.entries()) {
+    const cols = Array.from(colsSet);
+    const hasFr = FRANCHISEE_COL_CANDIDATES.find(c => cols.includes(c));
+    const hasStock = STOCK_COL_CANDIDATES.find(c => cols.includes(c));
     if (!hasFr || !hasStock) continue;
 
-    // Prefer tables named like inventory/stock
+    const t = table.toLowerCase();
     const score =
-      (table.includes("inventory") ? 2 : 0) +
-      (table.includes("stock") ? 1 : 0) + 1;
+      (t.includes("inventory") ? 4 : 0) +
+      (t.includes("stock") ? 3 : 0) +
+      (t.includes("franchisee") ? 2 : 0) +
+      (t.includes("kiosk") ? 1 : 0) + 1;
 
     if (!best || score > best.score) {
       best = { table, franchiseeCol: hasFr, stockCol: hasStock, score };
@@ -67,28 +80,6 @@ export async function detectInventoryMapping(client) {
   return cached;
 }
 
-export async function scanInventoryCandidates(client) {
-  const q = await client.query(`
-    SELECT table_name, column_name
-    FROM information_schema.columns
-    WHERE table_schema='public'
-  `);
-  const m = new Map();
-  for (const r of q.rows) {
-    if (!m.has(r.table_name)) m.set(r.table_name, { table: r.table_name, cols: [] });
-    m.get(r.table_name).cols.push(r.column_name);
-  }
-  const picks = [];
-  for (const { table, cols } of m.values()) {
-    const fr = FRANCHISEE_COL_CANDIDATES.filter(c => cols.includes(c));
-    const st = STOCK_COL_CANDIDATES.filter(c => cols.includes(c));
-    if (fr.length && st.length) {
-      picks.push({ table, franchiseeCols: fr, stockCols: st });
-    }
-  }
-  return picks;
-}
-
 export function setManualMappingForSession(table, franchiseeCol, stockCol) {
   if ([table, franchiseeCol, stockCol].every(isSafeIdentifier)) {
     cached = { table, franchiseeCol, stockCol, source: "manual" };
@@ -97,6 +88,7 @@ export function setManualMappingForSession(table, franchiseeCol, stockCol) {
   return null;
 }
 
+// ---- Inventory row helpers
 export async function getInventoryRowForUpdate(client, mapping, franchiseeId) {
   const sql = `
     SELECT "${mapping.stockCol}"::numeric AS available_litres
@@ -119,8 +111,7 @@ export async function listInventoryRows(client, mapping, limit = 10) {
 }
 
 export async function insertOrUpdateInventoryRow(client, mapping, franchiseeId, litres) {
-  // Upsert-ish (works if there's unique constraint; if not, try update then insert)
-  // First attempt update
+  // Try update then insert (works without unique constraint too, but may duplicate if not careful)
   const upd = await client.query(
     `UPDATE "${mapping.table}"
         SET "${mapping.stockCol}" = $2
@@ -130,17 +121,15 @@ export async function insertOrUpdateInventoryRow(client, mapping, franchiseeId, 
   );
   if (upd.rowCount) return { action: "updated" };
 
-  // Fallback insert
-  const sql = `
-    INSERT INTO "${mapping.table}" ("${mapping.franchiseeCol}", "${mapping.stockCol}")
-    VALUES ($1, $2)
-  `;
-  await client.query(sql, [franchiseeId, litres]);
+  await client.query(
+    `INSERT INTO "${mapping.table}" ("${mapping.franchiseeCol}", "${mapping.stockCol}")
+     VALUES ($1, $2)`,
+    [franchiseeId, litres]
+  );
   return { action: "inserted" };
 }
 
 export async function deductStockAndReturn(client, mapping, franchiseeId, usedLitres) {
-  // Prevent negative stock atomically
   const sql = `
     UPDATE "${mapping.table}"
        SET "${mapping.stockCol}" = "${mapping.stockCol}" - $2
@@ -149,4 +138,34 @@ export async function deductStockAndReturn(client, mapping, franchiseeId, usedLi
      RETURNING "${mapping.stockCol}"::numeric AS available_litres
   `;
   return client.query(sql, [franchiseeId, usedLitres]);
+}
+
+// ---- Schema helpers for debugging/selection
+export async function listAllTables(client, like = null) {
+  if (like) {
+    return client.query(
+      `SELECT table_name
+         FROM information_schema.tables
+        WHERE table_schema='public' AND table_name ILIKE $1
+        ORDER BY table_name`,
+      [`%${like}%`]
+    );
+  }
+  return client.query(
+    `SELECT table_name
+       FROM information_schema.tables
+      WHERE table_schema='public'
+      ORDER BY table_name`
+  );
+}
+
+export async function listColumnsForTable(client, table) {
+  if (!isSafeIdentifier(table)) return { rows: [] };
+  return client.query(
+    `SELECT column_name, data_type
+       FROM information_schema.columns
+      WHERE table_schema='public' AND table_name=$1
+      ORDER BY ordinal_position`,
+    [table]
+  );
 }
