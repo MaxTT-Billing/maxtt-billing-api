@@ -9,6 +9,8 @@ import { createV46Pdf } from './pdf/invoice_v46.js'
 import adminLatestInvoicesRouter from "./routes/admin.latest.invoices.js";
 
 const app = express()
+import systemRouter from './routes/system.js';
+systemRouter(app); // TEMP: DB self-test endpoint
 
 // ------------------------------- CORS ---------------------------------
 const ORIGINS = (process.env.ALLOWED_ORIGINS ||
