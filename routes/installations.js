@@ -1,4 +1,4 @@
-// routes/installations.js  (ESM) — PRODUCTION: real endpoints only
+// routes/installations.js  (ESM) — production with ADMIN_KEY auth
 
 import pkg from "pg";
 import {
@@ -16,11 +16,20 @@ export default function installationsRouter(app) {
     ssl: { rejectUnauthorized: false },
   });
 
+  // ---- simple admin-key auth (set ADMIN_KEY in env) ----
+  const ADMIN_KEY = process.env.ADMIN_KEY;
+  function requireAdmin(req, res, next) {
+    if (!ADMIN_KEY) return next(); // if not set, allow (useful in dev)
+    const key = req.get("X-ADMIN-KEY");
+    if (key && key === ADMIN_KEY) return next();
+    return res.status(401).json({ ok: false, code: "unauthorized" });
+  }
+
   // ---------------------------
   // POST /installations/start
   // body: { franchisee_id: "MAXTT-..." }
   // ---------------------------
-  app.post("/installations/start", async (req, res) => {
+  app.post("/installations/start", requireAdmin, async (req, res) => {
     const { franchisee_id } = req.body || {};
     if (!franchisee_id) {
       return res.status(400).json({ ok: false, code: "missing_franchisee_id" });
@@ -87,7 +96,7 @@ export default function installationsRouter(app) {
   // POST /installations/complete
   // body: { installation_id: 123, used_litres: 1.25 }
   // ------------------------------
-  app.post("/installations/complete", async (req, res) => {
+  app.post("/installations/complete", requireAdmin, async (req, res) => {
     const { installation_id, used_litres } = req.body || {};
     const used = parseFloat(used_litres);
     if (!installation_id || !Number.isFinite(used) || used <= 0) {
@@ -164,7 +173,7 @@ export default function installationsRouter(app) {
   // POST /installations/cancel
   // body: { installation_id }
   // ----------------------------
-  app.post("/installations/cancel", async (req, res) => {
+  app.post("/installations/cancel", requireAdmin, async (req, res) => {
     const { installation_id } = req.body || {};
     if (!installation_id) {
       return res.status(400).json({ ok: false, code: "invalid_input" });
