@@ -11,7 +11,6 @@ import adminLatestInvoicesRouter from "./routes/admin.latest.invoices.js";
 const app = express()
 
 import installationsRouter from './routes/installations.js';
-installationsRouter(app);
 
 // ------------------------------- CORS ---------------------------------
 const ORIGINS = (process.env.ALLOWED_ORIGINS ||
@@ -31,6 +30,7 @@ app.use((req, res, next) => {
 app.use("/api/invoices/admin", adminLatestInvoicesRouter);
 
 app.use(express.json({ limit: '15mb' }))
+installationsRouter(app);
 
 // ------------------------------- DB -----------------------------------
 const pool = new Pool({
