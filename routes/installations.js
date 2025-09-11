@@ -5,6 +5,10 @@ import {
   detectInventoryMapping,
   getInventoryRowForUpdate,
   deductStockAndReturn,
+  scanInventoryCandidates,
+  listInventoryRows,
+  insertOrUpdateInventoryRow,
+  setManualMappingForSession,
 } from "../src/inventory.js";
 
 const { Pool } = pkg;
@@ -377,6 +381,91 @@ export default function installationsRouter(app) {
         .json({ ok: false, code: "complete_failed", message: e.message });
     } finally {
       client.release();
+    }
+  });
+
+  // ===== INVENTORY DEBUG HELPERS (TEMP) =====
+
+  // 1) Show mapping in use + candidates
+  // GET /__dbg/inventory/scan
+  app.get("/__dbg/inventory/scan", async (req, res) => {
+    const client = await pool.connect();
+    try {
+      const mapping = await detectInventoryMapping(client);
+      const candidates = await scanInventoryCandidates(client);
+      res.status(200).json({ ok: true, mapping, candidates });
+    } catch (e) {
+      res.status(500).json({ ok: false, message: e.message });
+    } finally {
+      client.release();
+    }
+  });
+
+  // 2) List sample rows from detected mapping
+  // GET /__dbg/inventory/sample?limit=10
+  app.get("/__dbg/inventory/sample", async (req, res) => {
+    const limit = Math.max(1, Math.min(50, Number(req.query.limit) || 10));
+    const client = await pool.connect();
+    try {
+      const mapping = await detectInventoryMapping(client);
+      if (!mapping)
+        return res
+          .status(500)
+          .json({ ok: false, code: "inventory_mapping_not_found" });
+      const r = await listInventoryRows(client, mapping, limit);
+      res.status(200).json({ ok: true, mapping, rows: r.rows });
+    } catch (e) {
+      res.status(500).json({ ok: false, message: e.message });
+    } finally {
+      client.release();
+    }
+  });
+
+  // 3) Seed/override one franchisee’s stock for testing
+  // GET /__dbg/inventory/seed?franchisee_id=MAXTT-DEMO-001&litres=50
+  app.get("/__dbg/inventory/seed", async (req, res) => {
+    const franchisee_id = req.query.franchisee_id;
+    const litres = Number(req.query.litres);
+    if (!franchisee_id || !Number.isFinite(litres) || litres < 0) {
+      return res.status(400).json({ ok: false, code: "invalid_input" });
+    }
+    const client = await pool.connect();
+    try {
+      const mapping = await detectInventoryMapping(client);
+      if (!mapping)
+        return res
+          .status(500)
+          .json({ ok: false, code: "inventory_mapping_not_found" });
+
+      await client.query("BEGIN");
+      const result = await insertOrUpdateInventoryRow(
+        client,
+        mapping,
+        franchisee_id,
+        litres
+      );
+      await client.query("COMMIT");
+      res.status(200).json({ ok: true, mapping, result });
+    } catch (e) {
+      await client.query("ROLLBACK");
+      res.status(500).json({ ok: false, message: e.message });
+    } finally {
+      client.release();
+    }
+  });
+
+  // 4) Force mapping for this process without redeploy (use only if auto-pick is wrong)
+  // GET /__dbg/inventory/force?table=inventory&fr_col=franchisee_id&stock_col=available_litres
+  app.get("/__dbg/inventory/force", async (req, res) => {
+    const table = req.query.table,
+      fr = req.query.fr_col,
+      stock = req.query.stock_col;
+    try {
+      const set = setManualMappingForSession(table, fr, stock);
+      if (!set) return res.status(400).json({ ok: false, code: "invalid_identifiers" });
+      res.status(200).json({ ok: true, mapping: set });
+    } catch (e) {
+      res.status(500).json({ ok: false, message: e.message });
     }
   });
 }
