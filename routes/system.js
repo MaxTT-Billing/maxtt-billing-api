@@ -1,4 +1,6 @@
-// routes/system.js
+// routes/system.js  (ESM)
+// NOTE: must export a *default* function
+
 import pkg from "pg";
 import { runSelfTest } from "../src/selftest.js";
 
@@ -15,7 +17,7 @@ export default function systemRouter(app) {
       const report = await runSelfTest(pool);
       res.status(200).json({ ok: true, report });
     } catch (err) {
-      res.status(500).json({ ok: false, error: String(err && err.message || err) });
+      res.status(500).json({ ok: false, error: String((err && err.message) || err) });
     }
   });
 }
