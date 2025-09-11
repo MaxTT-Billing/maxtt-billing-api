@@ -1,26 +1,21 @@
-// server.js — Treadstone/MaxTT Billing API (ESM)
-// Baseline (27-Aug) + dedicated v46 PDF generator.
-// All onboarding/invoice APIs intact. PDF uses ./pdf/invoice_v46.js
+// server.js — MaxTT Billing API (ESM)
+// Baseline + v46 PDF + Installations (stock lock) + AUTH (F1)
 
 import express from 'express';
+import crypto from 'crypto';
 import pkg from 'pg';
 const { Pool } = pkg;
+
 import { createV46Pdf } from './pdf/invoice_v46.js';
 import adminLatestInvoicesRouter from './routes/admin.latest.invoices.js';
-
 import installationsRouter from './routes/installations.js';
 
 const app = express();
 
 // ------------------------------- CORS ---------------------------------
-// Allow your frontend origins and the custom X-ADMIN-KEY header for auth.
-// Keep this BEFORE body parser and route mounts.
 const ORIGINS = (process.env.ALLOWED_ORIGINS ||
   'https://maxtt-billing-frontend.onrender.com,https://maxtt-billing-tools.onrender.com'
-)
-  .split(',')
-  .map(s => s.trim())
-  .filter(Boolean);
+).split(',').map(s => s.trim()).filter(Boolean);
 
 app.use((req, res, next) => {
   const origin = req.headers.origin || '';
@@ -29,25 +24,21 @@ app.use((req, res, next) => {
     res.setHeader('Vary', 'Origin');
   }
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
-  // IMPORTANT: include X-ADMIN-KEY so browser can send it
   res.setHeader(
     'Access-Control-Allow-Headers',
-    'Content-Type, Authorization, X-REF-API-KEY, X-SA-KEY, X-ADMIN-KEY, X-SA-USER, X-ADMIN-USER'
+    'Content-Type, Authorization, X-REF-API-KEY, X-SA-KEY, X-ADMIN-KEY, X-SA-USER, X-ADMIN-USER, X-FRANCHISEE-KEY, X-FRANCHISEE-TOKEN'
   );
-
-  if (req.method === 'OPTIONS') {
-    return res.sendStatus(200); // preflight short-circuit
-  }
+  if (req.method === 'OPTIONS') return res.sendStatus(200);
   next();
 });
 
 // ------------------------------- Routers -------------------------------
 app.use('/api/invoices/admin', adminLatestInvoicesRouter);
 
-// Body parser should come before any JSON POST routes.
+// Body parser before JSON POST routes.
 app.use(express.json({ limit: '15mb' }));
 
-// Stock-lock / installations routes (require ADMIN_KEY; defined in that file)
+// Stock-lock / installations routes
 installationsRouter(app);
 
 // ------------------------------- DB -----------------------------------
@@ -57,6 +48,7 @@ const pool = new Pool({
 });
 
 // --------------------------- Helpers ----------------------------------
+// Column cache for invoices
 let cachedCols = null;
 async function getInvoiceCols(client) {
   if (cachedCols) return cachedCols;
@@ -75,7 +67,6 @@ function findCol(cols, candidates) {
   return null;
 }
 const pad = (n, w = 4) => String(Math.max(0, Number(n) || 0)).padStart(w, '0');
-
 function mmYY(d = new Date()) {
   const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
   const yy = String(d.getUTCFullYear()).slice(-2);
@@ -89,12 +80,80 @@ function printedFromNorm(norm) {
   return `${prefix}/${mmYY()}/${seq}`;
 }
 
-// ------------------------------- Health --------------------------------
-app.get('/', (_req, res) => res.send('MaxTT Billing API is running'));
-app.get('/api/health', (_req, res) => res.json({ ok: true }));
+// -------------------------- Franchisee AUTH (F1) ----------------------
+// DB column: ensure hashed_password exists
+async function ensureFranchiseeAuthColumns() {
+  const client = await pool.connect();
+  try {
+    await client.query(`
+      ALTER TABLE public.franchisees
+      ADD COLUMN IF NOT EXISTS hashed_password TEXT
+    `);
+  } finally {
+    client.release();
+  }
+}
+ensureFranchiseeAuthColumns().catch(() => { /* non-fatal at boot */ });
 
-// ------------------------------- Auth ----------------------------------
-// (Used by SA/admin endpoints below, NOT by installations — those use their own middleware)
+// Password generator (20 chars, 4x5 blocks, unambiguous alphabet)
+const PW_ALPH = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789-_';
+function generatePassword(len = 20) {
+  const bytes = crypto.randomBytes(len);
+  let out = '';
+  for (let i = 0; i < len; i++) out += PW_ALPH[bytes[i] % PW_ALPH.length];
+  // 4 blocks of 5
+  return `${out.slice(0,5)}-${out.slice(5,10)}-${out.slice(10,15)}-${out.slice(15,20)}`;
+}
+
+// Hash + verify using scrypt
+function scryptHash(password) {
+  const salt = crypto.randomBytes(16);
+  const N = 16384, r = 8, p = 1, keylen = 64;
+  const dk = crypto.scryptSync(password, salt, keylen, { N, r, p });
+  return `scrypt$${N}$${r}$${p}$${salt.toString('base64')}$${dk.toString('base64')}`;
+}
+function scryptVerify(password, stored) {
+  try {
+    const [alg, Ns, rs, ps, saltB64, hashB64] = String(stored).split('$');
+    if (alg !== 'scrypt') return false;
+    const N = Number(Ns), r = Number(rs), p = Number(ps);
+    const salt = Buffer.from(saltB64, 'base64');
+    const keylen = Buffer.from(hashB64, 'base64').length;
+    const dk = crypto.scryptSync(password, salt, keylen, { N, r, p });
+    return crypto.timingSafeEqual(dk, Buffer.from(hashB64, 'base64'));
+  } catch { return false; }
+}
+
+// Compact signed token (HMAC-SHA256) — not JWT
+const AUTH_SECRET = process.env.AUTH_SECRET || '';
+const TOKEN_TTL_HOURS = Number(process.env.TOKEN_TTL_HOURS || 8);
+function b64url(buf) {
+  return Buffer.from(buf).toString('base64').replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
+}
+function signToken(franchisee_id, hours = TOKEN_TTL_HOURS) {
+  if (!AUTH_SECRET) throw new Error('auth_secret_not_set');
+  const exp = Math.floor(Date.now()/1000) + Math.max(1, hours)*3600;
+  const payload = JSON.stringify({ sub: String(franchisee_id), exp });
+  const p64 = b64url(payload);
+  const toSign = `v1.${p64}`;
+  const sig = b64url(crypto.createHmac('sha256', AUTH_SECRET).update(toSign).digest());
+  return `${toSign}.${sig}`;
+}
+function verifyToken(token) {
+  try {
+    const [v, p64, sig] = String(token || '').split('.');
+    if (v !== 'v1' || !p64 || !sig) return null;
+    const expect = b64url(crypto.createHmac('sha256', AUTH_SECRET).update(`${v}.${p64}`).digest());
+    if (!crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expect))) return null;
+    const json = Buffer.from(p64.replace(/-/g,'+').replace(/_/g,'/'),'base64').toString('utf8');
+    const obj = JSON.parse(json);
+    if (!obj || !obj.sub || !obj.exp) return null;
+    if (Math.floor(Date.now()/1000) > Number(obj.exp)) return null;
+    return { franchisee_id: String(obj.sub) };
+  } catch { return null; }
+}
+
+// Middleware: Super Admin (existing) + Franchisee token
 function requireKey(header, envName) {
   return (req, res, next) => {
     const key = req.get(header) || '';
@@ -105,7 +164,109 @@ function requireKey(header, envName) {
   };
 }
 const requireSA = requireKey('X-SA-KEY', 'SUPER_ADMIN_KEY');
-const requireAdmin = requireKey('X-ADMIN-KEY', 'ADMIN_KEY');
+
+function requireFranchisee(req, res, next) {
+  const auth = req.get('Authorization') || '';
+  const bearer = auth.startsWith('Bearer ') ? auth.slice(7).trim() : '';
+  const alt = req.get('X-FRANCHISEE-TOKEN') || '';
+  const token = bearer || alt;
+  if (!AUTH_SECRET) return res.status(500).json({ ok: false, code: 'auth_secret_not_set' });
+  const parsed = verifyToken(token);
+  if (!parsed) return res.status(401).json({ ok: false, code: 'unauthorized' });
+  req.franchisee_id = parsed.franchisee_id;
+  next();
+}
+
+// ------------------------------- Health --------------------------------
+app.get('/', (_req, res) => res.send('MaxTT Billing API is running'));
+app.get('/api/health', (_req, res) => res.json({ ok: true }));
+
+// ------------------------------- AUTH F1 --------------------------------
+// Super Admin resets (or sets) password by numeric franchisee row id
+app.post('/admin/franchisees/reset-password/:id', requireSA, async (req, res) => {
+  const id = Number(req.params.id || 0);
+  if (!Number.isFinite(id) || id <= 0) return res.status(400).json({ ok: false, code: 'bad_id' });
+  const client = await pool.connect();
+  try {
+    await ensureFranchiseeAuthColumns();
+    const pw = generatePassword(20);
+    const hashed = scryptHash(pw);
+    const q = await client.query(
+      `UPDATE public.franchisees SET hashed_password=$2, updated_at=NOW()
+         WHERE id=$1
+     RETURNING franchisee_id`,
+      [id, hashed]
+    );
+    if (!q.rowCount) return res.status(404).json({ ok: false, code: 'not_found' });
+    const fr_id = q.rows[0].franchisee_id || null;
+    return res.status(200).json({ ok: true, franchisee_id: fr_id, password: pw });
+  } catch (e) {
+    return res.status(500).json({ ok: false, code: 'reset_failed', message: e?.message || String(e) });
+  } finally {
+    client.release();
+  }
+});
+
+// Convenience: reset by franchisee_id value
+app.post('/admin/franchisees/reset-password/by-franchisee-id/:franchisee_id', requireSA, async (req, res) => {
+  const frid = String(req.params.franchisee_id || '').trim();
+  if (!frid) return res.status(400).json({ ok: false, code: 'missing_franchisee_id' });
+  const client = await pool.connect();
+  try {
+    await ensureFranchiseeAuthColumns();
+    const pw = generatePassword(20);
+    const hashed = scryptHash(pw);
+    const q = await client.query(
+      `UPDATE public.franchisees SET hashed_password=$2, updated_at=NOW()
+         WHERE franchisee_id=$1
+     RETURNING franchisee_id`,
+      [frid, hashed]
+    );
+    if (!q.rowCount) return res.status(404).json({ ok: false, code: 'not_found' });
+    return res.status(200).json({ ok: true, franchisee_id: frid, password: pw });
+  } catch (e) {
+    return res.status(500).json({ ok: false, code: 'reset_failed', message: e?.message || String(e) });
+  } finally {
+    client.release();
+  }
+});
+
+// Login: returns signed token (8h default)
+app.post('/auth/login', async (req, res) => {
+  const { franchisee_id, password } = req.body || {};
+  if (!franchisee_id || !password) return res.status(400).json({ ok: false, code: 'invalid_input' });
+  if (!AUTH_SECRET) return res.status(500).json({ ok: false, code: 'auth_secret_not_set' });
+
+  const client = await pool.connect();
+  try {
+    const q = await client.query(
+      `SELECT id, franchisee_id, hashed_password
+         FROM public.franchisees
+        WHERE franchisee_id=$1
+        LIMIT 1`,
+      [String(franchisee_id)]
+    );
+    if (!q.rowCount) return res.status(401).json({ ok: false, code: 'bad_credentials' });
+    const row = q.rows[0];
+    if (!row.hashed_password) return res.status(403).json({ ok: false, code: 'password_not_set' });
+
+    const ok = scryptVerify(String(password), row.hashed_password);
+    if (!ok) return res.status(401).json({ ok: false, code: 'bad_credentials' });
+
+    const token = signToken(row.franchisee_id, TOKEN_TTL_HOURS);
+    const expires_at = new Date(Date.now() + TOKEN_TTL_HOURS * 3600 * 1000).toISOString();
+    return res.status(200).json({ ok: true, token, franchisee_id: row.franchisee_id, expires_at });
+  } catch (e) {
+    return res.status(500).json({ ok: false, code: 'login_failed', message: e?.message || String(e) });
+  } finally {
+    client.release();
+  }
+});
+
+// Test endpoint to confirm token + scoping works
+app.get('/me/ping', requireFranchisee, (req, res) => {
+  res.status(200).json({ ok: true, franchisee_id: req.franchisee_id });
+});
 
 // ---------------------- Invoices: create (schema-adaptive) -------------
 app.post('/api/invoices/full', async (req, res) => {
@@ -175,9 +336,7 @@ app.post('/api/invoices/full', async (req, res) => {
     });
   } catch (err) {
     console.error('create_invoice error:', err);
-    res
-      .status(500)
-      .json({ ok: false, where: 'create_invoice', message: err?.message || String(err) });
+    res.status(500).json({ ok: false, where: 'create_invoice', message: err?.message || String(err) });
   } finally {
     client.release();
   }
@@ -205,9 +364,7 @@ app.get('/api/invoices', async (req, res) => {
     const r = await client.query(sql, params);
     res.json(r.rows);
   } catch (err) {
-    res
-      .status(500)
-      .json({ ok: false, where: 'list_invoices', message: err?.message || String(err) });
+    res.status(500).json({ ok: false, where: 'list_invoices', message: err?.message || String(err) });
   } finally {
     client.release();
   }
@@ -244,9 +401,7 @@ app.get(['/api/invoices/:id/full2', '/invoices/:id/full2'], async (req, res) => 
       (doc.invoice_number_norm ? printedFromNorm(doc.invoice_number_norm) : null);
     res.json(printed ? { ...doc, invoice_number: printed } : doc);
   } catch (err) {
-    res
-      .status(500)
-      .json({ ok: false, where: 'get_invoice_full2', message: err?.message || String(err) });
+    res.status(500).json({ ok: false, where: 'get_invoice_full2', message: err?.message || String(err) });
   } finally {
     client.release();
   }
@@ -271,7 +426,10 @@ app.get('/api/invoices/by-norm/:norm', async (req, res) => {
 });
 
 // ---------------------- Franchisee Onboarding (Admin/SA) ---------------
-app.post('/api/super/franchisees/approve/:id', requireSA, async (req, res) => {
+function requireKeyWrap(header, envName) { return requireKey(header, envName); } // keep existing ref
+const requireSA2 = requireKeyWrap('X-SA-KEY', 'SUPER_ADMIN_KEY');
+
+app.post('/api/super/franchisees/approve/:id', requireSA2, async (req, res) => {
   const client = await pool.connect();
   try {
     const id = Number(req.params.id || 0);
@@ -294,7 +452,7 @@ app.post('/api/super/franchisees/approve/:id', requireSA, async (req, res) => {
   }
 });
 
-app.post('/api/super/franchisees/reject/:id', requireSA, async (req, res) => {
+app.post('/api/super/franchisees/reject/:id', requireSA2, async (req, res) => {
   const client = await pool.connect();
   try {
     const id = Number(req.params.id || 0);
@@ -333,18 +491,13 @@ app.get('/api/invoices/:id/pdf', async (req, res) => {
     const frCode = inv.franchisee_id || inv.franchisee_code || '';
     let fr = null;
     if (frCode) {
-      const frq = await client.query(`SELECT * FROM public.franchisees WHERE code=$1 LIMIT 1`, [
-        frCode,
-      ]);
+      const frq = await client.query(`SELECT * FROM public.franchisees WHERE code=$1 LIMIT 1`, [frCode]);
       fr = frq.rows[0] || null;
     }
 
     res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader(
-      'Content-Disposition',
-      `${download ? 'attachment' : 'inline'}; filename="invoice-${id}.pdf"`
-    );
-    await createV46Pdf(res, inv, fr); // stream out
+    res.setHeader('Content-Disposition', `${download ? 'attachment' : 'inline'}; filename="invoice-${id}.pdf"`);
+    await createV46Pdf(res, inv, fr);
   } catch (e) {
     res.status(500).json({ error: 'pdf_failed', message: e?.message || String(e) });
   } finally {
