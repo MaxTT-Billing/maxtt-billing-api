@@ -1,0 +1,3 @@
+# v46 PDF is frozen; any change requires CODEOWNERS review.
+# Replace @YOUR_GH_USER with your real GitHub username (or @org/team).
+/pdf/invoice_v46.js  @YOUR_GH_USER
