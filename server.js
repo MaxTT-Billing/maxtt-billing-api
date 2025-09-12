@@ -1,8 +1,9 @@
 // server.js — MaxTT Billing API (ESM)
 // Baseline + v46 PDF + Installations (stock lock) + AUTH (F1)
 // + F2 (/me/stock) + Strict Actuals /me/summary + Baseline control
-// + Fix: customer_code = invoice_number_norm on create
+// + Invoices: customer_code = invoice_number_norm (new)
 // + SA tools to repair historical customer_code
+// + Persist aspect_ratio so PDF renders "195/55 R15"
 
 import express from 'express';
 import crypto from 'crypto';
@@ -41,7 +42,7 @@ app.use('/api/invoices/admin', adminLatestInvoicesRouter);
 // Body parser
 app.use(express.json({ limit: '15mb' }));
 
-// Stock-lock / installations routes
+// Stock-lock / installations routes (token-protected)
 installationsRouter(app);
 
 // ------------------------------- DB -----------------------------------
@@ -266,6 +267,7 @@ app.post('/api/invoices/full', async (req,res)=>{
     const body=req.body||{};
     const franchisee_id=String(body.franchisee_id||body.franchiseeId||'').trim();
     const tyre_width_mm=Number(body.tyre_width_mm||195);
+    const aspect_ratio=Number(body.aspect_ratio || 55);             // <-- capture aspect
     const rim_diameter_in=Number(body.rim_diameter_in||15);
     const tyre_count=Number(body.tyre_count||4);
     if(!franchisee_id) return res.status(400).json({ok:false,error:'missing_franchisee_id'});
@@ -290,9 +292,10 @@ app.post('/api/invoices/full', async (req,res)=>{
     toInsert[fcol]=franchisee_id;
     if(has(cols,'invoice_number_norm')) toInsert['invoice_number_norm']=invoice_number_norm;
     if(has(cols,'invoice_number')) toInsert['invoice_number']=invoice_number_printed;
-    if(has(cols,'customer_code')) toInsert['customer_code']=invoice_number_norm;       // <-- NEW: lock customer_code
+    if(has(cols,'customer_code')) toInsert['customer_code']=invoice_number_norm; // lock to norm
     if(has(cols,'tyre_count')) toInsert['tyre_count']=tyre_count;
     if(has(cols,'tyre_width_mm')) toInsert['tyre_width_mm']=tyre_width_mm;
+    if(has(cols,'aspect_ratio')) toInsert['aspect_ratio']=aspect_ratio;          // <-- NEW: persist aspect
     if(has(cols,'rim_diameter_in')) toInsert['rim_diameter_in']=rim_diameter_in;
     if(has(cols,'dosage_ml')) toInsert['dosage_ml']=DEFAULT_QTY_ML;
     if(has(cols,'price_per_ml')) toInsert['price_per_ml']=MRP_PER_ML;
@@ -329,7 +332,6 @@ app.post('/api/invoices/full', async (req,res)=>{
 });
 
 // -------- SA tools: fix historical customer_code values ----------------
-// Single invoice
 app.post('/api/super/invoices/fix-customer-code/:id', requireSA2, async (req,res)=>{
   const id=Number(req.params.id||0);
   if(!Number.isFinite(id)||id<=0) return res.status(400).json({ok:false,error:'bad_id'});
@@ -345,7 +347,6 @@ app.post('/api/super/invoices/fix-customer-code/:id', requireSA2, async (req,res
   finally{ client.release(); }
 });
 
-// Bulk by franchisee_id (only rows with null or 'C\\d+' style codes)
 app.post('/api/super/invoices/fix-customer-codes/by-franchisee/:franchisee_id', requireSA2, async (req,res)=>{
   const frid=String(req.params.franchisee_id||'').trim();
   if(!frid) return res.status(400).json({ok:false,error:'missing_franchisee_id'});
@@ -402,7 +403,7 @@ app.get(['/api/invoices/:id/full2','/invoices/:id/full2'], async (req,res)=>{
     const doc=r.rows[0];
     const printed= doc.invoice_number || (doc.invoice_number_norm?printedFromNorm(doc.invoice_number_norm):null);
     res.json(printed?{...doc, invoice_number:printed}:doc);
-  }catch(err){ res.status(500).json({ok:false,where:'get_invoice_full2',message:err?.message||String(err)}); }
+  }catch(err){ res.status(500).json({ok:false,where:'get_invoice_full2',message:e?.message||String(err)}); }
   finally{ client.release(); }
 });
 
