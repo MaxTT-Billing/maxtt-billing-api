@@ -1,6 +1,7 @@
 // server.js — MaxTT Billing API (ESM)
 // Baseline + v46 PDF + Installations (stock lock) + AUTH (F1)
 // + F2 (auto-seed + /me/stock) + Strict Actuals /me/summary
+// + Baseline control: SA can set onboarded_at; summary caps to it
 
 import express from 'express';
 import crypto from 'crypto';
@@ -49,7 +50,6 @@ const pool = new Pool({
 });
 
 // --------------------------- Helpers ----------------------------------
-// Column cache for invoices
 let cachedCols = null;
 async function getInvoiceCols(client) {
   if (cachedCols) return cachedCols;
@@ -82,7 +82,6 @@ function printedFromNorm(norm) {
 }
 
 // -------------------------- Franchisee AUTH (F1) ----------------------
-// DB column: ensure hashed_password exists
 async function ensureFranchiseeAuthColumns() {
   const client = await pool.connect();
   try {
@@ -96,7 +95,6 @@ async function ensureFranchiseeAuthColumns() {
 }
 ensureFranchiseeAuthColumns().catch(() => { /* non-fatal at boot */ });
 
-// Password generator (20 chars, 4x5 blocks, unambiguous alphabet)
 const PW_ALPH = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789-_';
 function generatePassword(len = 20) {
   const bytes = crypto.randomBytes(len);
@@ -105,7 +103,6 @@ function generatePassword(len = 20) {
   return `${out.slice(0,5)}-${out.slice(5,10)}-${out.slice(10,15)}-${out.slice(15,20)}`;
 }
 
-// Hash + verify using scrypt
 function scryptHash(password) {
   const salt = crypto.randomBytes(16);
   const N = 16384, r = 8, p = 1, keylen = 64;
@@ -124,7 +121,6 @@ function scryptVerify(password, stored) {
   } catch { return false; }
 }
 
-// Compact signed token (HMAC-SHA256) — not JWT
 const AUTH_SECRET = process.env.AUTH_SECRET || '';
 const TOKEN_TTL_HOURS = Number(process.env.TOKEN_TTL_HOURS || 8);
 function b64url(buf) {
@@ -153,7 +149,6 @@ function verifyToken(token) {
   } catch { return null; }
 }
 
-// Middleware: Super Admin (existing) + Franchisee token
 function requireKey(header, envName) {
   return (req, res, next) => {
     const key = req.get(header) || '';
@@ -229,7 +224,7 @@ app.post('/admin/franchisees/reset-password/by-franchisee-id/:franchisee_id', re
   }
 });
 
-// Login: returns signed token (8h default)
+// Login
 app.post('/auth/login', async (req, res) => {
   const { franchisee_id, password } = req.body || {};
   if (!franchisee_id || !password) return res.status(400).json({ ok: false, code: 'invalid_input' });
@@ -261,7 +256,7 @@ app.post('/auth/login', async (req, res) => {
   }
 });
 
-// Test endpoint to confirm token + scoping works
+// Test token
 app.get('/me/ping', requireFranchisee, (req, res) => {
   res.status(200).json({ ok: true, franchisee_id: req.franchisee_id });
 });
@@ -292,37 +287,79 @@ app.get('/me/stock', requireFranchisee, async (req, res) => {
   }
 });
 
+// --------------------- Baseline: set onboarded_at (SA) -----------------
+const requireSA2 = requireKey('X-SA-KEY', 'SUPER_ADMIN_KEY');
+
+// Set or update onboarded_at for a franchisee (by franchisee_id).
+// Body: { "at": "<ISO timestamp>" }  // optional; defaults to now
+app.post('/api/super/franchisees/set-onboarded-at/:franchisee_id', requireSA2, async (req, res) => {
+  const frid = String(req.params.franchisee_id || '').trim();
+  if (!frid) return res.status(400).json({ ok: false, error: 'missing_franchisee_id' });
+  const atStr = (req.body?.at || '').toString().trim();
+  let when = new Date();
+  if (atStr) {
+    const d = new Date(atStr);
+    if (isNaN(d.getTime())) return res.status(400).json({ ok: false, error: 'bad_timestamp' });
+    when = d;
+  }
+  const client = await pool.connect();
+  try {
+    const r = await client.query(
+      `UPDATE public.franchisees
+         SET onboarded_at=$2, updated_at=NOW()
+       WHERE franchisee_id=$1
+       RETURNING franchisee_id, onboarded_at`,
+      [frid, when.toISOString()]
+    );
+    if (!r.rowCount) return res.status(404).json({ ok: false, error: 'not_found' });
+    res.status(200).json({ ok: true, franchisee_id: r.rows[0].franchisee_id, onboarded_at: r.rows[0].onboarded_at });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: 'set_onboarded_failed', message: e?.message || String(e) });
+  } finally {
+    client.release();
+  }
+});
+
 // --------------------- F3 (Strict Actuals): /me/summary ----------------
-// Month window default: current calendar month in IST (Asia/Kolkata).
-// You can override via ?month=YYYY-MM (interpreted in IST).
 const METRICS_TZ = process.env.METRICS_TZ || 'Asia/Kolkata';
 
-// Compute month window boundaries in UTC for IST month (no DST in IST).
+// IST month bounds → UTC ISO strings, plus pretty +05:30 strings
 function istMonthBounds(monthParam /* 'YYYY-MM' or undefined */) {
-  // IST offset = +05:30 => UTC = local - 5:30
   const pad2 = n => String(n).padStart(2, '0');
-  let y, m; // month 1..12
+  let y, m;
   if (monthParam && /^\d{4}-\d{2}$/.test(monthParam)) {
     y = Number(monthParam.slice(0,4));
     m = Number(monthParam.slice(5,7));
   } else {
-    // Now in IST
-    const now = new Date(Date.now() + 330 * 60 * 1000); // add 5h30m
+    const now = new Date(Date.now() + 330 * 60 * 1000); // now in IST
     y = now.getUTCFullYear();
     m = now.getUTCMonth() + 1;
   }
-  // IST month start at local 00:00 => UTC = -05:30
   const startUtcMs = Date.UTC(y, m - 1, 1, -5, -30, 0);
   const endUtcMs   = Date.UTC(m === 12 ? y + 1 : y, m === 12 ? 0 : m, 1, -5, -30, 0);
   const startUtcIso = new Date(startUtcMs).toISOString();
   const endUtcIso   = new Date(endUtcMs).toISOString();
-  const monthStr = `${y}-${pad2(m)}`;
+
+  const pad = n => String(n).padStart(2, '0');
+  const monthStr = `${y}-${pad(m)}`;
   const startLocal = `${monthStr}-01T00:00:00+05:30`;
-  // Compute next month local string
   const nextY = m === 12 ? y + 1 : y;
   const nextM = m === 12 ? 1 : m + 1;
-  const endLocal = `${nextY}-${pad2(nextM)}-01T00:00:00+05:30`;
+  const endLocal = `${nextY}-${pad(nextM)}-01T00:00:00+05:30`;
   return { monthStr, startUtcIso, endUtcIso, startLocal, endLocal, tz: 'Asia/Kolkata' };
+}
+function toIstLocalString(utcIso) {
+  const d = new Date(utcIso);
+  const ms = d.getTime() + 330 * 60 * 1000;
+  const z = new Date(ms);
+  const pad2 = n => String(n).padStart(2, '0');
+  const yyyy = z.getUTCFullYear();
+  const mm = pad2(z.getUTCMonth() + 1);
+  const dd = pad2(z.getUTCDate());
+  const hh = pad2(z.getUTCHours());
+  const mi = pad2(z.getUTCMinutes());
+  const ss = pad2(z.getUTCSeconds());
+  return `${yyyy}-${mm}-${dd}T${hh}:${mi}:${ss}+05:30`;
 }
 
 app.get('/me/summary', requireFranchisee, async (req, res) => {
@@ -331,6 +368,22 @@ app.get('/me/summary', requireFranchisee, async (req, res) => {
     const frid = req.franchisee_id;
     const monthParam = String(req.query.month || '').trim() || undefined;
     const b = istMonthBounds(monthParam);
+
+    // Fetch onboarded_at (baseline)
+    const rFr = await client.query(
+      `SELECT onboarded_at FROM public.franchisees WHERE franchisee_id=$1 LIMIT 1`,
+      [frid]
+    );
+    const onboardedAtUtcIso = rFr.rowCount && rFr.rows[0].onboarded_at
+      ? new Date(rFr.rows[0].onboarded_at).toISOString()
+      : null;
+
+    // Effective window start = max(month start, onboarded_at)
+    let effStartUtcIso = b.startUtcIso;
+    if (onboardedAtUtcIso && new Date(onboardedAtUtcIso) > new Date(b.startUtcIso)) {
+      effStartUtcIso = onboardedAtUtcIso;
+    }
+    const effStartLocal = toIstLocalString(effStartUtcIso);
 
     // 1) Current stock
     const rStock = await client.query(
@@ -342,7 +395,7 @@ app.get('/me/summary', requireFranchisee, async (req, res) => {
     );
     const currentStock = rStock.rowCount ? Number(rStock.rows[0].stock) : 0;
 
-    // 2) Vehicles installed (this month) & material used (strict actuals)
+    // 2) Vehicles & material used (Strict Actuals)
     const rInst = await client.query(
       `SELECT
           COUNT(*)::int AS vehicles,
@@ -352,7 +405,7 @@ app.get('/me/summary', requireFranchisee, async (req, res) => {
           AND status = 'completed'
           AND completed_at >= $2::timestamptz
           AND completed_at <  $3::timestamptz`,
-      [frid, b.startUtcIso, b.endUtcIso]
+      [frid, effStartUtcIso, b.endUtcIso]
     );
     const vehiclesThisMonth = rInst.rows[0]?.vehicles || 0;
     const materialUsedThisMonthL = Number(rInst.rows[0]?.used_l || 0);
@@ -362,19 +415,16 @@ app.get('/me/summary', requireFranchisee, async (req, res) => {
       `SELECT
           COALESCE(SUM(i.used_litres), 0)::float AS used_l
          FROM public.installations i
-         LEFT JOIN public.franchisees f ON f.franchisee_id = i.franchisee_id
         WHERE i.franchisee_id = $1
           AND i.status = 'completed'
-          AND (
-                f.onboarded_at IS NULL
-                OR i.completed_at >= f.onboarded_at
-              )`,
-      [frid]
+          AND ($2::timestamptz IS NULL OR i.completed_at >= $2::timestamptz)`,
+      [frid, onboardedAtUtcIso]
     );
     const materialUsedToDateL = Number(rToDate.rows[0]?.used_l || 0);
 
-    // 4) Sales & GST (this month) — from invoices created_at
-    // Note: created_at is TIMESTAMP WITHOUT TIME ZONE. We compare to UTC window.
+    // 4) Sales & GST (created_at is TIMESTAMP WITHOUT TIME ZONE)
+    const startNoTz = effStartUtcIso.replace('Z','');
+    const endNoTz   = b.endUtcIso.replace('Z','');
     const rSales = await client.query(
       `SELECT
           COALESCE(SUM(total_with_gst), 0)::float AS sales,
@@ -384,13 +434,13 @@ app.get('/me/summary', requireFranchisee, async (req, res) => {
         WHERE franchisee_id = $1
           AND created_at >= $2::timestamp
           AND created_at <  $3::timestamp`,
-      [frid, b.startUtcIso.replace('Z',''), b.endUtcIso.replace('Z','')]
+      [frid, startNoTz, endNoTz]
     );
     const salesThisMonth = Number(rSales.rows[0]?.sales || 0);
     const gstThisMonth = Number(rSales.rows[0]?.gst || 0);
     const invoicesThisMonth = rSales.rows[0]?.invoices || 0;
 
-    // 5) Reconciliation (strict actuals): installs that were started but not completed in the window
+    // 5) Reconciliation: started but not completed in the effective window
     const rRecon = await client.query(
       `SELECT COUNT(*)::int AS pending
          FROM public.installations
@@ -398,7 +448,7 @@ app.get('/me/summary', requireFranchisee, async (req, res) => {
           AND status <> 'completed'
           AND created_at >= $2::timestamptz
           AND created_at <  $3::timestamptz`,
-      [frid, b.startUtcIso, b.endUtcIso]
+      [frid, effStartUtcIso, b.endUtcIso]
     );
     const needsReconciliation = rRecon.rows[0]?.pending || 0;
 
@@ -407,8 +457,9 @@ app.get('/me/summary', requireFranchisee, async (req, res) => {
       franchisee_id: frid,
       period: {
         month: b.monthStr,
-        from_local: b.startLocal,
-        to_local: b.endLocal,
+        month_from_local: b.startLocal,
+        month_to_local: b.endLocal,
+        effective_from_local: effStartLocal,
         tz: METRICS_TZ
       },
       current_stock_l: currentStock,
@@ -418,7 +469,7 @@ app.get('/me/summary', requireFranchisee, async (req, res) => {
       material_used_this_month_l: materialUsedThisMonthL,
       material_used_to_date_l: materialUsedToDateL,
       needs_reconciliation_count: needsReconciliation,
-      computed_via: { material: 'installations_only' }
+      computed_via: { material: 'installations_only', baseline_applied: Boolean(onboardedAtUtcIso) }
     });
   } catch (e) {
     res.status(500).json({ ok: false, code: 'me_summary_failed', message: e?.message || String(e) });
@@ -585,9 +636,6 @@ app.get('/api/invoices/by-norm/:norm', async (req, res) => {
 });
 
 // -------------- Franchisee Onboarding (Admin/SA) + F2 seeding ----------
-const requireSA2 = requireKey('X-SA-KEY', 'SUPER_ADMIN_KEY');
-
-// Existing approve by numeric row id
 app.post('/api/super/franchisees/approve/:id', requireSA2, async (req, res) => {
   const client = await pool.connect();
   try {
@@ -616,7 +664,6 @@ app.post('/api/super/franchisees/approve/:id', requireSA2, async (req, res) => {
     const frRow = r.rows[0];
     const frid = frRow.franchisee_id || frRow.code || null;
 
-    // Auto-seed inventory if missing (idempotent)
     let seeded_inventory_litres = 0;
     let inventory_after = null;
 
@@ -653,7 +700,7 @@ app.post('/api/super/franchisees/approve/:id', requireSA2, async (req, res) => {
   }
 });
 
-// Approve by franchisee_id (string) — convenience
+// Approve by franchisee_id (string)
 app.post('/api/super/franchisees/approve/by-franchisee-id/:franchisee_id', requireSA2, async (req, res) => {
   const client = await pool.connect();
   try {
@@ -682,7 +729,6 @@ app.post('/api/super/franchisees/approve/by-franchisee-id/:franchisee_id', requi
     }
     const frRow = r.rows[0];
 
-    // Auto-seed inventory if missing (idempotent)
     let seeded_inventory_litres = 0;
     let inventory_after = null;
 
@@ -767,7 +813,7 @@ app.get('/api/invoices/:id/pdf', async (req, res) => {
       'Content-Disposition',
       `${download ? 'attachment' : 'inline'}; filename="invoice-${id}.pdf"`
     );
-    await createV46Pdf(res, inv, fr); // stream out
+    await createV46Pdf(res, inv, fr);
   } catch (e) {
     res.status(500).json({ error: 'pdf_failed', message: e?.message || String(e) });
   } finally {
