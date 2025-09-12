@@ -1,218 +1,148 @@
-// routes/installations.js — production with ADMIN_KEY auth + simple rate limiting
+// routes/installations.js — token-protected installs (Strict Actuals)
+// Works with AUTH_SECRET token just like /me/* endpoints.
 
-import pkg from "pg";
-import {
-  detectInventoryMapping,
-  getInventoryRowForUpdate,
-  deductStockAndReturn,
-} from "../src/inventory.js";
-
+import pkg from 'pg';
 const { Pool } = pkg;
-const MIN_STOCK_L = 20.0;
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false },
+});
+
+// ---- Token verify (same scheme as server.js) ----
+const AUTH_SECRET = process.env.AUTH_SECRET || '';
+function b64url(buf) {
+  return Buffer.from(buf).toString('base64').replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
+}
+function verifyToken(token) {
+  try {
+    const [v, p64, sig] = String(token || '').split('.');
+    if (v !== 'v1' || !p64 || !sig) return null;
+    const expect = b64url(require('crypto').createHmac('sha256', AUTH_SECRET).update(`${v}.${p64}`).digest());
+    if (!Buffer.from(sig).equals(Buffer.from(expect))) return null;
+    const json = Buffer.from(p64.replace(/-/g,'+').replace(/_/g,'/'),'base64').toString('utf8');
+    const obj = JSON.parse(json);
+    if (!obj?.sub || !obj?.exp) return null;
+    if (Math.floor(Date.now()/1000) > Number(obj.exp)) return null;
+    return { franchisee_id: String(obj.sub) };
+  } catch { return null; }
+}
+function requireFranchisee(req, res, next) {
+  if (!AUTH_SECRET) return res.status(500).json({ ok: false, code: 'auth_secret_not_set' });
+  const auth = req.get('Authorization') || '';
+  const bearer = auth.startsWith('Bearer ') ? auth.slice(7).trim() : '';
+  const alt = req.get('X-FRANCHISEE-TOKEN') || '';
+  const parsed = verifyToken(bearer || alt);
+  if (!parsed) return res.status(401).json({ ok: false, code: 'unauthorized' });
+  req.franchisee_id = parsed.franchisee_id;
+  next();
+}
+
+// ---- Inventory config ----
+const INV_TABLE = process.env.INVENTORY_TABLE || 'inventory';
+const INV_FR_COL = process.env.INVENTORY_FRANCHISEE_COL || 'franchisee_id';
+const INV_STOCK_COL = process.env.INVENTORY_STOCK_COL || 'available_litres';
+const STOCK_THRESHOLD_LITRES = Number(process.env.STOCK_THRESHOLD_LITRES || 20);
+
+const qid = n => `"${n}"`;
 
 export default function installationsRouter(app) {
-  const pool = new Pool({
-    connectionString: process.env.DATABASE_URL,
-    ssl: { rejectUnauthorized: false },
-  });
-
-  // ---- ADMIN KEY auth (set ADMIN_KEY in env) ----
-  const ADMIN_KEY = process.env.ADMIN_KEY;
-  function requireAdmin(req, res, next) {
-    if (!ADMIN_KEY) return next(); // allow in dev if not set
-    const key = req.get("X-ADMIN-KEY");
-    if (key && key === ADMIN_KEY) return next();
-    return res.status(401).json({ ok: false, code: "unauthorized" });
-  }
-
-  // ---- Simple rate limiting (per X-ADMIN-KEY or IP) ----
-  // Defaults: 30 requests / 60s per key (or per IP if no key).
-  const RL_WINDOW_MS = Number(process.env.RL_WINDOW_MS || 60_000);
-  const RL_MAX = Number(process.env.RL_MAX || 30);
-  const buckets = new Map(); // id -> { count, resetAt }
-
-  function rateLimit(req, res, next) {
-    const now = Date.now();
-    const key = req.get("X-ADMIN-KEY") || req.ip || "anon";
-    let b = buckets.get(key);
-    if (!b || now >= b.resetAt) {
-      b = { count: 0, resetAt: now + RL_WINDOW_MS };
-      buckets.set(key, b);
-    }
-    b.count += 1;
-    if (b.count > RL_MAX) {
-      const retry = Math.max(0, Math.ceil((b.resetAt - now) / 1000));
-      res.setHeader("Retry-After", String(retry));
-      return res.status(429).json({ ok: false, code: "rate_limited", retry_after_s: retry });
-    }
-    next();
-  }
-
-  // ---------------------------
-  // POST /installations/start
-  // ---------------------------
-  app.post("/installations/start", requireAdmin, rateLimit, async (req, res) => {
-    const { franchisee_id } = req.body || {};
-    if (!franchisee_id) {
-      return res.status(400).json({ ok: false, code: "missing_franchisee_id" });
-    }
-
+  // Start installation: snapshot stock & create 'started'
+  app.post('/installations/start', requireFranchisee, async (req, res) => {
     const client = await pool.connect();
     try {
-      await client.query("BEGIN");
-
-      const mapping = await detectInventoryMapping(client);
-      if (!mapping) {
-        await client.query("ROLLBACK");
-        return res.status(500).json({ ok: false, code: "inventory_mapping_not_found" });
-      }
-
-      const inv = await getInventoryRowForUpdate(client, mapping, franchisee_id);
-      if (!inv) {
-        await client.query("ROLLBACK");
-        return res.status(404).json({ ok: false, code: "inventory_row_not_found", franchisee_id });
-      }
-
-      const available = parseFloat(inv.available_litres);
-      if (!Number.isFinite(available)) {
-        await client.query("ROLLBACK");
-        return res.status(500).json({ ok: false, code: "invalid_inventory_value", details: inv });
-      }
-
-      if (available < MIN_STOCK_L) {
-        await client.query("ROLLBACK");
-        return res.status(409).json({
-          ok: false,
-          code: "stock_below_threshold",
-          threshold_litres: MIN_STOCK_L,
-          available_litres: available,
-        });
-      }
+      const frid = req.franchisee_id;
+      const r = await client.query(
+        `SELECT ${qid(INV_STOCK_COL)} AS stock
+           FROM public.${qid(INV_TABLE)}
+          WHERE ${qid(INV_FR_COL)}=$1
+          LIMIT 1`,
+        [frid]
+      );
+      const snap = r.rowCount ? Number(r.rows[0].stock) : 0;
+      const allowed = snap >= STOCK_THRESHOLD_LITRES;
+      const now = new Date().toISOString();
 
       const ins = await client.query(
-        `INSERT INTO installations
-           (franchisee_id, stock_check_litres_snapshot, allowed_to_proceed, status)
-         VALUES ($1, $2, TRUE, 'started')
-         RETURNING id, franchisee_id, stock_check_litres_snapshot, allowed_to_proceed, status, created_at`,
-        [franchisee_id, available]
+        `INSERT INTO public.installations
+           (franchisee_id, stock_check_litres_snapshot, stock_check_time, allowed_to_proceed, status, created_at)
+         VALUES ($1,$2,$3,$4,'started',$5)
+         RETURNING id`,
+        [frid, snap, now, allowed, now]
       );
 
-      await client.query("COMMIT");
-      const row = ins.rows[0];
-      return res.status(201).json({
+      res.status(200).json({
         ok: true,
-        installation_id: row.id,
-        snapshot_litres: row.stock_check_litres_snapshot,
-        checked_at: row.created_at,
-        threshold_litres: MIN_STOCK_L,
+        installation_id: String(ins.rows[0].id),
+        snapshot_litres: snap,
+        checked_at: now,
+        threshold_litres: STOCK_THRESHOLD_LITRES,
+        allowed_to_proceed: allowed,
       });
     } catch (e) {
-      await client.query("ROLLBACK");
-      return res.status(500).json({ ok: false, code: "start_failed", message: e.message });
+      res.status(500).json({ ok: false, code: 'start_failed', message: e?.message || String(e) });
     } finally {
       client.release();
     }
   });
 
-  // ------------------------------
-  // POST /installations/complete
-  // ------------------------------
-  app.post("/installations/complete", requireAdmin, rateLimit, async (req, res) => {
-    const { installation_id, used_litres } = req.body || {};
-    const used = parseFloat(used_litres);
-    if (!installation_id || !Number.isFinite(used) || used <= 0) {
-      return res.status(400).json({ ok: false, code: "invalid_input" });
-    }
+  // Complete installation: deduct stock & mark completed
+  app.post('/installations/complete', requireFranchisee, async (req, res) => {
+    const { id, used_litres } = req.body || {};
+    const iid = Number(id);
+    const used = Number(used_litres);
+    if (!Number.isFinite(iid) || iid <= 0) return res.status(400).json({ ok: false, code: 'bad_id' });
+    if (!Number.isFinite(used) || used <= 0) return res.status(400).json({ ok: false, code: 'bad_used_litres' });
 
+    const frid = req.franchisee_id;
     const client = await pool.connect();
     try {
-      await client.query("BEGIN");
+      await client.query('BEGIN');
 
-      const q = await client.query(
-        `SELECT id, franchisee_id, allowed_to_proceed, status
-           FROM installations
-          WHERE id=$1
+      // Lock installation row
+      const r = await client.query(`SELECT * FROM public.installations WHERE id=$1 FOR UPDATE`, [iid]);
+      if (!r.rowCount) { await client.query('ROLLBACK'); return res.status(404).json({ ok: false, code: 'not_found' }); }
+      const row = r.rows[0];
+      if (row.franchisee_id !== frid) { await client.query('ROLLBACK'); return res.status(403).json({ ok: false, code: 'wrong_owner' }); }
+      if (row.status === 'completed') { await client.query('ROLLBACK'); return res.status(409).json({ ok: false, code: 'already_completed' }); }
+
+      // Lock inventory row
+      const sel = await client.query(
+        `SELECT ${qid(INV_STOCK_COL)} AS stock
+           FROM public.${qid(INV_TABLE)}
+          WHERE ${qid(INV_FR_COL)}=$1
           FOR UPDATE`,
-        [installation_id]
+        [frid]
       );
-      if (q.rowCount === 0) {
-        await client.query("ROLLBACK");
-        return res.status(404).json({ ok: false, code: "installation_not_found" });
-      }
-      const inst = q.rows[0];
+      if (!sel.rowCount) { await client.query('ROLLBACK'); return res.status(400).json({ ok: false, code: 'inventory_row_missing' }); }
 
-      if (inst.status !== "started") {
-        await client.query("ROLLBACK");
-        return res.status(409).json({ ok: false, code: "already_finalized", status: inst.status });
-      }
-      if (!inst.allowed_to_proceed) {
-        await client.query("ROLLBACK");
-        return res.status(409).json({ ok: false, code: "not_allowed_to_proceed" });
-      }
+      const current = Number(sel.rows[0].stock || 0);
+      const after = current - used;
+      if (after < 0) { await client.query('ROLLBACK'); return res.status(400).json({ ok: false, code: 'insufficient_stock', available_litres: current }); }
 
-      const mapping = await detectInventoryMapping(client);
-      if (!mapping) {
-        await client.query("ROLLBACK");
-        return res.status(500).json({ ok: false, code: "inventory_mapping_not_found" });
-      }
-
-      const deduct = await deductStockAndReturn(
-        client,
-        mapping,
-        inst.franchisee_id,
-        used
+      await client.query(
+        `UPDATE public.${qid(INV_TABLE)} SET ${qid(INV_STOCK_COL)}=$2 WHERE ${qid(INV_FR_COL)}=$1`,
+        [frid, after]
       );
-      if (!deduct || deduct.rowCount === 0) {
-        await client.query("ROLLBACK");
-        return res.status(409).json({ ok: false, code: "insufficient_stock_for_deduction" });
-      }
-      const newAvail = parseFloat(deduct.rows[0].available_litres);
-
-      const upd = await client.query(
-        `UPDATE installations
-            SET status='completed', used_litres=$2, completed_at=NOW()
-          WHERE id=$1
-      RETURNING id, status, used_litres, completed_at, updated_at`,
-        [installation_id, used]
+      const now = new Date().toISOString();
+      await client.query(
+        `UPDATE public.installations
+            SET status='completed', used_litres=$2, completed_at=$3, updated_at=$3
+          WHERE id=$1`,
+        [iid, used, now]
       );
 
-      await client.query("COMMIT");
-      return res.status(200).json({
+      await client.query('COMMIT');
+      res.status(200).json({
         ok: true,
-        installation: upd.rows[0],
-        available_litres_after: newAvail,
+        installation: { id: String(iid), status: 'completed', used_litres: used, completed_at: now, updated_at: now },
+        available_litres_after: after
       });
     } catch (e) {
-      await client.query("ROLLBACK");
-      return res.status(500).json({ ok: false, code: "complete_failed", message: e.message });
+      try { await client.query('ROLLBACK'); } catch {}
+      res.status(500).json({ ok: false, code: 'complete_failed', message: e?.message || String(e) });
     } finally {
       client.release();
-    }
-  });
-
-  // ----------------------------
-  // POST /installations/cancel
-  // ----------------------------
-  app.post("/installations/cancel", requireAdmin, rateLimit, async (req, res) => {
-    const { installation_id } = req.body || {};
-    if (!installation_id) {
-      return res.status(400).json({ ok: false, code: "invalid_input" });
-    }
-
-    try {
-      const r = await pool.query(
-        `UPDATE installations
-            SET status='cancelled'
-          WHERE id=$1 AND status='started'
-      RETURNING id, status, updated_at`,
-        [installation_id]
-      );
-      if (r.rowCount === 0) {
-        return res.status(409).json({ ok: false, code: "not_started_or_missing" });
-      }
-      return res.status(200).json({ ok: true, installation: r.rows[0] });
-    } catch (e) {
-      return res.status(500).json({ ok: false, code: "cancel_failed", message: e.message });
     }
   });
 }
