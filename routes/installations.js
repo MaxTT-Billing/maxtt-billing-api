@@ -1,6 +1,6 @@
-// routes/installations.js — token-protected installs (Strict Actuals)
-// Works with AUTH_SECRET token just like /me/* endpoints.
+// routes/installations.js — token-protected installs (Strict Actuals, ESM-safe)
 
+import crypto from 'crypto';
 import pkg from 'pg';
 const { Pool } = pkg;
 
@@ -9,18 +9,21 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false },
 });
 
-// ---- Token verify (same scheme as server.js) ----
+// ---- Token verify (same scheme as server.js, ESM) ----
 const AUTH_SECRET = process.env.AUTH_SECRET || '';
+
 function b64url(buf) {
-  return Buffer.from(buf).toString('base64').replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
+  return Buffer.from(buf).toString('base64')
+    .replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
 }
 function verifyToken(token) {
   try {
     const [v, p64, sig] = String(token || '').split('.');
     if (v !== 'v1' || !p64 || !sig) return null;
-    const expect = b64url(require('crypto').createHmac('sha256', AUTH_SECRET).update(`${v}.${p64}`).digest());
-    if (!Buffer.from(sig).equals(Buffer.from(expect))) return null;
-    const json = Buffer.from(p64.replace(/-/g,'+').replace(/_/g,'/'),'base64').toString('utf8');
+    const expected = b64url(crypto.createHmac('sha256', AUTH_SECRET).update(`${v}.${p64}`).digest());
+    if (sig !== expected) return null;
+
+    const json = Buffer.from(p64.replace(/-/g,'+').replace(/_/g,'/'), 'base64').toString('utf8');
     const obj = JSON.parse(json);
     if (!obj?.sub || !obj?.exp) return null;
     if (Math.floor(Date.now()/1000) > Number(obj.exp)) return null;
@@ -47,7 +50,7 @@ const STOCK_THRESHOLD_LITRES = Number(process.env.STOCK_THRESHOLD_LITRES || 20);
 const qid = n => `"${n}"`;
 
 export default function installationsRouter(app) {
-  // Start installation: snapshot stock & create 'started'
+  // Start installation
   app.post('/installations/start', requireFranchisee, async (req, res) => {
     const client = await pool.connect();
     try {
@@ -86,7 +89,7 @@ export default function installationsRouter(app) {
     }
   });
 
-  // Complete installation: deduct stock & mark completed
+  // Complete installation
   app.post('/installations/complete', requireFranchisee, async (req, res) => {
     const { id, used_litres } = req.body || {};
     const iid = Number(id);
@@ -99,14 +102,12 @@ export default function installationsRouter(app) {
     try {
       await client.query('BEGIN');
 
-      // Lock installation row
       const r = await client.query(`SELECT * FROM public.installations WHERE id=$1 FOR UPDATE`, [iid]);
       if (!r.rowCount) { await client.query('ROLLBACK'); return res.status(404).json({ ok: false, code: 'not_found' }); }
       const row = r.rows[0];
       if (row.franchisee_id !== frid) { await client.query('ROLLBACK'); return res.status(403).json({ ok: false, code: 'wrong_owner' }); }
       if (row.status === 'completed') { await client.query('ROLLBACK'); return res.status(409).json({ ok: false, code: 'already_completed' }); }
 
-      // Lock inventory row
       const sel = await client.query(
         `SELECT ${qid(INV_STOCK_COL)} AS stock
            FROM public.${qid(INV_TABLE)}
