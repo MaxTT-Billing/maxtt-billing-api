@@ -1,0 +1,24 @@
+name: Freeze v46 PDF
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'pdf/invoice_v46.js'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'pdf/invoice_v46.js'
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Block direct pushes to main for v46
+        if: github.event_name == 'push'
+        run: |
+          echo "v46 PDF is FROZEN. Do not push changes directly to main. Open a PR."
+          exit 1
+      - name: PR status (informational)
+        if: github.event_name == 'pull_request'
+        run: echo "v46 change requires CODEOWNERS approval; status OK."
