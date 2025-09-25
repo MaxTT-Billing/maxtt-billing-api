@@ -1,0 +1,10 @@
+{
+  "variant": "TPMS",          // "TPMS" | "HIGHWAY"
+  "drums": 5,                 // integer >= 1
+  "litres": 100.0,            // server can compute drums*20 to be safe
+  "source": "ADMIN_CREDIT",   // ADMIN_CREDIT | PURCHASE | ADJUSTMENT
+  "ref_doc_no": "INV-2025-091",
+  "ref_doc_date": "2025-09-25",
+  "notes": "Delivered 5 drums TPMS",
+  "idempotency_key": "topup-TS-HR-GGM-001-20250925-001"
+}
